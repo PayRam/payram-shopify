@@ -159,13 +159,18 @@ fi
 # Store domain (used for install URL in final output)
 if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
   echo ""
-  warn "Your Shopify store domain (e.g. my-store.myshopify.com)"
-  read -rp "$(echo -e "${BOLD}Shopify store domain:${RESET} ")" store_domain_input
-  store_domain_input="${store_domain_input// /}"   # strip spaces
-  store_domain_input="${store_domain_input#https://}" # strip scheme if pasted
-  store_domain_input="${store_domain_input%/}"        # strip trailing slash
+  read -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. payram-test-store.myshopify.com): ")" store_domain_input
+  store_domain_input="${store_domain_input// /}"       # strip spaces
+  store_domain_input="${store_domain_input#https://}"  # strip https://
+  store_domain_input="${store_domain_input#http://}"   # strip http://
+  store_domain_input="${store_domain_input%/}"         # strip trailing slash
   [ -z "$store_domain_input" ] && die "Store domain cannot be empty."
+  # Append .myshopify.com if user only typed the store name (no dot present)
+  if [[ "$store_domain_input" != *.* ]]; then
+    store_domain_input="${store_domain_input}.myshopify.com"
+  fi
   set_env SHOPIFY_STORE_DOMAIN "$store_domain_input"
+  info "Store domain: ${store_domain_input}"
 else
   info "SHOPIFY_STORE_DOMAIN already set (${SHOPIFY_STORE_DOMAIN})"
 fi
