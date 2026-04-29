@@ -191,13 +191,14 @@ docker pull "$DOCKER_IMAGE"
 # =============================================================================
 # STEP 5 — Shopify app credentials (via CLI)
 # =============================================================================
-step "Shopify app credentials"
+step "Shopify app credentials & extension deploy"
 
 # Persistent volume for CLI auth state — survives between docker run invocations
 docker volume create payram-shopify-cli-auth >/dev/null 2>&1 || true
 
-# Write shopify.app.toml with the known client_id (or empty for first run)
-# so the CLI knows which app to deploy to without interactive prompts on re-runs.
+# Write shopify.app.toml.
+# client_id is empty on first run (CLI will link to new/existing app interactively).
+# client_id is set on re-runs so the CLI deploys to the known app without prompting.
 printf '%s\n' \
   'name = "payram-checkout-plugin"' \
   "client_id = \"${SHOPIFY_API_KEY:-}\"" \
@@ -231,60 +232,48 @@ printf '%s\n' \
   > "${INSTALL_DIR}/shopify.app.toml"
 
 if [ -z "${SHOPIFY_API_KEY:-}" ]; then
-  # ── First run: full auth + deploy + credentials pull ──────────────────────
   info "A browser login URL will appear below — open it to authenticate."
-  info "You will then be asked to select your organization and confirm the app name."
   warn "Choose 'Create new app' when prompted for the app."
   echo ""
-
-  docker run --rm -it \
-    --user root \
-    -v payram-shopify-cli-auth:/root/.config/shopify \
-    -v "${INSTALL_DIR}:/workspace" \
-    "$DOCKER_IMAGE" \
-    sh -c "
-      set -e
-      cp /workspace/shopify.app.toml /app/shopify.app.toml
-      npx shopify app deploy --allow-updates
-      npx shopify app env pull
-      cp /app/.env /workspace/.shopify-creds.env
-      chmod 644 /workspace/.shopify-creds.env
-      cp /app/shopify.app.toml /workspace/shopify.app.toml
-    " || die "App creation or deploy failed. See output above."
-
-  CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
-  [ ! -f "${CREDS_FILE}" ] && die "Credentials file not found after deploy. Check the output above for errors."
-
-  API_KEY=$(grep    '^SHOPIFY_API_KEY='    "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
-  API_SECRET=$(grep '^SHOPIFY_API_SECRET=' "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
-  rm -f "${CREDS_FILE}"
-
-  [ -z "${API_KEY}" ]    && die "Could not read SHOPIFY_API_KEY from credentials file."
-  [ -z "${API_SECRET}" ] && die "Could not read SHOPIFY_API_SECRET from credentials file."
-
-  set_env SHOPIFY_API_KEY    "${API_KEY}"
-  set_env SHOPIFY_API_SECRET "${API_SECRET}"
-
-  info "App created and extension deployed."
-  info "  API Key: ${API_KEY}"
 else
-  # ── Re-run: redeploy extension with updated URL / code ────────────────────
-  info "Redeploying extension (SHOPIFY_API_KEY already set) ..."
-
-  docker run --rm -it \
-    --user root \
-    -v payram-shopify-cli-auth:/root/.config/shopify \
-    -v "${INSTALL_DIR}:/workspace" \
-    "$DOCKER_IMAGE" \
-    sh -c "
-      set -e
-      cp /workspace/shopify.app.toml /app/shopify.app.toml
-      npx shopify app deploy --allow-updates
-      cp /app/shopify.app.toml /workspace/shopify.app.toml
-    " || die "Extension redeploy failed — see output above."
-
-  info "Extension redeployed."
+  info "Re-using existing credentials — redeploying extension to update."
+  info "If auth has expired, a new browser login URL will appear."
+  echo ""
 fi
+
+# Single Docker run: handles auth (fresh or expired), deploys app + extension,
+# pulls credentials. Works identically on first run and re-runs.
+docker run --rm -it \
+  --user root \
+  -v payram-shopify-cli-auth:/root/.config/shopify \
+  -v "${INSTALL_DIR}:/workspace" \
+  "$DOCKER_IMAGE" \
+  sh -c "
+    set -e
+    cp /workspace/shopify.app.toml /app/shopify.app.toml
+    npx shopify app deploy --allow-updates
+    npx shopify app env pull
+    cp /app/.env /workspace/.shopify-creds.env
+    chmod 644 /workspace/.shopify-creds.env
+    cp /app/shopify.app.toml /workspace/shopify.app.toml
+    echo '[payram-deploy] SUCCESS'
+  " || die "App deploy failed. See output above."
+
+CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
+[ ! -f "${CREDS_FILE}" ] && die "Credentials file not found after deploy."
+
+NEW_API_KEY=$(grep    '^SHOPIFY_API_KEY='    "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
+NEW_API_SECRET=$(grep '^SHOPIFY_API_SECRET=' "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
+rm -f "${CREDS_FILE}"
+
+[ -z "${NEW_API_KEY}" ]    && die "Could not read SHOPIFY_API_KEY from credentials file."
+[ -z "${NEW_API_SECRET}" ] && die "Could not read SHOPIFY_API_SECRET from credentials file."
+
+set_env SHOPIFY_API_KEY    "${NEW_API_KEY}"
+set_env SHOPIFY_API_SECRET "${NEW_API_SECRET}"
+
+info "App and extension deployed successfully."
+info "  API Key: ${NEW_API_KEY}"
 
 # Ensure SCOPES is set
 if ! grep -q "^SCOPES=" "$ENV_FILE" 2>/dev/null; then
