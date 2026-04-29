@@ -312,7 +312,7 @@ if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
     fi
   else
     warn "Could not fetch store list — enter domain manually."
-    read -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. payram-test-store.myshopify.com): ")" store_domain_input
+    read -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. your-store.myshopify.com): ")" store_domain_input
   fi
 
   store_domain_input=$(_normalize_store_domain "$store_domain_input")
