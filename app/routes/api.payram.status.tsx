@@ -49,6 +49,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     shopifyOrderName: mapping.shopifyOrderName,
     payramReferenceId: mapping.payramReferenceId,
     payramStatus: mapping.payramStatus,
+    shopifySyncMode: "order_tag",
+    shopifyOrderTag: mapping.shopifyFinancialStatus,
     shopifyFinancialStatus: mapping.shopifyFinancialStatus,
     shopifyPaidSyncedAt: mapping.shopifyPaidSyncedAt,
     lastSyncAt: mapping.lastSyncAt,

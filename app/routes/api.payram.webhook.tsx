@@ -3,11 +3,11 @@
  *
  * Receives Payram payment status webhooks.
  * Resolves the PaymentMapping by referenceId, updates status,
- * and attempts to mark the Shopify order as paid when status is terminal.
+ * and tags the Shopify order when the external payment completes.
  *
- * The orderMarkAsPaid call is fault-tolerant: PCD failures in development
- * are stored in syncError and do not cause the webhook to return 5xx
- * (which would trigger Payram retries for a known-permanent failure).
+ * The Shopify sync is fault-tolerant: sync failures are stored in syncError
+ * and do not cause the webhook to return 5xx (which would trigger Payram
+ * retries for a known-permanent failure).
  *
  * TODO: Add webhook signature verification when Payram publishes their
  * signing mechanism (e.g., HMAC header). Until then, referenceId acts as
@@ -17,7 +17,7 @@ import type { ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import prisma from "~/db.server";
 import { sessionStorage } from "~/shopify.server";
-import { markShopifyOrderPaid } from "~/utils/shopify-admin.server";
+import { tagShopifyOrderPaid } from "~/utils/shopify-admin.server";
 
 // Payram statuses that represent a successfully completed payment
 const PAID_STATUSES = new Set(["paid", "confirmed", "closed", "completed"]);
@@ -72,9 +72,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     },
   });
 
-  // If payment is complete, attempt to sync with Shopify
+  // If payment is complete, tag the Shopify order for merchant reconciliation.
   if (status && PAID_STATUSES.has(status.toLowerCase())) {
-    await attemptMarkShopifyOrderPaid(
+    await attemptTagShopifyOrderPaid(
       mapping.shop,
       mapping.shopifyOrderId,
       mapping.id
@@ -84,7 +84,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return json({ ok: true });
 };
 
-async function attemptMarkShopifyOrderPaid(
+async function attemptTagShopifyOrderPaid(
   shop: string,
   shopifyOrderId: string,
   mappingId: string
@@ -106,7 +106,7 @@ async function attemptMarkShopifyOrderPaid(
       return;
     }
 
-    await markShopifyOrderPaid(
+    await tagShopifyOrderPaid(
       shop,
       offlineSession.accessToken,
       shopifyOrderId,
@@ -114,7 +114,7 @@ async function attemptMarkShopifyOrderPaid(
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error("[payram-webhook] Unexpected error in markShopifyOrderPaid:", msg);
+    console.error("[payram-webhook] Unexpected error in tagShopifyOrderPaid:", msg);
     await prisma.paymentMapping.update({
       where: { id: mappingId },
       data: { syncError: msg, lastSyncAt: new Date() },

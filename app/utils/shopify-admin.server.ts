@@ -1,42 +1,40 @@
 /**
- * Calls Shopify Admin GraphQL orderMarkAsPaid mutation.
+ * Syncs an external Payram payment back into Shopify by tagging the order.
  *
- * NOTE: This is PCD-gated (Protected Customer Data) and will fail in
- * development stores until the app passes Shopify public app review.
- * Errors are stored in PaymentMapping.syncError and do not block webhook
- * acknowledgement.
+ * This avoids the PCD-gated orderMarkAsPaid mutation while still giving
+ * merchants a visible signal in Shopify Admin that the external payment
+ * completed successfully.
  */
 import prisma from "~/db.server";
 
 const SHOPIFY_API_VERSION = "2025-01";
+const PAYRAM_PAID_TAG = "payram_paid";
 
-const ORDER_MARK_AS_PAID_MUTATION = /* graphql */ `
-  mutation orderMarkAsPaid($input: OrderMarkAsPaidInput!) {
-    orderMarkAsPaid(input: $input) {
-      order {
+const TAGS_ADD_MUTATION = /* graphql */ `
+  mutation addTags($id: ID!, $tags: [String!]!) {
+    tagsAdd(id: $id, tags: $tags) {
+      node {
         id
-        displayFinancialStatus
       }
       userErrors {
-        field
         message
       }
     }
   }
 `;
 
-interface MarkPaidResult {
+interface SyncOrderTagResult {
   ok: boolean;
-  financialStatus?: string;
+  tag?: string;
   error?: string;
 }
 
-export async function markShopifyOrderPaid(
+export async function tagShopifyOrderPaid(
   shop: string,
   accessToken: string,
   shopifyOrderId: string,
   mappingId: string
-): Promise<MarkPaidResult> {
+): Promise<SyncOrderTagResult> {
   const gid = `gid://shopify/Order/${shopifyOrderId}`;
 
   let res: Response;
@@ -50,8 +48,8 @@ export async function markShopifyOrderPaid(
           "X-Shopify-Access-Token": accessToken,
         },
         body: JSON.stringify({
-          query: ORDER_MARK_AS_PAID_MUTATION,
-          variables: { input: { id: gid } },
+          query: TAGS_ADD_MUTATION,
+          variables: { id: gid, tags: [PAYRAM_PAID_TAG] },
         }),
       }
     );
@@ -75,15 +73,15 @@ export async function markShopifyOrderPaid(
 
   const json = (await res.json()) as {
     data?: {
-      orderMarkAsPaid?: {
-        order?: { id: string; displayFinancialStatus: string };
-        userErrors?: { field: string; message: string }[];
+      tagsAdd?: {
+        node?: { id: string };
+        userErrors?: { message: string }[];
       };
     };
     errors?: unknown;
   };
 
-  const userErrors = json.data?.orderMarkAsPaid?.userErrors ?? [];
+  const userErrors = json.data?.tagsAdd?.userErrors ?? [];
   if (userErrors.length > 0) {
     const msg = userErrors.map((e) => e.message).join("; ");
     await prisma.paymentMapping.update({
@@ -93,18 +91,20 @@ export async function markShopifyOrderPaid(
     return { ok: false, error: msg };
   }
 
-  const order = json.data?.orderMarkAsPaid?.order;
-  if (order) {
+  const node = json.data?.tagsAdd?.node;
+  if (node) {
     await prisma.paymentMapping.update({
       where: { id: mappingId },
       data: {
-        shopifyFinancialStatus: order.displayFinancialStatus,
+        // Legacy field: now stores the Shopify order tag used for external
+        // payment reconciliation rather than a financial status string.
+        shopifyFinancialStatus: PAYRAM_PAID_TAG,
         shopifyPaidSyncedAt: new Date(),
         lastSyncAt: new Date(),
         syncError: null,
       },
     });
-    return { ok: true, financialStatus: order.displayFinancialStatus };
+    return { ok: true, tag: PAYRAM_PAID_TAG };
   }
 
   return { ok: false, error: "No order data in response" };
