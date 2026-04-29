@@ -265,8 +265,10 @@ docker run --rm -it \
     if [ -n "$LINKED_CLIENT_ID" ]; then
       sed -i "s/^client_id = .*/client_id = \"${LINKED_CLIENT_ID}\"/" /app/shopify.app.toml
     fi
-    # Second deploy: non-interactive (auth cached, client_id set), pushes proxy config.
-    npx shopify app deploy --allow-updates
+    # Second deploy: non-interactive (auth cached, client_id set).
+    # --include-config-on-deploy ensures the [app_proxy] section from the toml
+    # is pushed to Shopify (not just the extension versions).
+    npx shopify app deploy --allow-updates --include-config-on-deploy
     npx shopify app env pull
     cp /app/.env /workspace/.shopify-creds.env
     chmod 644 /workspace/.shopify-creds.env
