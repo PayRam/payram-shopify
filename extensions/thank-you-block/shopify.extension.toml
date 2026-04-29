@@ -9,11 +9,3 @@ handle = "payram-thank-you-block"
   [[extensions.targeting]]
   target = "purchase.thank-you.block.render"
   module = "./src/Checkout.tsx"
-
-  [extensions.settings]
-
-    [[extensions.settings.fields]]
-    key = "app_backend_base_url"
-    type = "single_line_text_field"
-    name = "App backend base URL"
-    description = "Public URL for this Payram Shopify Connector backend (e.g. https://your-tunnel.trycloudflare.com). Update this whenever the dev tunnel URL changes."

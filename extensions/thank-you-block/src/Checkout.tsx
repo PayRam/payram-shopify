@@ -42,44 +42,21 @@ declare module "preact/jsx-runtime" {
 }
 
 /* ------------------------------------------------------------------ */
-/* Settings type                                                        */
-/* ------------------------------------------------------------------ */
-interface PayramSettings {
-  app_backend_base_url?: string;
-  [key: string]: string | undefined;
-}
-
-/* ------------------------------------------------------------------ */
 /* Block component                                                      */
 /* ------------------------------------------------------------------ */
 function PayramBlock() {
   const api = useApi<"purchase.thank-you.block.render">();
 
-  const [appBackendBaseUrl, setAppBackendBaseUrl] = useState<
-    string | undefined
-  >(
-    () =>
-      (
-        api.settings.value as Partial<PayramSettings>
-      )?.app_backend_base_url?.trim() || undefined,
-  );
   const [orderConfirmation, setOrderConfirmation] = useState<{
     order: { id: string };
     isFirstOrder: boolean;
   } | null>(() => api.orderConfirmation.value ?? null);
 
   useEffect(() => {
-    const unsubSettings = api.settings.subscribe((v) => {
-      setAppBackendBaseUrl(
-        (v as Partial<PayramSettings>)?.app_backend_base_url?.trim() ||
-          undefined,
-      );
-    });
     const unsubOrder = api.orderConfirmation.subscribe((v) => {
       setOrderConfirmation(v ?? null);
     });
     return () => {
-      unsubSettings();
       unsubOrder();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -112,21 +89,15 @@ function PayramBlock() {
     }
   };
 
-  const normalizeBaseUrl = (u: string) => {
-    const trimmed = u.trim().replace(/\/$/, "");
-    if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
-      return `https://${trimmed}`;
-    }
-    return trimmed;
-  };
-
+  // Use Shopify App Proxy — stable URL that never changes when tunnel restarts.
+  // Shopify proxies https://{shopDomain}/apps/payram-connector/... → app backend.
   const buildHref = () =>
-    `${normalizeBaseUrl(appBackendBaseUrl!)}/api/payram/redirect-to-payment?${new URLSearchParams({
+    `https://${shopDomain}/apps/payram-connector/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
       amountInUSD: String(amountInUSD),
       email,
-      ...(shopDomain ? { shop: shopDomain } : {}),
     })}`;
+
 
   const handlePay = (e: Event) => {
     setSubmitted(true);
@@ -143,7 +114,7 @@ function PayramBlock() {
         <s-heading level={2}>Pay with Crypto via Payram</s-heading>
 
         {/* Body */}
-        {!validOrderId || !appBackendBaseUrl ? (
+        {!validOrderId || !shopDomain ? (
           <s-text>
             Your order has been received. Complete your crypto payment using the
             link in your confirmation email.

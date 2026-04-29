@@ -22,3 +22,8 @@ api_version = "2026-01"
 
 [pos]
 embedded = false
+
+[app_proxy]
+url = "{{ APPLICATION_URL }}"
+prefix = "apps"
+subpath = "payram-connector"

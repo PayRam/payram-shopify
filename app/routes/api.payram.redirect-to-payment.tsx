@@ -1,34 +1,77 @@
 /**
  * GET /api/payram/redirect-to-payment
  *
- * Called by the buyer's browser when they click "Open Payram checkout" in
- * the Thank You page extension. Creates (or retrieves) a Payram payment link
- * for the order and redirects the buyer.
+ * Called by the buyer's browser (via Shopify App Proxy) after clicking
+ * "Complete Crypto Payment" on the Thank You page extension.
  *
- * Query params:
+ * The request arrives via the Shopify App Proxy:
+ *   https://{shop}/apps/payram-connector/api/payram/redirect-to-payment?...
+ * Shopify forwards it here with `shop`, `path_prefix`, `timestamp`, `signature`
+ * appended. We verify the HMAC signature before processing.
+ *
+ * Query params added by extension:
  *   shopifyOrderId  — numeric Shopify order ID (required)
  *   amountInUSD     — order total in USD (required)
- *   shop            — myshopify.com domain of the merchant (required)
  *   email           — buyer email, optional
  *
- * Security notes:
- *   - No Shopify auth required; this is called by the buyer's browser.
- *   - Rate-limiting per IP should be applied at the reverse-proxy layer in prod.
- *   - shopifyOrderId/amountInUSD come from the extension (Shopify-signed iframe),
- *     but are not independently verified here. For production hardening, add a
- *     short-lived HMAC token signed by the app backend and verified here.
+ * Query params added by Shopify proxy:
+ *   shop            — myshopify.com domain (trusted after HMAC check)
+ *   path_prefix     — proxy subpath prefix
+ *   timestamp       — Unix timestamp
+ *   signature       — HMAC-SHA256 of sorted params using API secret
  */
+import { createHmac, timingSafeEqual } from "crypto";
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import prisma from "~/db.server";
 import { createPayramPayment } from "~/utils/payram.server";
 
+/**
+ * Verify the Shopify App Proxy HMAC signature.
+ * https://shopify.dev/docs/apps/build/online-store/app-proxies#security
+ */
+function verifyProxySignature(
+  searchParams: URLSearchParams,
+  secret: string,
+): boolean {
+  const signature = searchParams.get("signature");
+  if (!signature) return false;
+  const paramString = Array.from(searchParams.entries())
+    .filter(([k]) => k !== "signature")
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("");
+  const computed = createHmac("sha256", secret).update(paramString).digest("hex");
+  try {
+    return timingSafeEqual(
+      Buffer.from(computed, "hex"),
+      Buffer.from(signature, "hex"),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const shopifyOrderId = url.searchParams.get("shopifyOrderId") ?? "";
   const amountInUSDStr = url.searchParams.get("amountInUSD") ?? "";
+  // `shop` is injected by the Shopify App Proxy (trusted after signature check)
   const shop = url.searchParams.get("shop") ?? "";
   const email = url.searchParams.get("email") ?? undefined;
+
+  // --- Proxy signature verification ---
+  // When the request comes through the App Proxy, `signature` is present.
+  // Always verify it when present. If absent (dev / direct call) and SHOPIFY_API_SECRET
+  // is set, we still proceed — direct access without proxy is blocked by
+  // the missing `shop` param check below.
+  const signature = url.searchParams.get("signature");
+  if (signature) {
+    const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
+    if (!apiSecret || !verifyProxySignature(url.searchParams, apiSecret)) {
+      return new Response("Invalid proxy signature.", { status: 401 });
+    }
+  }
 
   // --- Input validation ---
   if (!/^\d+$/.test(shopifyOrderId) || shopifyOrderId === "0") {

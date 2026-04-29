@@ -199,6 +199,11 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
     '' \
     '[pos]' \
     'embedded = false' \
+    '' \
+    '[app_proxy]' \
+    "url = \"${SHOPIFY_APP_URL}\"" \
+    'prefix = "apps"' \
+    'subpath = "payram-connector"' \
     > "${INSTALL_DIR}/shopify.app.toml"
 
   info "A browser login URL will appear below — open it to authenticate."
@@ -326,7 +331,8 @@ echo -e "       add: 'Pay with Crypto via Payram'"
 echo ""
 echo -e "  ${CYAN}3.${RESET} In Shopify Admin → Online Store → Checkout → Customize"
 echo -e "       → Thank You page → Add block → Payram Thank You Block."
-echo -e "       Set 'App backend base URL' to: ${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}"
+echo -e "       ${GREEN}No additional configuration needed — the block auto-connects${RESET}"
+echo -e "       ${GREEN}via the App Proxy. Just add and save.${RESET}"
 echo ""
 echo -e "  ${CYAN}Manage container:${RESET}"
 echo -e "       docker logs payram-shopify-connector"
