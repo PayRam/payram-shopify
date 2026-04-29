@@ -126,8 +126,6 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
 
   # Write a shopify.app.toml with empty client_id to the install dir.
   # shopify app deploy will create the app and write the real client_id back.
-  # Using printf avoids heredoc parsing issues when the script runs via
-  # /bin/bash -c "$(curl ...)"
   printf '%s\n' \
     'name = "payram-connector"' \
     'client_id = ""' \
@@ -155,34 +153,25 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
     'embedded = false' \
     > "${INSTALL_DIR}/shopify.app.toml"
 
-  info "Opening browser to authenticate with your Shopify Partner account..."
-  warn "Running on a headless server? A URL will appear below — open it in your browser."
+  info "A browser login URL will appear below — open it to authenticate."
+  info "You will then be asked to select your organization and confirm the app name."
+  warn "Choose 'Create new app' when prompted for the app."
   echo ""
-  docker run --rm -it \
-    --user root \
-    -v payram-shopify-cli-auth:/root/.config/shopify \
-    "$DOCKER_IMAGE" \
-    npx shopify auth login || die "Authentication failed."
 
-  echo ""
-  info "Creating the Shopify app and deploying the checkout extension..."
-  info "The CLI will ask you to select your organization and confirm the app name."
-  info "Choose 'Create new app' when prompted."
-  echo ""
-  # Run deploy (creates app + deploys extension) then immediately pull env vars.
-  # Both commands share the same container so the updated toml from deploy is
-  # available to env pull. The credentials file is written to /workspace which
-  # is bind-mounted to INSTALL_DIR on the host.
+  # Single container: auth + deploy + env pull all share the same process/session.
+  # env pull writes to /app/.env by default; we copy it to /workspace for extraction.
   docker run --rm -it \
     --user root \
     -v payram-shopify-cli-auth:/root/.config/shopify \
     -v "${INSTALL_DIR}:/workspace" \
     "$DOCKER_IMAGE" \
     sh -c "
+      set -e
       cp /workspace/shopify.app.toml /app/shopify.app.toml
       npx shopify app deploy --allow-updates
-      npx shopify app env pull --env-file /workspace/.shopify-creds.env
-      chmod 644 /workspace/.shopify-creds.env 2>/dev/null || true
+      npx shopify app env pull
+      cp /app/.env /workspace/.shopify-creds.env
+      chmod 644 /workspace/.shopify-creds.env
     " || die "App creation or deploy failed. See output above."
 
   CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
