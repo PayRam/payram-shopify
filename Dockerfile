@@ -72,6 +72,9 @@ RUN printf '#!/bin/sh\necho ""\necho "  ➜  Open this URL in your browser to au
 # Non-root user for least-privilege execution
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
+# Pre-create /data so the volume mount inherits correct ownership
+RUN mkdir -p /data && chown appuser:appgroup /data
+
 # Copy only what's needed to run
 COPY --from=builder --chown=appuser:appgroup /app/build          ./build
 COPY --from=builder --chown=appuser:appgroup /app/node_modules   ./node_modules
