@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-DOCKER_IMAGE="payram/shopify-connector:latest"
+DOCKER_IMAGE="mason0816/payram-shopify-test:latest"
 DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
 
 # ── colours ──────────────────────────────────────────────────────────────────
@@ -225,7 +225,7 @@ if [[ "${deploy_ext,,}" == "y" ]]; then
   info "Extension deployed."
 else
   warn "Skipped. Run this later to deploy the extension:"
-  warn "  docker run --rm -it --env-file ${ENV_FILE} ${DOCKER_IMAGE} npx shopify app deploy"
+  warn "  docker run --rm -it --env-file ${ENV_FILE} mason0816/payram-shopify-test:latest npx shopify app deploy"
 fi
 
 # =============================================================================
