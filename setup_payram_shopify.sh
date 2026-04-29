@@ -165,14 +165,6 @@ else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
 fi
 
-# App name (shown in Shopify Partners and checkout editor)
-if [ -z "${SHOPIFY_APP_NAME:-}" ]; then
-  read -rp "$(echo -e "${BOLD}App name${RESET} [Payram Connector]: ")" app_name_input
-  app_name_input="${app_name_input:-Payram Checkout Plugin}"
-  set_env SHOPIFY_APP_NAME "$app_name_input"
-else
-  info "SHOPIFY_APP_NAME already set (${SHOPIFY_APP_NAME})"
-fi
 step "Pulling Docker image"
 info "Pulling ${DOCKER_IMAGE} ..."
 docker pull "$DOCKER_IMAGE"
@@ -189,7 +181,7 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
   # Write a shopify.app.toml with empty client_id to the install dir.
   # shopify app deploy will create the app and write the real client_id back.
   printf '%s\n' \
-    "name = \"${SHOPIFY_APP_NAME}\"" \
+    'name = "payram-checkout-plugin"' \
     'client_id = ""' \
     "application_url = \"${SHOPIFY_APP_URL}\"" \
     'embedded = true' \
