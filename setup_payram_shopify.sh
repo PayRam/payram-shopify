@@ -156,6 +156,20 @@ else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
 fi
 
+# Store domain (used for install URL in final output)
+if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
+  echo ""
+  warn "Your Shopify store domain (e.g. my-store.myshopify.com)"
+  read -rp "$(echo -e "${BOLD}Shopify store domain:${RESET} ")" store_domain_input
+  store_domain_input="${store_domain_input// /}"   # strip spaces
+  store_domain_input="${store_domain_input#https://}" # strip scheme if pasted
+  store_domain_input="${store_domain_input%/}"        # strip trailing slash
+  [ -z "$store_domain_input" ] && die "Store domain cannot be empty."
+  set_env SHOPIFY_STORE_DOMAIN "$store_domain_input"
+else
+  info "SHOPIFY_STORE_DOMAIN already set (${SHOPIFY_STORE_DOMAIN})"
+fi
+
 # =============================================================================
 # STEP 4 — Pull Docker image (needed before auth step uses it)
 # =============================================================================
@@ -324,7 +338,7 @@ echo -e "${BOLD}${GREEN}  Payram Shopify Connector is running!${RESET}"
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  ${CYAN}1.${RESET} Install the app on your Shopify store:"
-echo -e "       ${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/auth?shop=your-store.myshopify.com"
+echo -e "       ${BOLD}${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/auth?shop=${SHOPIFY_STORE_DOMAIN:-your-store.myshopify.com}${RESET}"
 echo ""
 echo -e "  ${CYAN}2.${RESET} In Shopify Admin → Settings → Payments → Manual payment methods"
 echo -e "       add: 'Pay with Crypto via Payram'"
