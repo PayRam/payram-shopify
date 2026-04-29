@@ -129,7 +129,7 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
   # Using printf avoids heredoc parsing issues when the script runs via
   # /bin/bash -c "$(curl ...)"
   printf '%s\n' \
-    'name = "payram-shopify-connector"' \
+    'name = "payram-connector"' \
     'client_id = ""' \
     "application_url = \"${SHOPIFY_APP_URL}\"" \
     'embedded = true' \
