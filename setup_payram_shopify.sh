@@ -109,7 +109,14 @@ else
 fi
 
 # =============================================================================
-# STEP 4 — Shopify app credentials (via CLI)
+# STEP 4 — Pull Docker image (needed before auth step uses it)
+# =============================================================================
+step "Pulling Docker image"
+info "Pulling ${DOCKER_IMAGE} ..."
+docker pull "$DOCKER_IMAGE"
+
+# =============================================================================
+# STEP 5 — Shopify app credentials (via CLI)
 # =============================================================================
 step "Shopify app credentials"
 
@@ -237,14 +244,7 @@ else
 fi
 
 # =============================================================================
-# STEP 7 — Pull Docker image
-# =============================================================================
-step "Pulling Docker image"
-info "Pulling ${DOCKER_IMAGE} ..."
-docker pull "$DOCKER_IMAGE"
-
-# =============================================================================
-# STEP 8 — Start the container
+# STEP 7 — Start the container
 # =============================================================================
 step "Starting the connector"
 
