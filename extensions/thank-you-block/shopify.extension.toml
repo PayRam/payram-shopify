@@ -3,8 +3,8 @@ uid = "fe87973a-e963-71dc-addd-7073d35f08257b672ac0"
 
 [[extensions]]
 type = "ui_extension"
-name = "Payram Thank You Block"
-handle = "payram-thank-you-block"
+name = "Payram Checkout Plugin"
+handle = "payram-checkout-plugin-block"
 
   [[extensions.targeting]]
   target = "purchase.thank-you.block.render"
