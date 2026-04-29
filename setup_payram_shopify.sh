@@ -241,14 +241,9 @@ else
   echo ""
 fi
 
-# Single Docker run: handles auth (fresh or expired), deploys app + extension,
-# pulls credentials. Works identically on first run and re-runs.
-docker run --rm -it \
-  --user root \
-  -v payram-shopify-cli-auth:/root/.config/shopify \
-  -v "${INSTALL_DIR}:/workspace" \
-  "$DOCKER_IMAGE" \
-  sh <<'EOF' || die "App deploy failed. See output above."
+DEPLOY_SCRIPT="${INSTALL_DIR}/.payram-deploy.sh"
+cat > "$DEPLOY_SCRIPT" <<'EOF'
+#!/bin/sh
 set -e
 cp /workspace/shopify.app.toml /app/shopify.app.toml
 # Save our desired toml (with app_proxy) before the link step overwrites it.
@@ -277,6 +272,18 @@ chmod 644 /workspace/.shopify-creds.env
 cp /app/shopify.app.toml /workspace/shopify.app.toml
 echo '[payram-deploy] SUCCESS'
 EOF
+chmod 700 "$DEPLOY_SCRIPT"
+
+# Single Docker run: handles auth (fresh or expired), deploys app + extension,
+# pulls credentials. Works identically on first run and re-runs.
+docker run --rm -it \
+  --user root \
+  -v payram-shopify-cli-auth:/root/.config/shopify \
+  -v "${INSTALL_DIR}:/workspace" \
+  "$DOCKER_IMAGE" \
+  sh /workspace/.payram-deploy.sh || die "App deploy failed. See output above."
+
+rm -f "$DEPLOY_SCRIPT"
 
 CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
 [ ! -f "${CREDS_FILE}" ] && die "Credentials file not found after deploy."
