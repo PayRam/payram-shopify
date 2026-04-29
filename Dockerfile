@@ -59,7 +59,8 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 # Runtime-only OS packages
-RUN apk add --no-cache tini
+# openssl + libc6-compat are required by Prisma's query engine binary on Alpine
+RUN apk add --no-cache tini openssl libc6-compat
 
 # Fake xdg-open so the Shopify CLI device-code auth flow doesn't crash
 # on headless servers. The CLI will try to open the browser; this script
