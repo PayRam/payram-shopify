@@ -251,7 +251,15 @@ docker run --rm -it \
   sh -c "
     set -e
     cp /workspace/shopify.app.toml /app/shopify.app.toml
-    npx shopify app config push --force
+    # Save our desired toml (with app_proxy) before the link step overwrites it.
+    # shopify app deploy internally runs 'app config link' which pulls the remote
+    # config (no proxy) and overwrites the toml. We restore after.
+    cp /app/shopify.app.toml /app/shopify.app.desired.toml
+    # First deploy: handles interactive auth + link (overwrites toml) + extension deploy
+    npx shopify app deploy --allow-updates
+    # Auth is now cached and app is linked. Restore our toml with the proxy section.
+    cp /app/shopify.app.desired.toml /app/shopify.app.toml
+    # Second deploy: non-interactive (auth cached, already linked), pushes proxy config.
     npx shopify app deploy --allow-updates
     npx shopify app env pull
     cp /app/.env /workspace/.shopify-creds.env
