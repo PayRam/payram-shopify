@@ -1,0 +1,19 @@
+api_version = "2026-01"
+uid = "fe87973a-e963-71dc-addd-7073d35f08257b672ac0"
+
+[[extensions]]
+type = "ui_extension"
+name = "Payram Thank You Block"
+handle = "payram-thank-you-block"
+
+  [[extensions.targeting]]
+  target = "purchase.thank-you.block.render"
+  module = "./src/Checkout.tsx"
+
+  [extensions.settings]
+
+    [[extensions.settings.fields]]
+    key = "app_backend_base_url"
+    type = "single_line_text_field"
+    name = "App backend base URL"
+    description = "Public URL for this Payram Shopify Connector backend (e.g. https://your-tunnel.trycloudflare.com). Update this whenever the dev tunnel URL changes."

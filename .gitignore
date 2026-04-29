@@ -1,0 +1,53 @@
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+.yarn/
+
+# ── Build output ──────────────────────────────────────────────────────────────
+build/
+.cache/
+public/build/
+dist/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+# Never commit real credentials. Only .env.example is allowed.
+.env
+.env.*
+!.env.example
+
+# ── Database ──────────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+prisma/*.sqlite
+prisma/*.db
+
+# ── Shopify CLI local state ───────────────────────────────────────────────────
+# .shopify/ contains dev store URL, session cache, and bundled dev assets.
+# Each developer's machine will have different values.
+.shopify/
+
+# ── Shopify-specific toml files generated/overwritten by CLI ─────────────────
+# shopify.app.payram-connector.toml is a local dev override populated by
+# `shopify app config link` — it contains developer-specific localhost URLs.
+shopify.app.payram-connector.toml
+
+# ── OS / editor artifacts ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/settings.json
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+tmp/
+temp/

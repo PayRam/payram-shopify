@@ -1,0 +1,24 @@
+name = "payram-shopify-connector"
+client_id = "{{ CLIENT_ID }}"
+application_url = "{{ APPLICATION_URL }}"
+embedded = true
+
+[access_scopes]
+scopes = "read_orders,write_orders,read_customers"
+
+[auth]
+redirect_urls = [
+  "{{ APPLICATION_URL }}/auth/callback",
+  "{{ APPLICATION_URL }}/auth/shopify/callback",
+  "{{ APPLICATION_URL }}/api/auth/callback",
+]
+
+[webhooks]
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  topics = ["app/uninstalled"]
+  uri = "/webhooks"
+
+[pos]
+embedded = false

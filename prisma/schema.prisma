@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Required by @shopify/shopify-app-session-storage-prisma
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// Per-merchant Payram configuration.
+// API key is encrypted at rest (AES-256-GCM).
+model MerchantConfig {
+  id                           String   @id @default(cuid())
+  shop                         String   @unique
+  payramBaseUrl                String
+  payramProjectApiKeyEncrypted String
+  paymentMethodName            String   @default("Pay with Crypto via Payram")
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+}
+
+// Maps a Shopify order to a Payram payment reference.
+model PaymentMapping {
+  id                     String    @id @default(cuid())
+  shop                   String
+  shopifyOrderId         String
+  shopifyOrderName       String?
+  payramReferenceId      String?
+  payramCheckoutUrl      String?
+  payramStatus           String?
+  shopifyFinancialStatus String?
+  shopifyPaidSyncedAt    DateTime?
+  lastSyncAt             DateTime?
+  // Stores sync errors when PCD blocks Shopify order mark-paid calls
+  syncError              String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  @@unique([shop, shopifyOrderId])
+}
