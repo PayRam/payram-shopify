@@ -126,32 +126,34 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
 
   # Write a shopify.app.toml with empty client_id to the install dir.
   # shopify app deploy will create the app and write the real client_id back.
-  cat > "${INSTALL_DIR}/shopify.app.toml" <<TOML
-name = "payram-shopify-connector"
-client_id = ""
-application_url = "${SHOPIFY_APP_URL}"
-embedded = true
-
-[access_scopes]
-scopes = "read_orders,write_orders,read_customers"
-
-[auth]
-redirect_urls = [
-  "${SHOPIFY_APP_URL}/auth/callback",
-  "${SHOPIFY_APP_URL}/auth/shopify/callback",
-  "${SHOPIFY_APP_URL}/api/auth/callback",
-]
-
-[webhooks]
-api_version = "2026-01"
-
-  [[webhooks.subscriptions]]
-  topics = ["app/uninstalled"]
-  uri = "/webhooks"
-
-[pos]
-embedded = false
-TOML
+  # Using printf avoids heredoc parsing issues when the script runs via
+  # /bin/bash -c "$(curl ...)"
+  printf '%s\n' \
+    'name = "payram-shopify-connector"' \
+    'client_id = ""' \
+    "application_url = \"${SHOPIFY_APP_URL}\"" \
+    'embedded = true' \
+    '' \
+    '[access_scopes]' \
+    'scopes = "read_orders,write_orders,read_customers"' \
+    '' \
+    '[auth]' \
+    'redirect_urls = [' \
+    "  \"${SHOPIFY_APP_URL}/auth/callback\"," \
+    "  \"${SHOPIFY_APP_URL}/auth/shopify/callback\"," \
+    "  \"${SHOPIFY_APP_URL}/api/auth/callback\"," \
+    ']' \
+    '' \
+    '[webhooks]' \
+    'api_version = "2026-01"' \
+    '' \
+    '  [[webhooks.subscriptions]]' \
+    '  topics = ["app/uninstalled"]' \
+    '  uri = "/webhooks"' \
+    '' \
+    '[pos]' \
+    'embedded = false' \
+    > "${INSTALL_DIR}/shopify.app.toml"
 
   info "Opening browser to authenticate with your Shopify Partner account..."
   warn "Running on a headless server? A URL will appear below — open it in your browser."
