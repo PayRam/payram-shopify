@@ -8,14 +8,13 @@ Accept crypto payments on your Shopify store via [Payram](https://www.payram.com
 
 ### Prerequisites
 
-| Requirement | Version |
+| Requirement | Notes |
 |---|---|
-| Node.js | ≥ 18 |
-| npm | ≥ 9 |
-| Git | any recent |
-| Docker *(optional)* | any recent |
+| Docker | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
 | A Shopify Partner account | [partners.shopify.com](https://partners.shopify.com) |
 | A Payram account + project | [payram.com](https://www.payram.com) |
+
+No Node.js required on the host — everything runs inside Docker.
 
 ---
 
@@ -29,45 +28,38 @@ On your server (Linux or macOS), run:
 
 The script will:
 
-1. Install dependencies (including Shopify CLI)
-2. Open a browser to log in to your Shopify Partner account
-3. Prompt you to select an existing Shopify app or create a new one — **no manual copy-pasting of credentials needed**
-4. Pull `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, and `SCOPES` automatically into `.env`
-5. Ask for your server's public HTTPS URL and database connection string
-6. Auto-generate an encryption key for stored API keys
-7. Run database migrations and build the app
+1. Check Docker is installed and running
+2. Ask for an install directory (default: `~/payram-shopify-connector`)
+3. Prompt for your Shopify app's **Client ID** and **Client Secret** — get these from [partners.shopify.com](https://partners.shopify.com) → Apps → your app → API credentials
+4. Ask for your server's public HTTPS URL and optional database connection string
+5. Auto-generate an encryption key using `openssl`
+6. Pull the Docker image and start the container
+7. Optionally deploy the checkout UI extension to Shopify's CDN
 
 ---
 
 ### Step 2 — Deploy the checkout UI extension
 
-The Thank You page block is a Shopify-hosted UI extension and must be deployed once to Shopify's CDN. Run this from the install directory:
+The installer offers to do this automatically. If you skipped it, run:
 
 ```bash
-cd ~/payram-shopify-connector
-npx shopify app deploy          # you are already authenticated from Step 1
+docker run --rm -it \
+  --env-file ~/payram-shopify-connector/.env \
+  payram/shopify-connector:latest \
+  npx shopify app deploy
 ```
 
 ---
 
 ### Step 3 — Start the server
 
-**With Node directly:**
-```bash
-cd ~/payram-shopify-connector
-npm start
-```
+The container is already running after the installer. To manage it:
 
-**With Docker:**
 ```bash
-docker run -d \
-  --env-file ~/payram-shopify-connector/.env \
-  -p 3000:3000 \
-  --restart unless-stopped \
-  payram-shopify-connector:latest
+docker logs payram-shopify-connector     # view logs
+docker stop payram-shopify-connector     # stop
+docker start payram-shopify-connector    # restart
 ```
-
-The server listens on port `3000` by default. Put it behind a reverse proxy (nginx, Caddy, etc.) with a valid TLS certificate — Shopify requires HTTPS.
 
 ---
 
@@ -142,12 +134,15 @@ Approve the permission request. This installs the app on your store and creates 
 ## Updating
 
 ```bash
-cd ~/payram-shopify-connector
-git pull
-npm install
-npx prisma migrate deploy
-npm run build
-npm start          # or restart your Docker container
+docker pull payram/shopify-connector:latest
+docker stop payram-shopify-connector && docker rm payram-shopify-connector
+docker run -d \
+  --name payram-shopify-connector \
+  --env-file ~/payram-shopify-connector/.env \
+  -p 3000:3000 \
+  -v payram-shopify-data:/data \
+  --restart unless-stopped \
+  payram/shopify-connector:latest
 ```
 
 ---

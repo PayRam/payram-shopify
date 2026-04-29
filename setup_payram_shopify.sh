@@ -2,16 +2,15 @@
 # =============================================================================
 # Payram Shopify Connector — Self-Hosted Installer
 #
-# Clones the repo, configures credentials via Shopify CLI (no copy-pasting),
-# runs database migrations, builds the app, and starts the server.
+# Only requires Docker. No Node.js needed on the host.
 #
-# Usage (run without cloning first):
+# Usage:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"
 #
 # =============================================================================
 set -euo pipefail
 
-REPO_URL="https://github.com/PayRam/payram-shopify.git"
+DOCKER_IMAGE="payram/shopify-connector:latest"
 DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
 
 # ── colours ──────────────────────────────────────────────────────────────────
@@ -22,10 +21,10 @@ CYAN="\033[36m"
 RED="\033[31m"
 RESET="\033[0m"
 
-info()   { echo -e "${GREEN}[payram]${RESET} $*"; }
-warn()   { echo -e "${YELLOW}[payram]${RESET} $*"; }
-step()   { echo -e "\n${CYAN}${BOLD}▶ $*${RESET}"; }
-die()    { echo -e "\n${RED}[payram] ERROR:${RESET} $*\n" >&2; exit 1; }
+info()  { echo -e "${GREEN}[payram]${RESET} $*"; }
+warn()  { echo -e "${YELLOW}[payram]${RESET} $*"; }
+step()  { echo -e "\n${CYAN}${BOLD}▶ $*${RESET}"; }
+die()   { echo -e "\n${RED}[payram] ERROR:${RESET} $*\n" >&2; exit 1; }
 
 # ── banner ────────────────────────────────────────────────────────────────────
 echo ""
@@ -41,62 +40,35 @@ echo "  Shopify Connector — Self-Hosted Setup"
 echo -e "${RESET}"
 
 # =============================================================================
-# STEP 1 — Prerequisites
+# STEP 1 — Prerequisites (Docker only)
 # =============================================================================
 step "Checking prerequisites"
 
-check_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed. $2"
-}
+command -v docker >/dev/null 2>&1 || die "Docker is required but not installed.
+  Install from: https://docs.docker.com/get-docker/"
 
-check_cmd git  "Install from https://git-scm.com"
-check_cmd node "Install Node.js >= 18 from https://nodejs.org"
-check_cmd npm  "npm is bundled with Node.js"
+docker info >/dev/null 2>&1 || die "Docker is installed but not running. Start Docker and try again."
 
-NODE_MAJOR=$(node -e "console.log(parseInt(process.versions.node))")
-[ "$NODE_MAJOR" -lt 18 ] && die "Node.js >= 18 required (found $(node --version))"
-
-info "node $(node --version)  npm $(npm --version)  git $(git --version | awk '{print $3}')"
-
-if command -v docker >/dev/null 2>&1; then
-  info "docker $(docker --version | awk '{print $3}' | tr -d ',')"
-  HAS_DOCKER=true
-else
-  warn "Docker not found — the app will run directly with Node."
-  HAS_DOCKER=false
-fi
+info "docker $(docker --version | awk '{print $3}' | tr -d ',')"
 
 # =============================================================================
-# STEP 2 — Clone / update the repository
+# STEP 2 — Install directory
 # =============================================================================
-step "Installing Payram Shopify Connector"
+step "Install location"
 
 read -rp "$(echo -e "${BOLD}Install directory${RESET} [${DEFAULT_INSTALL_DIR}]: ")" INSTALL_DIR
 INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
-if [ -d "$INSTALL_DIR/.git" ]; then
-  warn "Directory already exists — pulling latest changes ..."
-  git -C "$INSTALL_DIR" pull --ff-only
-elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR")" ]; then
-  die "Directory '$INSTALL_DIR' exists and is not empty. Choose a different path or remove it first."
-else
-  info "Cloning $REPO_URL → $INSTALL_DIR"
-  git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
-fi
-
+mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
 # =============================================================================
-# STEP 3 — Install npm dependencies (includes @shopify/cli)
+# Helpers for .env
 # =============================================================================
-step "Installing dependencies"
-npm install --prefer-offline
+ENV_FILE="${INSTALL_DIR}/.env"
 
-# =============================================================================
-# Helpers for reading/writing .env
-# =============================================================================
-[ ! -f .env ] && cp .env.example .env
+[ ! -f "$ENV_FILE" ] && touch "$ENV_FILE"
 
 load_env() {
   while IFS='=' read -r key value; do
@@ -104,15 +76,15 @@ load_env() {
     value="${value%\"}"
     value="${value#\"}"
     export "$key=$value" 2>/dev/null || true
-  done < .env
+  done < "$ENV_FILE"
 }
 
 set_env() {
   local var="$1" val="$2"
-  if grep -q "^${var}=" .env 2>/dev/null; then
-    sed -i "s|^${var}=.*|${var}=${val}|" .env
+  if grep -q "^${var}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "s|^${var}=.*|${var}=${val}|" "$ENV_FILE"
   else
-    echo "${var}=${val}" >> .env
+    echo "${var}=${val}" >> "$ENV_FILE"
   fi
   export "${var}=${val}"
 }
@@ -120,33 +92,35 @@ set_env() {
 load_env
 
 # =============================================================================
-# STEP 4 — Shopify authentication + app linking
+# STEP 3 — Shopify app credentials
 # =============================================================================
-step "Connecting to Shopify"
+step "Shopify app credentials"
 
-if [ -z "${SHOPIFY_API_KEY:-}" ]; then
-  info "Logging in to your Shopify Partner account ..."
-  info "(A browser window will open — complete the login there.)"
-  npx shopify auth login
+warn "Create a Shopify app at https://partners.shopify.com → Apps → Create app."
+warn "Then copy the Client ID and Client Secret from the API credentials tab."
+echo ""
 
-  echo ""
-  info "Linking this project to a Shopify app ..."
-  info "(Select an existing app or create a new one when prompted.)"
-  npx shopify app config link
+ask_if_empty() {
+  local var="$1" label="$2" current="${!1:-}"
+  if [ -n "$current" ]; then
+    info "$var already set — skipping."
+    return
+  fi
+  read -rp "$(echo -e "${BOLD}${label}:${RESET} ")" input
+  [ -z "$input" ] && die "$var cannot be empty."
+  set_env "$var" "$input"
+}
 
-  echo ""
-  info "Pulling app credentials into .env ..."
-  npx shopify app env pull --env-file .env
-  load_env
+ask_if_empty SHOPIFY_API_KEY    "Shopify API Key (Client ID)"
+ask_if_empty SHOPIFY_API_SECRET "Shopify API Secret (Client Secret)"
 
-  [ -z "${SHOPIFY_API_KEY:-}" ] && die "SHOPIFY_API_KEY was not set after 'shopify app env pull'. Check the output above."
-  info "Shopify credentials written to .env"
-else
-  info "SHOPIFY_API_KEY already set — skipping Shopify auth."
+# Ensure SCOPES is set
+if ! grep -q "^SCOPES=" "$ENV_FILE" 2>/dev/null; then
+  set_env SCOPES "read_orders,write_orders,read_customers"
 fi
 
 # =============================================================================
-# STEP 5 — App URL
+# STEP 4 — App URL
 # =============================================================================
 step "Server URL"
 
@@ -165,25 +139,20 @@ else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
 fi
 
-# Patch placeholder in shopify.app.toml if still present
-if grep -q "{{ APPLICATION_URL }}" shopify.app.toml 2>/dev/null; then
-  sed -i "s|{{ APPLICATION_URL }}|${SHOPIFY_APP_URL}|g" shopify.app.toml
-fi
-
 # =============================================================================
-# STEP 6 — Database
+# STEP 5 — Database
 # =============================================================================
 step "Database"
 
-warn "Default is SQLite — fine for low traffic. For production use Postgres:"
+warn "Default is SQLite — fine for small stores. For production use Postgres:"
 warn "  postgresql://user:password@host:5432/dbname"
 echo ""
 
 if [ -z "${DATABASE_URL:-}" ]; then
   read -rp "$(echo -e "${BOLD}DATABASE_URL${RESET} [Enter for SQLite default]: ")" db_input
   if [ -z "$db_input" ]; then
-    db_input="file:prod.sqlite"
-    info "Using SQLite: $db_input"
+    db_input="file:/data/prod.sqlite"
+    info "Using SQLite at /data/prod.sqlite (mounted into the container)"
   fi
   set_env DATABASE_URL "$db_input"
 else
@@ -191,73 +160,76 @@ else
 fi
 
 # =============================================================================
-# STEP 7 — Encryption key
+# STEP 6 — Encryption key
 # =============================================================================
 step "Encryption key"
 
 if [ -z "${ENCRYPTION_KEY:-}" ]; then
-  enc_key=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+  # openssl is available on all Linux/macOS systems — no Node required
+  enc_key=$(openssl rand -hex 32)
   set_env ENCRYPTION_KEY "$enc_key"
-  warn "Auto-generated ENCRYPTION_KEY written to .env."
+  warn "Auto-generated ENCRYPTION_KEY written to .env"
   warn "Back this up — losing it makes stored merchant API keys unrecoverable."
 else
   info "ENCRYPTION_KEY already set"
 fi
 
 # =============================================================================
-# STEP 8 — Database migrations + build
+# STEP 7 — Pull Docker image
 # =============================================================================
-step "Running database migrations"
-npx prisma migrate deploy
-npx prisma generate
-
-step "Building the application"
-NODE_ENV=production npm run build
+step "Pulling Docker image"
+info "Pulling ${DOCKER_IMAGE} ..."
+docker pull "$DOCKER_IMAGE"
 
 # =============================================================================
-# STEP 9 — Deploy Shopify extension
+# STEP 8 — Start the container
+# =============================================================================
+step "Starting the connector"
+
+# Stop + remove any existing container with the same name
+if docker ps -a --format '{{.Names}}' | grep -q '^payram-shopify-connector$'; then
+  warn "Existing container found — stopping and replacing it ..."
+  docker stop payram-shopify-connector >/dev/null
+  docker rm payram-shopify-connector >/dev/null
+fi
+
+# Create a named volume for SQLite persistence (ignored if using Postgres)
+docker volume create payram-shopify-data >/dev/null 2>&1 || true
+
+docker run -d \
+  --name payram-shopify-connector \
+  --env-file "${ENV_FILE}" \
+  -p 3000:3000 \
+  -v payram-shopify-data:/data \
+  --restart unless-stopped \
+  "$DOCKER_IMAGE"
+
+info "Container started."
+
+# =============================================================================
+# STEP 9 — Deploy Shopify checkout extension (one-time)
 # =============================================================================
 step "Deploying checkout UI extension"
-info "Publishing the Thank You Block extension to Shopify's CDN ..."
-npx shopify app deploy
 
-# =============================================================================
-# STEP 10 — Optional Docker build + start
-# =============================================================================
-if [ "$HAS_DOCKER" = true ]; then
-  echo ""
-  read -rp "$(echo -e "${BOLD}Build and run as a Docker container? [y/N]:${RESET} ")" use_docker
-  if [[ "${use_docker,,}" == "y" ]]; then
-    step "Building Docker image"
-    docker build \
-      --build-arg SHOPIFY_API_KEY="${SHOPIFY_API_KEY:-}" \
-      --build-arg SHOPIFY_APP_URL="${SHOPIFY_APP_URL:-}" \
-      -t payram-shopify-connector:latest \
-      .
+warn "The Thank You Block extension must be deployed to Shopify's CDN once."
+warn "This step opens a browser to authenticate with your Shopify Partner account."
+echo ""
+read -rp "$(echo -e "${BOLD}Deploy the extension now? [Y/n]:${RESET} ")" deploy_ext
+deploy_ext="${deploy_ext:-y}"
 
-    step "Starting Docker container"
-    docker run -d \
-      --name payram-shopify-connector \
-      --env-file "${INSTALL_DIR}/.env" \
-      -p 3000:3000 \
-      --restart unless-stopped \
-      payram-shopify-connector:latest
-
-    info "Container started. Check status with: docker logs payram-shopify-connector"
-    STARTED_WITH_DOCKER=true
-  fi
-fi
-
-if [ "${STARTED_WITH_DOCKER:-false}" != "true" ]; then
-  step "Starting server"
-  info "Starting on port ${PORT:-3000} ..."
-  [ -f .env ] && { set -o allexport; source .env; set +o allexport; }
-  npx prisma migrate deploy
-  exec node_modules/.bin/remix-serve ./build/server/index.js
+if [[ "${deploy_ext,,}" == "y" ]]; then
+  docker run --rm -it \
+    --env-file "${ENV_FILE}" \
+    "$DOCKER_IMAGE" \
+    npx shopify app deploy
+  info "Extension deployed."
+else
+  warn "Skipped. Run this later to deploy the extension:"
+  warn "  docker run --rm -it --env-file ${ENV_FILE} ${DOCKER_IMAGE} npx shopify app deploy"
 fi
 
 # =============================================================================
-# Final instructions (only reached if Docker was used)
+# Done
 # =============================================================================
 echo ""
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
@@ -265,9 +237,17 @@ echo -e "${BOLD}${GREEN}  Payram Shopify Connector is running!${RESET}"
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  ${CYAN}1.${RESET} Install the app on your Shopify store:"
-echo -e "       ${SHOPIFY_APP_URL}/auth?shop=your-store.myshopify.com"
+echo -e "       ${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/auth?shop=your-store.myshopify.com"
 echo ""
-echo -e "  ${CYAN}2.${RESET} In Shopify Admin → Online Store → Checkout → Customize"
+echo -e "  ${CYAN}2.${RESET} In Shopify Admin → Settings → Payments → Manual payment methods"
+echo -e "       add: 'Pay with Crypto via Payram'"
+echo ""
+echo -e "  ${CYAN}3.${RESET} In Shopify Admin → Online Store → Checkout → Customize"
 echo -e "       → Thank You page → Add block → Payram Thank You Block."
-echo -e "       Set 'App backend base URL' to: ${SHOPIFY_APP_URL}"
+echo -e "       Set 'App backend base URL' to: ${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}"
+echo ""
+echo -e "  ${CYAN}Manage container:${RESET}"
+echo -e "       docker logs payram-shopify-connector"
+echo -e "       docker stop payram-shopify-connector"
+echo -e "       docker start payram-shopify-connector"
 echo ""
