@@ -17,6 +17,8 @@ export default function handleRequest(
   remixContext: EntryContext
 ) {
   addDocumentResponseHeaders(request, responseHeaders);
+  // Bypass ngrok browser-warning interstitial for all responses (harmless on production)
+  responseHeaders.set("ngrok-skip-browser-warning", "1");
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? "") ? "onAllReady" : "onShellReady";
 
@@ -51,4 +53,9 @@ export default function handleRequest(
     );
     setTimeout(abort, ABORT_DELAY);
   });
+}
+
+export function handleDataRequest(response: Response) {
+  response.headers.set("ngrok-skip-browser-warning", "1");
+  return response;
 }
