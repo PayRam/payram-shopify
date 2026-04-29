@@ -150,6 +150,7 @@ export default function SettingsPage() {
 
   const [baseUrl, setBaseUrl] = useState(payramBaseUrl);
   const [methodName, setMethodName] = useState(paymentMethodName);
+  const [apiKey, setApiKey] = useState("");
 
   return (
     <Page title="Payram Connector Settings">
@@ -186,6 +187,8 @@ export default function SettingsPage() {
                     label="Payram Project API Key"
                     name="payramProjectApiKey"
                     type="password"
+                    value={apiKey}
+                    onChange={setApiKey}
                     autoComplete="new-password"
                     placeholder={
                       hasApiKey ? "•••••••••••••• (saved)" : "Enter API Key"
