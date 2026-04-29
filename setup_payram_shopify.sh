@@ -252,14 +252,20 @@ docker run --rm -it \
     set -e
     cp /workspace/shopify.app.toml /app/shopify.app.toml
     # Save our desired toml (with app_proxy) before the link step overwrites it.
-    # shopify app deploy internally runs 'app config link' which pulls the remote
-    # config (no proxy) and overwrites the toml. We restore after.
+    # shopify app deploy internally runs 'app config link' on first run, which
+    # pulls the remote config (no proxy) and overwrites the toml.
     cp /app/shopify.app.toml /app/shopify.app.desired.toml
-    # First deploy: handles interactive auth + link (overwrites toml) + extension deploy
+    # First deploy: handles interactive auth + link (may overwrite toml) + extension deploy
     npx shopify app deploy --allow-updates
-    # Auth is now cached and app is linked. Restore our toml with the proxy section.
+    # Extract the client_id that was written to the toml during linking.
+    LINKED_CLIENT_ID=$(grep '^client_id' /app/shopify.app.toml | sed 's/.*= *//' | tr -d '"' | tr -d "'")
+    # Restore our desired toml with the proxy section, and inject the real client_id
+    # so the second deploy is fully non-interactive.
     cp /app/shopify.app.desired.toml /app/shopify.app.toml
-    # Second deploy: non-interactive (auth cached, already linked), pushes proxy config.
+    if [ -n "$LINKED_CLIENT_ID" ]; then
+      sed -i "s/^client_id = .*/client_id = \"${LINKED_CLIENT_ID}\"/" /app/shopify.app.toml
+    fi
+    # Second deploy: non-interactive (auth cached, client_id set), pushes proxy config.
     npx shopify app deploy --allow-updates
     npx shopify app env pull
     cp /app/.env /workspace/.shopify-creds.env
