@@ -31,8 +31,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const email = url.searchParams.get("email") ?? undefined;
 
   // --- Input validation ---
-  if (!/^\d+$/.test(shopifyOrderId)) {
-    return new Response("Invalid shopifyOrderId — must be numeric.", {
+  if (!/^\d+$/.test(shopifyOrderId) || shopifyOrderId === "0") {
+    return new Response("Invalid shopifyOrderId — must be a positive integer.", {
       status: 400,
     });
   }

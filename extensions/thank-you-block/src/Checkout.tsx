@@ -87,7 +87,8 @@ function PayramBlock() {
 
   const rawOrderId = orderConfirmation?.order?.id ?? "";
   const orderId = rawOrderId.split("/").pop() ?? "";
-  const validOrderId = !!orderId && /^\d+$/.test(orderId);
+  // orderId "0" is editor-preview mock data — treat as invalid
+  const validOrderId = !!orderId && orderId !== "0" && /^\d+$/.test(orderId);
 
   const totalAmount = useTotalAmount();
   const amountInUSD = totalAmount.amount;
@@ -111,11 +112,16 @@ function PayramBlock() {
     }
   };
 
+  const normalizeBaseUrl = (u: string) => {
+    const trimmed = u.trim().replace(/\/$/, "");
+    if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
+      return `https://${trimmed}`;
+    }
+    return trimmed;
+  };
+
   const buildHref = () =>
-    `${appBackendBaseUrl!.replace(
-      /\/$/,
-      "",
-    )}/api/payram/redirect-to-payment?${new URLSearchParams({
+    `${normalizeBaseUrl(appBackendBaseUrl!)}/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
       amountInUSD: String(amountInUSD),
       email,
