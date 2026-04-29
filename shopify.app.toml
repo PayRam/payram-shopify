@@ -1,4 +1,4 @@
-name = "payram-connector"
+name = "{{ APP_NAME }}"
 client_id = "{{ CLIENT_ID }}"
 application_url = "{{ APPLICATION_URL }}"
 embedded = true
@@ -26,4 +26,4 @@ embedded = false
 [app_proxy]
 url = "{{ APPLICATION_URL }}"
 prefix = "apps"
-subpath = "payram-connector"
+subpath = "payram-checkout-plugin"

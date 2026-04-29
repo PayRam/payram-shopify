@@ -5,7 +5,7 @@
  * "Complete Crypto Payment" on the Thank You page extension.
  *
  * The request arrives via the Shopify App Proxy:
- *   https://{shop}/apps/payram-connector/api/payram/redirect-to-payment?...
+ *   https://{shop}/apps/payram-checkout-plugin/api/payram/redirect-to-payment?...
  * Shopify forwards it here with `shop`, `path_prefix`, `timestamp`, `signature`
  * appended. We verify the HMAC signature before processing.
  *

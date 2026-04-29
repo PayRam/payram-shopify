@@ -90,9 +90,9 @@ function PayramBlock() {
   };
 
   // Use Shopify App Proxy — stable URL that never changes when tunnel restarts.
-  // Shopify proxies https://{shopDomain}/apps/payram-connector/... → app backend.
+  // Shopify proxies https://{shopDomain}/apps/payram-checkout-plugin/... → app backend.
   const buildHref = () =>
-    `https://${shopDomain}/apps/payram-connector/api/payram/redirect-to-payment?${new URLSearchParams({
+    `https://${shopDomain}/apps/payram-checkout-plugin/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
       amountInUSD: String(amountInUSD),
       email,

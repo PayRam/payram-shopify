@@ -165,9 +165,14 @@ else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
 fi
 
-# =============================================================================
-# STEP 4 — Pull Docker image (needed before auth step uses it)
-# =============================================================================
+# App name (shown in Shopify Partners and checkout editor)
+if [ -z "${SHOPIFY_APP_NAME:-}" ]; then
+  read -rp "$(echo -e "${BOLD}App name${RESET} [Payram Connector]: ")" app_name_input
+  app_name_input="${app_name_input:-Payram Checkout Plugin}"
+  set_env SHOPIFY_APP_NAME "$app_name_input"
+else
+  info "SHOPIFY_APP_NAME already set (${SHOPIFY_APP_NAME})"
+fi
 step "Pulling Docker image"
 info "Pulling ${DOCKER_IMAGE} ..."
 docker pull "$DOCKER_IMAGE"
@@ -184,7 +189,7 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
   # Write a shopify.app.toml with empty client_id to the install dir.
   # shopify app deploy will create the app and write the real client_id back.
   printf '%s\n' \
-    'name = "payram-connector"' \
+    "name = \"${SHOPIFY_APP_NAME}\"" \
     'client_id = ""' \
     "application_url = \"${SHOPIFY_APP_URL}\"" \
     'embedded = true' \
@@ -212,7 +217,7 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
     '[app_proxy]' \
     "url = \"${SHOPIFY_APP_URL}\"" \
     'prefix = "apps"' \
-    'subpath = "payram-connector"' \
+    'subpath = "payram-checkout-plugin"' \
     > "${INSTALL_DIR}/shopify.app.toml"
 
   info "A browser login URL will appear below — open it to authenticate."
