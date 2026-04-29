@@ -114,43 +114,41 @@ function PayramBlock() {
         <s-heading level={2}>Pay with Crypto via Payram</s-heading>
 
         {/* Body */}
-        {!validOrderId || !shopDomain ? (
-          <s-text>
-            Your order has been received. Complete your crypto payment using the
-            link in your confirmation email.
+        <s-text>
+          Enter your email address below and click the button to complete your
+          crypto payment via Payram.
+        </s-text>
+
+        <s-text-field
+          label="Email address"
+          type="email"
+          value={email}
+          required
+          onInput={handleEmailChange}
+          onChange={handleEmailChange}
+        />
+
+        {emailError && (
+          <s-text tone="critical" emphasis="bold">
+            {emailError}
           </s-text>
-        ) : (
-          <>
-            <s-text>
-              Your order is reserved — enter your email below and click the
-              button to complete your crypto payment and confirm the order.
-            </s-text>
+        )}
 
-            <s-text-field
-              label="Email address"
-              type="email"
-              value={email}
-              required
-              onInput={handleEmailChange}
-              onChange={handleEmailChange}
-            />
+        <s-button
+          variant="primary"
+          inlineSize="fill"
+          href={validOrderId && shopDomain && isValidEmail(email) ? buildHref() : undefined}
+          target="_blank"
+          disabled={!validOrderId || !shopDomain || undefined}
+          onClick={handlePay}
+        >
+          Complete Crypto Payment →
+        </s-button>
 
-            {emailError && (
-              <s-text tone="critical" emphasis="bold">
-                {emailError}
-              </s-text>
-            )}
-
-            <s-button
-              variant="primary"
-              inlineSize="fill"
-              href={isValidEmail(email) ? buildHref() : undefined}
-              target="_blank"
-              onClick={handlePay}
-            >
-              Complete Crypto Payment →
-            </s-button>
-          </>
+        {(!validOrderId || !shopDomain) && (
+          <s-text tone="subdued">
+            (Preview only — button activates on a real order)
+          </s-text>
         )}
       </s-stack>
     </s-box>
