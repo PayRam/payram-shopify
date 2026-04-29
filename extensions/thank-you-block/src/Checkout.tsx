@@ -9,7 +9,11 @@
 
 // Side-effect: registers Preact as the renderer for s-* custom elements
 import "@shopify/ui-extensions/preact";
-import { useApi, useShop, useTotalAmount } from "@shopify/ui-extensions/checkout/preact";
+import {
+  useApi,
+  useShop,
+  useTotalAmount,
+} from "@shopify/ui-extensions/checkout/preact";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
 
@@ -51,22 +55,34 @@ interface PayramSettings {
 function PayramBlock() {
   const api = useApi<"purchase.thank-you.block.render">();
 
-  const [appBackendBaseUrl, setAppBackendBaseUrl] = useState<string | undefined>(
-    () => (api.settings.value as Partial<PayramSettings>)?.app_backend_base_url?.trim() || undefined
+  const [appBackendBaseUrl, setAppBackendBaseUrl] = useState<
+    string | undefined
+  >(
+    () =>
+      (
+        api.settings.value as Partial<PayramSettings>
+      )?.app_backend_base_url?.trim() || undefined,
   );
-  const [orderConfirmation, setOrderConfirmation] = useState<{ order: { id: string }; isFirstOrder: boolean } | null>(
-    () => api.orderConfirmation.value ?? null
-  );
+  const [orderConfirmation, setOrderConfirmation] = useState<{
+    order: { id: string };
+    isFirstOrder: boolean;
+  } | null>(() => api.orderConfirmation.value ?? null);
 
   useEffect(() => {
     const unsubSettings = api.settings.subscribe((v) => {
-      setAppBackendBaseUrl((v as Partial<PayramSettings>)?.app_backend_base_url?.trim() || undefined);
+      setAppBackendBaseUrl(
+        (v as Partial<PayramSettings>)?.app_backend_base_url?.trim() ||
+          undefined,
+      );
     });
     const unsubOrder = api.orderConfirmation.subscribe((v) => {
       setOrderConfirmation(v ?? null);
     });
-    return () => { unsubSettings(); unsubOrder(); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      unsubSettings();
+      unsubOrder();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const rawOrderId = orderConfirmation?.order?.id ?? "";
@@ -89,12 +105,17 @@ function PayramBlock() {
     const val = detail?.value ?? target?.value ?? "";
     setEmail(val);
     if (submitted) {
-      setEmailError(isValidEmail(val) ? "" : "Please enter a valid email address.");
+      setEmailError(
+        isValidEmail(val) ? "" : "Please enter a valid email address.",
+      );
     }
   };
 
   const buildHref = () =>
-    `${appBackendBaseUrl!.replace(/\/$/, "")}/api/payram/redirect-to-payment?${new URLSearchParams({
+    `${appBackendBaseUrl!.replace(
+      /\/$/,
+      "",
+    )}/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
       amountInUSD: String(amountInUSD),
       email,
@@ -118,12 +139,14 @@ function PayramBlock() {
         {/* Body */}
         {!validOrderId || !appBackendBaseUrl ? (
           <s-text>
-            Your order has been received. Complete your crypto payment using the link in your confirmation email.
+            Your order has been received. Complete your crypto payment using the
+            link in your confirmation email.
           </s-text>
         ) : (
           <>
             <s-text>
-              Your order is reserved — enter your email below and click the button to complete your crypto payment and confirm the order.
+              Your order is reserved — enter your email below and click the
+              button to complete your crypto payment and confirm the order.
             </s-text>
 
             <s-text-field
@@ -136,7 +159,9 @@ function PayramBlock() {
             />
 
             {emailError && (
-              <s-text tone="critical" emphasis="bold">{emailError}</s-text>
+              <s-text tone="critical" emphasis="bold">
+                {emailError}
+              </s-text>
             )}
 
             <s-button
@@ -161,4 +186,3 @@ function PayramBlock() {
 export default function () {
   render(<PayramBlock />, document.body);
 }
-
