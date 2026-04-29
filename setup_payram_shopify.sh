@@ -220,6 +220,8 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
       npx shopify app env pull
       cp /app/.env /workspace/.shopify-creds.env
       chmod 644 /workspace/.shopify-creds.env
+      # Copy updated toml (with real client_id written by CLI) back to workspace
+      cp /app/shopify.app.toml /workspace/shopify.app.toml
     " || die "App creation or deploy failed. See output above."
 
   CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
