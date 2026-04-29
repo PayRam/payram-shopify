@@ -174,51 +174,50 @@ docker pull "$DOCKER_IMAGE"
 # =============================================================================
 step "Shopify app credentials"
 
+# Persistent volume for CLI auth state — survives between docker run invocations
+docker volume create payram-shopify-cli-auth >/dev/null 2>&1 || true
+
+# Write shopify.app.toml with the known client_id (or empty for first run)
+# so the CLI knows which app to deploy to without interactive prompts on re-runs.
+printf '%s\n' \
+  'name = "payram-checkout-plugin"' \
+  "client_id = \"${SHOPIFY_API_KEY:-}\"" \
+  "application_url = \"${SHOPIFY_APP_URL}\"" \
+  'embedded = true' \
+  '' \
+  '[access_scopes]' \
+  'scopes = "read_orders,write_orders,read_customers"' \
+  '' \
+  '[auth]' \
+  'redirect_urls = [' \
+  "  \"${SHOPIFY_APP_URL}/auth/callback\"," \
+  "  \"${SHOPIFY_APP_URL}/auth/shopify/callback\"," \
+  "  \"${SHOPIFY_APP_URL}/api/auth/callback\"," \
+  ']' \
+  '' \
+  '[webhooks]' \
+  'api_version = "2026-01"' \
+  '' \
+  '  [[webhooks.subscriptions]]' \
+  '  topics = ["app/uninstalled"]' \
+  '  uri = "/webhooks"' \
+  '' \
+  '[pos]' \
+  'embedded = false' \
+  '' \
+  '[app_proxy]' \
+  "url = \"${SHOPIFY_APP_URL}\"" \
+  'prefix = "apps"' \
+  'subpath = "payram-checkout-plugin"' \
+  > "${INSTALL_DIR}/shopify.app.toml"
+
 if [ -z "${SHOPIFY_API_KEY:-}" ]; then
-  # Persistent volume for CLI auth state — survives between docker run invocations
-  docker volume create payram-shopify-cli-auth >/dev/null 2>&1 || true
-
-  # Write a shopify.app.toml with empty client_id to the install dir.
-  # shopify app deploy will create the app and write the real client_id back.
-  printf '%s\n' \
-    'name = "payram-checkout-plugin"' \
-    'client_id = ""' \
-    "application_url = \"${SHOPIFY_APP_URL}\"" \
-    'embedded = true' \
-    '' \
-    '[access_scopes]' \
-    'scopes = "read_orders,write_orders,read_customers"' \
-    '' \
-    '[auth]' \
-    'redirect_urls = [' \
-    "  \"${SHOPIFY_APP_URL}/auth/callback\"," \
-    "  \"${SHOPIFY_APP_URL}/auth/shopify/callback\"," \
-    "  \"${SHOPIFY_APP_URL}/api/auth/callback\"," \
-    ']' \
-    '' \
-    '[webhooks]' \
-    'api_version = "2026-01"' \
-    '' \
-    '  [[webhooks.subscriptions]]' \
-    '  topics = ["app/uninstalled"]' \
-    '  uri = "/webhooks"' \
-    '' \
-    '[pos]' \
-    'embedded = false' \
-    '' \
-    '[app_proxy]' \
-    "url = \"${SHOPIFY_APP_URL}\"" \
-    'prefix = "apps"' \
-    'subpath = "payram-checkout-plugin"' \
-    > "${INSTALL_DIR}/shopify.app.toml"
-
+  # ── First run: full auth + deploy + credentials pull ──────────────────────
   info "A browser login URL will appear below — open it to authenticate."
   info "You will then be asked to select your organization and confirm the app name."
   warn "Choose 'Create new app' when prompted for the app."
   echo ""
 
-  # Single container: auth + deploy + env pull all share the same process/session.
-  # env pull writes to /app/.env by default; we copy it to /workspace for extraction.
   docker run --rm -it \
     --user root \
     -v payram-shopify-cli-auth:/root/.config/shopify \
@@ -231,14 +230,11 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
       npx shopify app env pull
       cp /app/.env /workspace/.shopify-creds.env
       chmod 644 /workspace/.shopify-creds.env
-      # Copy updated toml (with real client_id written by CLI) back to workspace
       cp /app/shopify.app.toml /workspace/shopify.app.toml
     " || die "App creation or deploy failed. See output above."
 
   CREDS_FILE="${INSTALL_DIR}/.shopify-creds.env"
-  if [ ! -f "${CREDS_FILE}" ]; then
-    die "Credentials file not found after deploy. Check the output above for errors."
-  fi
+  [ ! -f "${CREDS_FILE}" ] && die "Credentials file not found after deploy. Check the output above for errors."
 
   API_KEY=$(grep    '^SHOPIFY_API_KEY='    "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
   API_SECRET=$(grep '^SHOPIFY_API_SECRET=' "${CREDS_FILE}" | cut -d'=' -f2- | tr -d '"\r')
@@ -253,7 +249,22 @@ if [ -z "${SHOPIFY_API_KEY:-}" ]; then
   info "App created and extension deployed."
   info "  API Key: ${API_KEY}"
 else
-  info "SHOPIFY_API_KEY already set — skipping."
+  # ── Re-run: redeploy extension with updated URL / code ────────────────────
+  info "Redeploying extension (SHOPIFY_API_KEY already set) ..."
+
+  docker run --rm -it \
+    --user root \
+    -v payram-shopify-cli-auth:/root/.config/shopify \
+    -v "${INSTALL_DIR}:/workspace" \
+    "$DOCKER_IMAGE" \
+    sh -c "
+      set -e
+      cp /workspace/shopify.app.toml /app/shopify.app.toml
+      npx shopify app deploy --allow-updates
+      cp /app/shopify.app.toml /workspace/shopify.app.toml
+    " || warn "Extension redeploy failed — run with --reset if this persists."
+
+  info "Extension redeployed."
 fi
 
 # Ensure SCOPES is set
