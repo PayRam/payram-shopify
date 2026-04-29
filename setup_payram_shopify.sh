@@ -13,6 +13,14 @@ set -euo pipefail
 DOCKER_IMAGE="mason0816/payram-shopify-test:latest"
 DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
 
+# ── argument parsing ──────────────────────────────────────────────────────────
+RESET_MODE=false
+for arg in "$@"; do
+  case "$arg" in
+    --reset) RESET_MODE=true ;;
+  esac
+done
+
 # ── colours ──────────────────────────────────────────────────────────────────
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -40,7 +48,47 @@ echo "  Shopify Connector — Self-Hosted Setup"
 echo -e "${RESET}"
 
 # =============================================================================
+# --reset: wipe everything and exit
+# =============================================================================
+if [ "$RESET_MODE" = true ]; then
+  step "Reset — removing all Payram Shopify Connector data"
+
+  read -rp "$(echo -e "${BOLD}Install directory to reset${RESET} [${DEFAULT_INSTALL_DIR}]: ")" RESET_DIR
+  RESET_DIR="${RESET_DIR:-$DEFAULT_INSTALL_DIR}"
+  RESET_DIR="${RESET_DIR/#\~/$HOME}"
+
+  echo ""
+  warn "This will:"
+  warn "  • Stop and remove container: payram-shopify-connector"
+  warn "  • Delete Docker volumes:     payram-shopify-data, payram-shopify-cli-auth"
+  warn "  • Delete .env and shopify.app.toml in: ${RESET_DIR}"
+  echo ""
+  read -rp "$(echo -e "${RED}${BOLD}Type 'yes' to confirm reset:${RESET} ")" confirm
+  [ "$confirm" != "yes" ] && { info "Reset cancelled."; exit 0; }
+
+  echo ""
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^payram-shopify-connector$'; then
+    docker stop payram-shopify-connector >/dev/null 2>&1 || true
+    docker rm   payram-shopify-connector >/dev/null 2>&1 || true
+    info "Container removed."
+  else
+    info "No container found — skipping."
+  fi
+
+  docker volume rm payram-shopify-data      >/dev/null 2>&1 && info "Volume payram-shopify-data removed."      || info "Volume payram-shopify-data not found — skipping."
+  docker volume rm payram-shopify-cli-auth  >/dev/null 2>&1 && info "Volume payram-shopify-cli-auth removed."  || info "Volume payram-shopify-cli-auth not found — skipping."
+
+  rm -f "${RESET_DIR}/.env" && info "Removed ${RESET_DIR}/.env" || true
+  rm -f "${RESET_DIR}/shopify.app.toml" && info "Removed ${RESET_DIR}/shopify.app.toml" || true
+
+  echo ""
+  info "Reset complete. Re-run the installer to start fresh."
+  exit 0
+fi
+
+# =============================================================================
 # STEP 1 — Prerequisites (Docker only)
+# =============================================================================
 # =============================================================================
 step "Checking prerequisites"
 
