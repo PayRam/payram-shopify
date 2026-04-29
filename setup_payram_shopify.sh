@@ -262,7 +262,7 @@ else
       cp /workspace/shopify.app.toml /app/shopify.app.toml
       npx shopify app deploy --allow-updates
       cp /app/shopify.app.toml /workspace/shopify.app.toml
-    " || warn "Extension redeploy failed — run with --reset if this persists."
+    " || die "Extension redeploy failed — see output above."
 
   info "Extension redeployed."
 fi
