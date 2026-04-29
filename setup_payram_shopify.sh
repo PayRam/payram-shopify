@@ -144,14 +144,15 @@ load_env
 # =============================================================================
 step "Server URL"
 
-warn "This must be the public HTTPS URL where this server will be reachable."
-warn "Examples: https://payram.yourstore.com  or  https://your-server.example.com"
+warn "This must be the public HTTPS URL where this Shopify connector is reachable."
+warn "If using Cloudflare Tunnel, the URL changes on every restart — update it here."
+warn "Examples: https://your-tunnel.trycloudflare.com  or  https://payram.yourstore.com"
 echo ""
 
-if [ -z "${SHOPIFY_APP_URL:-}" ]; then
+_read_app_url() {
   while true; do
     read -rp "$(echo -e "${BOLD}Public HTTPS App URL (no trailing slash):${RESET} ")" app_url_input
-    app_url_input="${app_url_input%/}"   # strip trailing slash
+    app_url_input="${app_url_input%/}"
     if [ -z "$app_url_input" ]; then
       warn "URL cannot be empty. Enter the full https:// address."
     elif [[ "$app_url_input" != https://* ]]; then
@@ -160,9 +161,27 @@ if [ -z "${SHOPIFY_APP_URL:-}" ]; then
       break
     fi
   done
-  set_env SHOPIFY_APP_URL "$app_url_input"
+  echo "$app_url_input"
+}
+
+if [ -z "${SHOPIFY_APP_URL:-}" ]; then
+  SHOPIFY_APP_URL=$(_read_app_url)
+  set_env SHOPIFY_APP_URL "$SHOPIFY_APP_URL"
 else
-  info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
+  echo -e "  Current App URL: ${CYAN}${SHOPIFY_APP_URL}${RESET}"
+  read -rp "$(echo -e "${BOLD}Press Enter to keep it, or type a new URL:${RESET} ")" app_url_update
+  app_url_update="${app_url_update%/}"
+  if [ -n "$app_url_update" ]; then
+    if [[ "$app_url_update" != https://* ]]; then
+      warn "URL must start with https:// — got: ${app_url_update}"
+      app_url_update=$(_read_app_url)
+    fi
+    set_env SHOPIFY_APP_URL "$app_url_update"
+    SHOPIFY_APP_URL="$app_url_update"
+    info "App URL updated to: ${SHOPIFY_APP_URL}"
+  else
+    info "Keeping existing App URL: ${SHOPIFY_APP_URL}"
+  fi
 fi
 
 step "Pulling Docker image"
