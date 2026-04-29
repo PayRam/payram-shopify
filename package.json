@@ -22,6 +22,7 @@
     "@remix-run/react": "^2.13.1",
     "@remix-run/serve": "^2.13.1",
     "@shopify/app-bridge-react": "^4.1.6",
+    "@shopify/cli": "^3.94.3",
     "@shopify/polaris": "^13.9.5",
     "@shopify/shopify-app-remix": "^3.5.0",
     "@shopify/shopify-app-session-storage-prisma": "^5.1.4",
@@ -31,7 +32,6 @@
   },
   "devDependencies": {
     "@remix-run/dev": "^2.13.1",
-    "@shopify/cli": "^3.94.3",
     "@types/react": "^18.2.66",
     "@types/react-dom": "^18.2.22",
     "prisma": "^5.20.0",
