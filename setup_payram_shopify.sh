@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Payram Shopify Connector — Self-Hosted Installer
+# Payram Shopify Connector — Self-Hosted Installer  (v2)
 #
 # Only requires Docker. No Node.js needed on the host.
 #
