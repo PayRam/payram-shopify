@@ -156,25 +156,6 @@ else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
 fi
 
-# Store domain (used for install URL in final output)
-if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
-  echo ""
-  read -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. payram-test-store.myshopify.com): ")" store_domain_input
-  store_domain_input="${store_domain_input// /}"       # strip spaces
-  store_domain_input="${store_domain_input#https://}"  # strip https://
-  store_domain_input="${store_domain_input#http://}"   # strip http://
-  store_domain_input="${store_domain_input%/}"         # strip trailing slash
-  [ -z "$store_domain_input" ] && die "Store domain cannot be empty."
-  # Append .myshopify.com if user only typed the store name (no dot present)
-  if [[ "$store_domain_input" != *.* ]]; then
-    store_domain_input="${store_domain_input}.myshopify.com"
-  fi
-  set_env SHOPIFY_STORE_DOMAIN "$store_domain_input"
-  info "Store domain: ${store_domain_input}"
-else
-  info "SHOPIFY_STORE_DOMAIN already set (${SHOPIFY_STORE_DOMAIN})"
-fi
-
 # =============================================================================
 # STEP 4 — Pull Docker image (needed before auth step uses it)
 # =============================================================================
@@ -272,6 +253,65 @@ fi
 # Ensure SCOPES is set
 if ! grep -q "^SCOPES=" "$ENV_FILE" 2>/dev/null; then
   set_env SCOPES "read_orders,write_orders,read_customers"
+fi
+
+# =============================================================================
+# STEP 5b — Shopify store domain
+# =============================================================================
+step "Shopify store"
+
+_normalize_store_domain() {
+  local d="$1"
+  d="${d// /}"
+  d="${d#https://}"
+  d="${d#http://}"
+  d="${d%/}"
+  if [[ "$d" != *.* ]]; then
+    d="${d}.myshopify.com"
+  fi
+  echo "$d"
+}
+
+if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
+  # Try to list available stores via the authenticated CLI session
+  info "Fetching your Shopify stores ..."
+  STORES_RAW=$(docker run --rm \
+    --user root \
+    -v payram-shopify-cli-auth:/root/.config/shopify \
+    "$DOCKER_IMAGE" \
+    sh -c 'timeout 20 npx shopify store list 2>/dev/null || true' 2>/dev/null || true)
+
+  # Extract .myshopify.com domains from CLI table output
+  mapfile -t STORES_ARRAY < <(echo "$STORES_RAW" | grep -oE '[a-zA-Z0-9-]+\.myshopify\.com' | sort -u)
+
+  store_domain_input=""
+
+  if [ "${#STORES_ARRAY[@]}" -gt 0 ]; then
+    echo ""
+    echo -e "  ${BOLD}Your Shopify stores:${RESET}"
+    for i in "${!STORES_ARRAY[@]}"; do
+      echo -e "    ${CYAN}$((i+1))${RESET}) ${STORES_ARRAY[$i]}"
+    done
+    echo ""
+    read -rp "$(echo -e "${BOLD}Select store number (or type domain manually):${RESET} ")" store_choice
+    if [[ "$store_choice" =~ ^[0-9]+$ ]] && \
+       [ "$store_choice" -ge 1 ] && \
+       [ "$store_choice" -le "${#STORES_ARRAY[@]}" ]; then
+      store_domain_input="${STORES_ARRAY[$((store_choice-1))]}"
+    else
+      store_domain_input="$store_choice"
+    fi
+  else
+    warn "Could not fetch store list — enter domain manually."
+    read -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. payram-test-store.myshopify.com): ")" store_domain_input
+  fi
+
+  store_domain_input=$(_normalize_store_domain "$store_domain_input")
+  [ -z "$store_domain_input" ] && die "Store domain cannot be empty."
+  set_env SHOPIFY_STORE_DOMAIN "$store_domain_input"
+  info "Store domain: ${store_domain_input}"
+else
+  info "SHOPIFY_STORE_DOMAIN already set (${SHOPIFY_STORE_DOMAIN})"
 fi
 
 # =============================================================================
