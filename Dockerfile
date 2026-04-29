@@ -61,6 +61,13 @@ WORKDIR /app
 # Runtime-only OS packages
 RUN apk add --no-cache tini
 
+# Fake xdg-open so the Shopify CLI device-code auth flow doesn't crash
+# on headless servers. The CLI will try to open the browser; this script
+# just prints the URL instead of dying with ENOENT, and the CLI continues
+# waiting for the user to complete auth manually.
+RUN printf '#!/bin/sh\necho ""\necho "  ➜  Open this URL in your browser to authenticate:"\necho "     $1"\necho ""\n' \
+      > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
+
 # Non-root user for least-privilege execution
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 

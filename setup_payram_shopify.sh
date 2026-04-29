@@ -147,7 +147,8 @@ embedded = false
 TOML
 
   info "Opening browser to authenticate with your Shopify Partner account..."
-  docker run --rm -it \
+  warn "Running on a headless server? A URL will appear below — open it in your browser."
+  echo ""
     --user root \
     -v payram-shopify-cli-auth:/root/.config/shopify \
     "$DOCKER_IMAGE" \
