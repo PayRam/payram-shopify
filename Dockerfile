@@ -81,6 +81,7 @@ COPY --from=builder --chown=appuser:appgroup /app/node_modules   ./node_modules
 COPY --from=builder --chown=appuser:appgroup /app/package.json   ./package.json
 COPY --from=builder --chown=appuser:appgroup /app/prisma         ./prisma
 COPY --from=builder --chown=appuser:appgroup /app/shopify.app.toml ./shopify.app.toml
+COPY --from=builder --chown=appuser:appgroup /app/extensions     ./extensions
 COPY --from=builder --chown=appuser:appgroup /app/scripts/start.sh ./scripts/start.sh
 
 RUN chmod +x ./scripts/start.sh
