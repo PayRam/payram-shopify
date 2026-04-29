@@ -149,8 +149,17 @@ warn "Examples: https://payram.yourstore.com  or  https://your-server.example.co
 echo ""
 
 if [ -z "${SHOPIFY_APP_URL:-}" ]; then
-  read -rp "$(echo -e "${BOLD}Public HTTPS App URL (no trailing slash):${RESET} ")" app_url_input
-  [ -z "$app_url_input" ] && die "SHOPIFY_APP_URL cannot be empty."
+  while true; do
+    read -rp "$(echo -e "${BOLD}Public HTTPS App URL (no trailing slash):${RESET} ")" app_url_input
+    app_url_input="${app_url_input%/}"   # strip trailing slash
+    if [ -z "$app_url_input" ]; then
+      warn "URL cannot be empty. Enter the full https:// address."
+    elif [[ "$app_url_input" != https://* ]]; then
+      warn "URL must start with https:// — got: ${app_url_input}"
+    else
+      break
+    fi
+  done
   set_env SHOPIFY_APP_URL "$app_url_input"
 else
   info "SHOPIFY_APP_URL already set (${SHOPIFY_APP_URL})"
