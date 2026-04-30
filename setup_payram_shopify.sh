@@ -226,7 +226,7 @@ printf '%s\n' \
   'embedded = false' \
   '' \
   '[app_proxy]' \
-  "url = \"${SHOPIFY_APP_URL}\"" \
+  'url = "/api/payram"' \
   'prefix = "apps"' \
   'subpath = "payram-checkout-plugin"' \
   > "${INSTALL_DIR}/shopify.app.toml"

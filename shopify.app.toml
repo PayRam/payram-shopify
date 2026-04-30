@@ -24,6 +24,6 @@ api_version = "2026-01"
 embedded = false
 
 [app_proxy]
-url = "{{ APPLICATION_URL }}"
+url = "/api/payram"
 prefix = "apps"
 subpath = "payram-checkout-plugin"
