@@ -4,7 +4,7 @@ application_url = "{{ APPLICATION_URL }}"
 embedded = true
 
 [access_scopes]
-scopes = "read_orders,write_orders,read_customers"
+scopes = "read_orders,write_orders,read_customers,write_app_proxy"
 
 [auth]
 redirect_urls = [

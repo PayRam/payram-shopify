@@ -206,7 +206,7 @@ printf '%s\n' \
   'embedded = true' \
   '' \
   '[access_scopes]' \
-  'scopes = "read_orders,write_orders,read_customers"' \
+  'scopes = "read_orders,write_orders,read_customers,write_app_proxy"' \
   '' \
   '[auth]' \
   'redirect_urls = [' \
@@ -311,10 +311,8 @@ set_env SHOPIFY_API_SECRET "${NEW_API_SECRET}"
 info "App and extension deployed successfully."
 info "  API Key: ${NEW_API_KEY}"
 
-# Ensure SCOPES is set
-if ! grep -q "^SCOPES=" "$ENV_FILE" 2>/dev/null; then
-  set_env SCOPES "read_orders,write_orders,read_customers"
-fi
+# Normalize SCOPES so existing installs pick up the app proxy permission too.
+set_env SCOPES "read_orders,write_orders,read_customers,write_app_proxy"
 
 # =============================================================================
 # STEP 5b — Shopify store domain
