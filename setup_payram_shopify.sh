@@ -15,7 +15,15 @@ DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 RESET_MODE=false
-for arg in "$@"; do
+# When this script is piped into `bash -c`, the first post-script token becomes
+# `$0` rather than part of `$@`. Include it when it looks like a flag so
+# invocations such as `/bin/bash -c "$(curl ...)" --reset` work as expected.
+INSTALLER_ARGS=("$@")
+if [[ "${0:-}" == --* ]]; then
+  INSTALLER_ARGS=("$0" "${INSTALLER_ARGS[@]}")
+fi
+
+for arg in "${INSTALLER_ARGS[@]}"; do
   case "$arg" in
     --reset) RESET_MODE=true ;;
   esac
