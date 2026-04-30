@@ -245,6 +245,13 @@ DEPLOY_SCRIPT="${INSTALL_DIR}/.payram-deploy.sh"
 cat > "$DEPLOY_SCRIPT" <<'EOF'
 #!/bin/sh
 set -e
+APP_URL="${SHOPIFY_APP_URL%/}"
+if [ -z "$APP_URL" ]; then
+  echo "[payram-deploy] SHOPIFY_APP_URL is required" >&2
+  exit 1
+fi
+
+sed -i "s|__PAYRAM_REDIRECT_BASE_URL__|${APP_URL}|g" /app/extensions/thank-you-block/src/Checkout.tsx
 cp /workspace/shopify.app.toml /app/shopify.app.toml
 # Save our desired toml (with app_proxy) before the link step overwrites it.
 # shopify app deploy internally runs 'app config link' on first run, which
@@ -279,6 +286,7 @@ chmod 700 "$DEPLOY_SCRIPT"
 DOCKER_DEPLOY_ARGS=(
   docker run --rm -it
   --user root
+  -e "SHOPIFY_APP_URL=${SHOPIFY_APP_URL}"
   -v payram-shopify-cli-auth:/root/.config/shopify
   -v "${INSTALL_DIR}:/workspace"
   "$DOCKER_IMAGE"

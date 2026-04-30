@@ -70,6 +70,8 @@ function PayramBlock() {
   const totalAmount = useTotalAmount();
   const amountInUSD = totalAmount.amount;
   const shopDomain = useShop().myshopifyDomain ?? "";
+  const redirectBaseUrl = "__PAYRAM_REDIRECT_BASE_URL__";
+  const hasRedirectBaseUrl = /^https:\/\//.test(redirectBaseUrl);
 
   const [email, setEmail] = useState("");
   const [emailError, setEmailError] = useState("");
@@ -89,14 +91,15 @@ function PayramBlock() {
     }
   };
 
-  // Use Shopify App Proxy — stable URL that never changes when tunnel restarts.
-  // Shopify proxies https://{shopDomain}/apps/payram-checkout-plugin/... to
-  // the configured backend root /api/payram, so we only append the extra path.
+  // The installer injects the current public app URL into this bundle at deploy
+  // time, so buyers can navigate directly to the app without relying on a
+  // Shopify App Proxy round-trip.
   const buildHref = () =>
-    `https://${shopDomain}/apps/payram-checkout-plugin/redirect-to-payment?${new URLSearchParams({
+    `${redirectBaseUrl}/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
       amountInUSD: String(amountInUSD),
       email,
+      shop: shopDomain,
     })}`;
 
 
@@ -138,17 +141,28 @@ function PayramBlock() {
         <s-button
           variant="primary"
           inlineSize="fill"
-          href={validOrderId && shopDomain && isValidEmail(email) ? buildHref() : undefined}
+          href={
+            validOrderId &&
+            shopDomain &&
+            hasRedirectBaseUrl &&
+            isValidEmail(email)
+              ? buildHref()
+              : undefined
+          }
           target="_blank"
-          disabled={!validOrderId || !shopDomain || undefined}
+          disabled={
+            !validOrderId || !shopDomain || !hasRedirectBaseUrl || undefined
+          }
           onClick={handlePay}
         >
           Complete Crypto Payment →
         </s-button>
 
-        {(!validOrderId || !shopDomain) && (
+        {(!validOrderId || !shopDomain || !hasRedirectBaseUrl) && (
           <s-text tone="subdued">
-            (Preview only — button activates on a real order)
+            {hasRedirectBaseUrl
+              ? "(Preview only — button activates on a real order)"
+              : "(Payment link is not configured yet — re-run the installer to deploy the current app URL)"}
           </s-text>
         )}
       </s-stack>
