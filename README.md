@@ -127,7 +127,7 @@ Approve the permission request. This installs the app on your store and creates 
 | `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
 | `ENCRYPTION_KEY` | ✅ | 64-char hex key for encrypting stored API keys |
 | `SCOPES` | ✅ | `read_orders,write_orders,read_customers` (do not change) |
-| `PORT` | — | Server port (default: `3000`) |
+| `PORT` | — | Server port (default: `2798`) |
 
 ---
 
@@ -139,7 +139,7 @@ docker stop payram-shopify-connector && docker rm payram-shopify-connector
 docker run -d \
   --name payram-shopify-connector \
   --env-file ~/payram-shopify-connector/.env \
-  -p 3000:3000 \
+  -p 2798:2798 \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
   payram/shopify-connector:latest

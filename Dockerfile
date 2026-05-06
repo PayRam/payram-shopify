@@ -11,7 +11,7 @@
 # Run:
 #   docker run -d \
 #     --env-file .env \
-#     -p 3000:3000 \
+#     -p 2798:2798 \
 #     payram-shopify-connector
 # ---------------------------------------------------------------------------
 
@@ -88,7 +88,7 @@ RUN chmod +x ./scripts/start.sh
 
 USER appuser
 
-EXPOSE 3000
+EXPOSE 2798
 
 # tini reaps zombie processes and forwards signals correctly
 ENTRYPOINT ["/sbin/tini", "--"]

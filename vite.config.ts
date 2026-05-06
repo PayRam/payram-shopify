@@ -4,7 +4,7 @@ import tsconfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
   server: {
-    port: Number(process.env.PORT || 3000),
+    port: Number(process.env.PORT || 2798),
     allowedHosts: true,
     warmup: {
       clientFiles: ["./app/entry.client.tsx"],

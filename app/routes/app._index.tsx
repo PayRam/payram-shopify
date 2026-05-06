@@ -18,6 +18,33 @@ import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
 import { validatePayramBaseUrl } from "~/utils/payram.server";
 
+function summarizeResponseText(value: string): string | null {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  return normalized.length > 160
+    ? `${normalized.slice(0, 157)}...`
+    : normalized;
+}
+
+function getCheckoutUrl(payload: Record<string, unknown>): string | null {
+  const checkoutUrl =
+    (payload.checkoutUrl as string | undefined) ??
+    (payload.checkout_url as string | undefined) ??
+    (payload.paymentUrl as string | undefined) ??
+    (payload.url as string | undefined);
+
+  return checkoutUrl ?? null;
+}
+
+function getReferenceId(payload: Record<string, unknown>): string | null {
+  const referenceId =
+    (payload.referenceId as string | undefined) ??
+    (payload.reference_id as string | undefined) ??
+    (payload.id as string | undefined);
+
+  return referenceId ?? null;
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const config = await prisma.merchantConfig.findUnique({
@@ -44,8 +71,49 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     formData.get("paymentMethodName") ?? "Pay with Crypto via Payram"
   ).trim();
 
-  // --- Test connection ---
-  if (intent === "test") {
+  // --- Test Payram server reachability ---
+  if (intent === "test-server") {
+    if (!payramBaseUrl) {
+      return json({ error: "Enter a Payram Base URL to test." });
+    }
+    try {
+      validatePayramBaseUrl(payramBaseUrl);
+    } catch (err) {
+      return json({
+        error: err instanceof Error ? err.message : "Invalid URL",
+      });
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10_000);
+      const res = await fetch(payramBaseUrl.replace(/\/$/, ""), {
+        method: "GET",
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timeoutId));
+      const responseText = await res.text().catch(() => "");
+      const summary = summarizeResponseText(responseText);
+
+      if (res.ok) {
+        const payramCoreDetected = /welcome to payram core/i.test(responseText);
+        return json({
+          success: payramCoreDetected
+            ? `Payram server reachable — HTTP ${res.status}. Payram Core responded normally.`
+            : `Payram server reachable — HTTP ${res.status}${summary ? `. Response: ${summary}` : ""}`,
+        });
+      }
+
+      return json({
+        error: `Payram server returned HTTP ${res.status}${summary ? `: ${summary}` : "."}`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return json({ error: `Connection failed: ${msg}` });
+    }
+  }
+
+  // --- Test Payram payment API / API key ---
+  if (intent === "test-payment-api") {
     if (!payramBaseUrl) {
       return json({ error: "Enter a Payram Base URL to test." });
     }
@@ -81,20 +149,49 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             "API-Key": apiKey,
           },
           body: JSON.stringify({
-            customerId: "shopify:test:order:0",
-            amountInUSD: 0.01,
+            customerEmail: "shopify-payram-test@example.com",
+            customerId: `shopify:test:${session.shop}`,
+            amountInUSD: 50,
           }),
           signal: controller.signal,
         }
       ).finally(() => clearTimeout(timeoutId));
+      const responseText = await res.text().catch(() => "");
+      const summary = summarizeResponseText(responseText);
 
-      // 2xx or 4xx both mean the server is reachable
-      if (res.ok || (res.status >= 400 && res.status < 500)) {
+      if (res.ok) {
+        let payload: Record<string, unknown> = {};
+        if (responseText) {
+          try {
+            payload = JSON.parse(responseText) as Record<string, unknown>;
+          } catch {
+            return json({
+              error: `Payram payment API returned HTTP ${res.status} but did not return valid JSON.`,
+            });
+          }
+        }
+
+        const checkoutUrl = getCheckoutUrl(payload);
+        const referenceId = getReferenceId(payload);
+
+        if (!checkoutUrl) {
+          return json({
+            error:
+              `Payram payment API returned HTTP ${res.status} but did not include a checkout URL.`,
+          });
+        }
+
         return json({
-          success: `Payram API reachable — HTTP ${res.status}`,
+          success: `Test payment link created successfully — HTTP ${res.status}${referenceId ? ` (${referenceId})` : ""}`,
+          checkoutUrl,
         });
       }
-      return json({ error: `Payram API returned HTTP ${res.status}` });
+
+      return json({
+        error:
+          `Payram payment API returned HTTP ${res.status}` +
+          `${summary ? `: ${summary}` : "."}`,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return json({ error: `Connection failed: ${msg}` });
@@ -164,6 +261,17 @@ export default function SettingsPage() {
           {actionData && 'success' in actionData && (
             <Banner tone="success" title="Success">
               <p>{actionData.success}</p>
+              {'checkoutUrl' in actionData && actionData.checkoutUrl ? (
+                <p>
+                  <a
+                    href={actionData.checkoutUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open the test payment link
+                  </a>
+                </p>
+              ) : null}
             </Banner>
           )}
           <Card>
@@ -209,11 +317,30 @@ export default function SettingsPage() {
                 </FormLayout>
               </Form>
 
+              <Text as="p" variant="bodySm" tone="subdued">
+                Test the server separately from the payment API. The server test
+                checks that the base URL responds with HTTP 2xx. The payment API
+                test creates a real test payment link using the current API key.
+              </Text>
+
               <Form method="post">
-                <input type="hidden" name="intent" value="test" />
+                <input type="hidden" name="intent" value="test-server" />
                 <input type="hidden" name="payramBaseUrl" value={baseUrl} />
                 <Button submit loading={isSubmitting} variant="plain">
-                  Test Payram Connection
+                  Test Payram Server
+                </Button>
+              </Form>
+
+              <Form method="post">
+                <input type="hidden" name="intent" value="test-payment-api" />
+                <input type="hidden" name="payramBaseUrl" value={baseUrl} />
+                <input
+                  type="hidden"
+                  name="payramProjectApiKey"
+                  value={apiKey}
+                />
+                <Button submit loading={isSubmitting} variant="plain">
+                  Create Test Payment Link
                 </Button>
               </Form>
             </BlockStack>

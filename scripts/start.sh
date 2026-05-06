@@ -29,8 +29,11 @@ fi
 : "${DATABASE_URL:?DATABASE_URL is required}"
 : "${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}"
 
+PORT="${PORT:-2798}"
+export PORT
+
 info "Running database migrations …"
 npx prisma migrate deploy
 
-info "Starting server on port ${PORT:-3000} …"
+info "Starting server on port ${PORT} …"
 exec node_modules/.bin/remix-serve ./build/server/index.js

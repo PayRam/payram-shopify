@@ -442,7 +442,7 @@ docker volume create payram-shopify-data >/dev/null 2>&1 || true
 docker run -d \
   --name payram-shopify-connector \
   --env-file "${ENV_FILE}" \
-  -p 3000:3000 \
+  -p 2798:2798 \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
   "$DOCKER_IMAGE"
