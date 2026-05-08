@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-DOCKER_IMAGE="mason0816/payram-shopify-test:latest"
+DOCKER_IMAGE="payramapp/payram-shopify-plugin:latest"
 DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
 
 # ── argument parsing ──────────────────────────────────────────────────────────

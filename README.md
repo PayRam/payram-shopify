@@ -45,7 +45,7 @@ The installer offers to do this automatically. If you skipped it, run:
 ```bash
 docker run --rm -it \
   --env-file ~/payram-shopify-connector/.env \
-  payram/shopify-connector:latest \
+  payramapp/payram-shopify-plugin:latest \
   npx shopify app deploy
 ```
 
@@ -134,7 +134,7 @@ Approve the permission request. This installs the app on your store and creates 
 ## Updating
 
 ```bash
-docker pull payram/shopify-connector:latest
+docker pull payramapp/payram-shopify-plugin:latest
 docker stop payram-shopify-connector && docker rm payram-shopify-connector
 docker run -d \
   --name payram-shopify-connector \
@@ -142,7 +142,7 @@ docker run -d \
   -p 2798:2798 \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
-  payram/shopify-connector:latest
+  payramapp/payram-shopify-plugin:latest
 ```
 
 ---
