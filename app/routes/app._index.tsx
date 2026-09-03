@@ -54,11 +54,28 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   // Recent payment activity, so problems the connector recorded during a webhook
   // are visible here instead of only in server logs.
-  const payments = await prisma.paymentMapping.findMany({
-    where: { shop: session.shop },
+  // Orders needing attention are listed FIRST and in full — a count that
+  // includes rows the list cannot show is worse than no count, because the
+  // merchant has no way to reach them.
+  const attention = await prisma.paymentMapping.findMany({
+    where: {
+      shop: session.shop,
+      OR: [
+        { syncError: { not: null } },
+        { shopifyFinancialStatus: "payram_partially_paid" },
+      ],
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+  const recent = await prisma.paymentMapping.findMany({
+    where: {
+      shop: session.shop,
+      id: { notIn: attention.map((a) => a.id) },
+    },
     orderBy: { updatedAt: "desc" },
     take: 20,
   });
+  const payments = [...attention, ...recent];
   const needsAttention = await prisma.paymentMapping.count({
     where: {
       shop: session.shop,
@@ -107,6 +124,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 };
 
+/** Ceiling on the underpayment tolerance a merchant can configure. */
+const MAX_TOLERANCE_PERCENT = 10;
+
 /** Plain-language explanation of each settlement state, for the merchant. */
 const STATE_HELP: Record<string, string> = {
   FILLED: "Paid in full",
@@ -133,12 +153,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   ).trim();
   const autoGiftCardOnOverpayment =
     String(formData.get("autoGiftCardOnOverpayment") ?? "") === "on";
-  const giftCardMinimumUsdRaw = String(
-    formData.get("giftCardMinimumUsd") ?? "1.00"
-  ).trim();
-  // Guard the stored value: it is later parsed as a Decimal during settlement.
-  const tolPctRaw = String(formData.get("settlementTolerancePercent") ?? "1.0").trim();
-  const tolMinRaw = String(formData.get("settlementToleranceMinUsd") ?? "1.00").trim();
+
+  // Fall back to what is STORED, not to the literal default. The gift-card
+  // minimum field is disabled while the feature is off, and browsers do not
+  // submit disabled inputs — so defaulting here silently reset a merchant's
+  // configured 25.00 to 1.00 every time they saved with the checkbox off.
+  const stored = await prisma.merchantConfig.findUnique({
+    where: { shop: session.shop },
+    select: {
+      giftCardMinimumUsd: true,
+      settlementTolerancePercent: true,
+      settlementToleranceMinUsd: true,
+    },
+  });
+
+  const formValue = (name: string, fallback: string) => {
+    const v = formData.get(name);
+    return v === null ? fallback : String(v).trim();
+  };
+
+  const giftCardMinimumUsdRaw = formValue(
+    "giftCardMinimumUsd",
+    stored?.giftCardMinimumUsd ?? "1.00",
+  );
+  const tolPctRaw = formValue(
+    "settlementTolerancePercent",
+    stored?.settlementTolerancePercent ?? "1.0",
+  );
+  const tolMinRaw = formValue(
+    "settlementToleranceMinUsd",
+    stored?.settlementToleranceMinUsd ?? "1.00",
+  );
 
   // These decide how much of a shortfall still counts as paid, so a typo must be
   // rejected, not quietly replaced with a default. A merchant who meant 0.1% and
@@ -153,6 +198,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       error:
         `Underpayment tolerance must be a plain number such as 1 or 0.5 — got "${tolPctRaw}". ` +
         "Do not include a % sign, and use a dot for decimals.",
+    });
+  }
+  // An unbounded percentage is a foot-gun with real cost: at 100 the allowance
+  // equals the invoice, nothing is ever short, and a payment of zero settles as
+  // paid in full. Someone typing 100 meaning 1.00 would get exactly that.
+  if (Number(settlementTolerancePercent) > MAX_TOLERANCE_PERCENT) {
+    return json({
+      error:
+        `Underpayment tolerance of ${settlementTolerancePercent}% is too high — the most ` +
+        `that can be accepted is ${MAX_TOLERANCE_PERCENT}%. At high values almost any ` +
+        "payment, including none at all, would settle as paid in full.",
     });
   }
   if (!/^\d+(\.\d{1,2})?$/.test(settlementToleranceMinUsd)) {

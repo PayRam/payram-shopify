@@ -193,7 +193,7 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server. Used to build absolute redirects for App Proxy requests |
 | `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
 | `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM) |
-| `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_app_proxy,write_gift_cards` (do not change) |
+| `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards` (do not change) |
 | `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. Falls back to `SHOPIFY_API_SECRET` — see the warning below |
 | `PORT` | — | Server port (default `2798`) |
 | `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
@@ -269,7 +269,7 @@ Fill in:
 # from Shopify Partner Dashboard → App → Client credentials
 SHOPIFY_API_KEY=your_key
 SHOPIFY_API_SECRET=your_secret
-SCOPES=read_orders,write_orders,read_customers,write_app_proxy,write_gift_cards
+SCOPES=read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards
 SHOPIFY_APP_URL=https://your-tunnel.trycloudflare.com
 
 DATABASE_URL="file:dev.sqlite"
@@ -353,15 +353,31 @@ Query params:
 | `email` | No | Buyer email for Payram receipt |
 | `amountInUSD` | — | **Ignored.** Older extension bundles still send it; the server never reads it. |
 
-Behaviour:
-- Validates params, loads merchant Payram config.
-- If a mapping already exists for the order, redirects to the existing checkout URL (idempotent).
-- Reads the **authoritative order total from the Shopify Admin API** (`read_orders`), never from the
-  request. The buyer's browser cannot influence the amount charged.
-- Converts that total to USD (see [Currency Handling](#currency-handling)). If no live exchange rate
-  is available the payment is **not** created and the buyer is asked to retry.
-- Claims the order in the database, calls `POST {payramBaseUrl}/api/v1/payment`, stores the
-  reference, and redirects the buyer.
+Behaviour — **this route does no payment work**. It validates, records the buyer's email
+against an existing mapping, mints a signed token and redirects to `/pay/{token}?auto=1`.
+It is kept at this URL because checkout extension bundles deploy separately from the server,
+so merchants on an older bundle still link here.
+
+When debugging a payment, the work happens in the two routes below, not this one.
+
+### `GET /pay/{token}`
+
+The durable buyer-facing payment page. Plain HTML, no React hydration, no external calls in
+the loader — it renders immediately, then calls `/api/payram/session` for the real numbers.
+`?auto=1` proceeds straight to checkout; without it the page stops and shows current state.
+
+### `POST /api/payram/session`
+
+Where the money logic lives. The order is identified **only** by the signed token, never by a
+raw order ID in the body.
+
+| Body | Does |
+|---|---|
+| `{ token, step: "quote" }` | Reads the outstanding total from the Shopify Admin API (`totalOutstandingSet`), strikes the USD invoice once and stores it, sums everything received, returns amounts in both currencies |
+| `{ token, step: "create", email? }` | Compare-and-set claims the order, reuses the live Payram link if the amount is unchanged, otherwise calls `POST {payramBaseUrl}/api/v1/payment` for the outstanding balance |
+
+If no live exchange rate is available the payment is **not** created and the buyer is asked to
+retry — see [Currency Handling](#currency-handling).
 
 ### `POST /api/payram/webhook`
 

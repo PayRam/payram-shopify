@@ -95,9 +95,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   // Accept both Payram's snake_case webhook fields and camelCase variants.
-  const referenceId = (
-    (body.reference_id ?? body.referenceId ?? body.paymentId) as string | undefined
-  )?.trim();
+  // The cast is not a runtime check and the body is untrusted: a numeric
+  // reference_id would throw on .trim() and 500, which Payram then retries.
+  const rawReference = body.reference_id ?? body.referenceId ?? body.paymentId;
+  const referenceId =
+    typeof rawReference === "string" || typeof rawReference === "number"
+      ? String(rawReference).trim()
+      : "";
   const rawStatus = body.status ?? body.paymentStatus;
   const state = normalizePayramState(rawStatus);
   const filledAmountInUsd =
@@ -184,12 +188,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         shopifyOrderId: mapping.shopifyOrderId,
         payramReferenceId: referenceId,
         state,
-        filledAmountInUsd: state === "CANCELLED" ? null : filledAmountInUsd,
+        // Neither state has delivered funds: OPEN means nothing has arrived yet,
+        // CANCELLED means it never will. Storing the body's amount here would let
+        // an unsigned webhook credit an order with money that does not exist,
+        // because the received total only excludes CANCELLED.
+        filledAmountInUsd: null,
         txHash,
       },
       update: {
         state,
-        ...(state === "CANCELLED" ? { filledAmountInUsd: null } : {}),
+        filledAmountInUsd: null,
         updatedAt: new Date(),
       },
     });

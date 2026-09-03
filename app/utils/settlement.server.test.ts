@@ -53,6 +53,23 @@ const { db, admin, fx, store } = vi.hoisted(() => {
         db.mapping = { ...(db.mapping ?? {}), ...data };
         return db.mapping;
       },
+      // Honours the `where` clause, so the gift-card compare-and-set claim is
+      // actually exercised rather than assumed to succeed.
+      updateMany: async ({ where, data }: any) => {
+        const m = db.mapping;
+        if (!m) return { count: 0 };
+        for (const k of Object.keys(where)) {
+          if (k === "shop" || k === "shopifyOrderId") continue;
+          const expected = where[k];
+          const actual = (m as any)[k] ?? null;
+          if (expected === null ? actual !== null : actual !== expected) {
+            return { count: 0 };
+          }
+        }
+        db.updates.push(data);
+        db.mapping = { ...m, ...data };
+        return { count: 1 };
+      },
     },
     merchantConfig: { findUnique: async () => db.config },
   };
@@ -595,5 +612,59 @@ describe("settleOrder — refuses to act on an unrecognised state", () => {
     // A later legitimate payment must not inherit the bogus figure.
     const real = await settle("ref-2", "FILLED" as never, "54.22");
     expect(real.receivedUsd).toBe("54.22");
+  });
+});
+
+describe("settleOrder — review fixes", () => {
+  it("never erases a recorded txHash on a delivery without payment_info", async () => {
+    seedMapping();
+
+    await settleOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      referenceId: "ref-1",
+      state: "PARTIALLY_FILLED" as never,
+      filledAmountInUsd: "40.00",
+      txHash: "0xdeadbeef",
+      accessToken: "token",
+      verified: true,
+    });
+
+    // Payram re-sends every 3s and payment_info is absent on some deliveries.
+    await settleOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      referenceId: "ref-1",
+      state: "FILLED" as never,
+      filledAmountInUsd: "54.22",
+      txHash: null,
+      accessToken: "token",
+      verified: true,
+    });
+
+    expect(db.payments.get("ref-1")?.txHash).toBe("0xdeadbeef");
+  });
+
+  it("reports settled consistently on a repeat delivery of a tolerated shortfall", async () => {
+    seedMapping();
+
+    // 50c short on a $54.22 invoice — inside the $1.00 floor, so settled.
+    const first = await settle("ref-1", "PARTIALLY_FILLED" as never, "53.72");
+    expect(first.settled).toBe(true);
+
+    // The re-delivery must not answer differently for the same order.
+    const repeat = await settle("ref-1", "PARTIALLY_FILLED" as never, "53.72");
+    expect(repeat.settled).toBe(true);
+  });
+
+  it("does not mint a second gift card when the slot is already claimed", async () => {
+    seedMapping();
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(1);
+
+    // A concurrent/later delivery finds the claim taken.
+    admin.createGiftCard.mockClear();
+    await settle("ref-2", "OVER_FILLED" as never, "60.00");
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
   });
 });

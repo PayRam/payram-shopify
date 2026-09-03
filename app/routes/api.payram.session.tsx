@@ -31,7 +31,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   let body: Record<string, unknown>;
   try {
-    body = (await request.json()) as Record<string, unknown>;
+    const parsed: unknown = await request.json();
+    // request.json() resolves happily for `null`, `1` and `"x"` — none of which
+    // hit the catch, and all of which throw on the property read below.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return json({ error: "Invalid request." }, { status: 400 });
+    }
+    body = parsed as Record<string, unknown>;
   } catch {
     return json({ error: "Invalid request." }, { status: 400 });
   }

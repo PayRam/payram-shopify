@@ -95,6 +95,13 @@ function safeDecimal(value: string | null | undefined, fallback: string): Prisma
   }
 }
 
+/**
+ * Placeholder written while a gift card is being created, so a concurrent
+ * webhook delivery cannot also decide the slot is free. Replaced by the real
+ * Shopify GID on success, cleared on failure.
+ */
+const GIFT_CARD_PENDING = "pending";
+
 export const TAG_PAID = "payram_paid";
 export const TAG_PARTIAL = "payram_partially_paid";
 export const TAG_OVERPAID = "payram_overpaid";
@@ -224,7 +231,15 @@ export async function settleOrder(params: {
         filledAmountInUsd,
         txHash,
       },
-      update: { state, filledAmountInUsd, txHash, updatedAt: new Date() },
+      update: {
+        state,
+        filledAmountInUsd,
+        // Only ever set the hash, never clear it. Payram re-sends every three
+        // seconds and `payment_info` is absent on some deliveries, so writing
+        // it unconditionally erases the on-chain reference already recorded.
+        ...(txHash ? { txHash } : {}),
+        updatedAt: new Date(),
+      },
     });
 
     // One implementation of the money-summing rule, shared with the payment page
@@ -287,13 +302,16 @@ export async function settleOrder(params: {
   // change. A stored syncError means the last attempt did not finish, so those
   // are always retried.
   if (unchanged && mapping.paymentState === state && !mapping.syncError) {
-    const priorBalance = mapping.balanceUsd ?? null;
+    // `settled` must mean the same thing here as on the first delivery. Deriving
+    // it from the balance sign would report a shortfall absorbed by the
+    // tolerance as unsettled on every re-delivery, while the order stays tagged
+    // paid — two answers for one order. Read back what settlement recorded.
     return {
       state,
       receivedUsd: received.toFixed(2),
       invoicedUsd: invoiced.toFixed(2),
-      balanceUsd: priorBalance,
-      settled: priorBalance !== null && !new Prisma.Decimal(priorBalance).lessThan(0),
+      balanceUsd: mapping.balanceUsd ?? null,
+      settled: mapping.shopifyFinancialStatus === TAG_PAID,
       giftCardIssued: Boolean(mapping.giftCardId),
       note: null,
       warnings: [],
@@ -409,10 +427,21 @@ export async function settleOrder(params: {
         `Overpaid by ${money(balance, "USD")}, which is below the ${money(minimum, "USD")} ` +
           "gift card minimum. No gift card was issued.",
       );
-    } else if (mapping.giftCardId) {
+    } else if (
+      // Compare-and-set claim. The read of `mapping.giftCardId` above happened
+      // before the Shopify calls, so two concurrent deliveries could both pass
+      // it and both mint real money. Reserve the slot first; whoever loses the
+      // race takes the "already issued" branch.
+      (
+        await prisma.paymentMapping.updateMany({
+          where: { shop, shopifyOrderId, giftCardId: null },
+          data: { giftCardId: GIFT_CARD_PENDING, updatedAt: new Date() },
+        })
+      ).count === 0
+    ) {
       // A card already exists for this order. Never issue a second one
       // automatically — a retried webhook must not mint value twice.
-      giftCardIssued = true;
+      giftCardIssued = mapping.giftCardId !== GIFT_CARD_PENDING;
       // But if genuinely more money has since arrived, say so rather than
       // silently pocketing it. Under-issuing is safe; staying quiet is not.
       const alreadyRefunded = new Prisma.Decimal(mapping.balanceUsd ?? 0);
@@ -477,6 +506,14 @@ export async function settleOrder(params: {
           );
         }
       } catch (err) {
+        // Release the reservation so a later delivery can retry — but only from
+        // `pending`, never from a real card id.
+        await prisma.paymentMapping
+          .updateMany({
+            where: { shop, shopifyOrderId, giftCardId: GIFT_CARD_PENDING },
+            data: { giftCardId: null },
+          })
+          .catch(() => {});
         warnings.push(
           `Overpaid by ${money(balance, "USD")} but the gift card could not be created: ${
             err instanceof Error ? err.message : String(err)

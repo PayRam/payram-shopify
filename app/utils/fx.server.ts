@@ -133,11 +133,18 @@ async function getUsdRate(currency: string): Promise<Prisma.Decimal | null> {
   }
 
   // open.er-api.com: rates[CUR] = units of CUR per 1 USD.
+  // `new Prisma.Decimal("n/a")` throws, which would escape this module's
+  // fail-closed contract and surface a raw library error to the buyer.
   const raw = body?.rates?.[currency];
-  const perUsd =
-    typeof raw === "number" || typeof raw === "string"
-      ? new Prisma.Decimal(raw)
-      : null;
+  let perUsd: Prisma.Decimal | null = null;
+  if (typeof raw === "number" || typeof raw === "string") {
+    try {
+      perUsd = new Prisma.Decimal(raw);
+    } catch {
+      console.error(`[payram-fx] non-numeric rate for ${currency}:`, raw);
+      return null;
+    }
+  }
 
   if (!perUsd || !perUsd.isFinite() || perUsd.lessThanOrEqualTo(0)) {
     console.error(`[payram-fx] no usable rate for ${currency} in provider response`);
