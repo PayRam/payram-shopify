@@ -1,30 +1,29 @@
 /**
  * GET /api/payram/redirect-to-payment
  *
- * Called by the buyer's browser (via Shopify App Proxy) after clicking
- * "Complete Crypto Payment" on the Thank You page extension.
+ * The entry point from the Thank You block. It no longer does any work — it
+ * validates, records the buyer's email, mints a signed token and hands off to
+ * `/pay/{token}?auto=1`, which is the durable payment page.
  *
- * The request arrives via the Shopify App Proxy:
- *   https://{shop}/apps/payram-checkout-plugin/api/payram/redirect-to-payment?...
- * Shopify forwards it here with `shop`, `path_prefix`, `timestamp`, `signature`
- * appended. We verify the HMAC signature before processing.
+ * WHY THIS ROUTE STILL EXISTS
+ * ---------------------------
+ * Checkout extension bundles are deployed separately from the server, so
+ * merchants running an older bundle still link here. Keeping this URL means the
+ * new flow reaches them the moment the server updates, with no extension
+ * redeploy. Any `amountInUSD` such a bundle sends is ignored — the amount is
+ * always read from Shopify server-side.
  *
- * Query params added by extension:
- *   shopifyOrderId  — numeric Shopify order ID (required)
- *   amountInUSD     — order total in USD (required)
- *   email           — buyer email, optional
- *
- * Query params added by Shopify proxy:
- *   shop            — myshopify.com domain (trusted after HMAC check)
- *   path_prefix     — proxy subpath prefix
- *   timestamp       — Unix timestamp
- *   signature       — HMAC-SHA256 of sorted params using API secret
+ * Everything the old version did inline (Admin API lookup, FX conversion, Payram
+ * create) now happens behind the payment page, so the buyer sees a rendered page
+ * immediately instead of a blank tab.
  */
 import { createHmac, timingSafeEqual } from "crypto";
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import prisma from "~/db.server";
-import { createPayramPayment } from "~/utils/payram.server";
+import { signOrderToken } from "~/utils/order-token.server";
+
+const EMAIL_RE = /^[^@\s]{1,254}@[^@\s]{1,253}\.[^@\s]{1,63}$/;
 
 /**
  * Verify the Shopify App Proxy HMAC signature.
@@ -52,229 +51,129 @@ function verifyProxySignature(
   }
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderProxyHtmlPage(title: string, bodyHtml: string): Response {
-  const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${escapeHtml(title)}</title>
-    <style>
-      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #f6f6f7; color: #111827; }
-      main { max-width: 42rem; margin: 0 auto; background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
-      h1 { margin-top: 0; font-size: 1.25rem; }
-      p { line-height: 1.5; }
-      a { color: #005bd3; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>${escapeHtml(title)}</h1>
-      ${bodyHtml}
-    </main>
-  </body>
-</html>`;
-
-  return new Response(html, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
+function errorPage(title: string, detail: string, status: number): Response {
+  const esc = (v: string) =>
+    v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return new Response(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${esc(title)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Poppins:wght@600;700&display=swap">
+<style>
+ /* Payram tokens — see payram-frontend/src/styles/themes.css */
+ :root{--pr-bg:#f1f5f9;--pr-surface:#fff;--pr-text:#0f172a;--pr-text-secondary:#475569;--pr-border:#e2e8f0;--pr-primary:#09984E;--pr-primary-soft:rgba(1,228,111,.10)}
+ @media(prefers-color-scheme:dark){:root{--pr-bg:#0f172a;--pr-surface:#1e293b;--pr-text:#f1f5f9;--pr-text-secondary:#94a3b8;--pr-border:#334155;--pr-primary:#01E46F;--pr-primary-soft:rgba(1,228,111,.12)}}
+ body{margin:0;background:var(--pr-bg);color:var(--pr-text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;padding:2rem;display:flex;justify-content:center;-webkit-font-smoothing:antialiased}
+ main{width:100%;max-width:30rem;background:var(--pr-surface);border:1px solid var(--pr-border);border-radius:16px;padding:1.75rem;box-shadow:0 1px 2px rgba(15,23,42,.04),0 8px 24px rgba(15,23,42,.06)}
+ .brand{display:flex;align-items:center;gap:.55rem;font-family:Poppins,Inter,sans-serif;font-weight:700;font-size:.82rem;letter-spacing:.14em;text-transform:uppercase;color:var(--pr-text-secondary);margin-bottom:1rem}
+ .brand::before{content:"";width:.65rem;height:.65rem;border-radius:3px;background:var(--pr-primary);box-shadow:0 0 0 3px var(--pr-primary-soft)}
+ h1{font-family:Poppins,Inter,sans-serif;font-size:1.3rem;font-weight:600;margin:0 0 .6rem;letter-spacing:-.01em}
+ p{margin:0;color:var(--pr-text-secondary);line-height:1.55}
+</style></head><body><main><div class="brand">Payram</div><h1>${esc(title)}</h1><p>${esc(detail)}</p></main></body></html>`,
+    {
+      status,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
     },
-  });
-}
-
-function renderProxyErrorPage(title: string, detail: string): Response {
-  return renderProxyHtmlPage(
-    title,
-    `<p>${escapeHtml(detail)}</p>`,
-  );
-}
-
-function renderProxyRedirectPage(checkoutUrl: string): Response {
-  let parsed: URL;
-  try {
-    parsed = new URL(checkoutUrl);
-  } catch {
-    return renderProxyErrorPage(
-      "Invalid payment URL",
-      "Payram returned an invalid checkout URL.",
-    );
-  }
-
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    return renderProxyErrorPage(
-      "Invalid payment URL",
-      "Payram returned an unsupported checkout URL.",
-    );
-  }
-
-  const safeUrl = parsed.toString();
-  const escapedUrl = escapeHtml(safeUrl);
-  const jsUrl = JSON.stringify(safeUrl);
-
-  return renderProxyHtmlPage(
-    "Redirecting to Payram",
-    `<p>Redirecting you to the secure Payram payment page.</p>
-     <p>If you are not redirected automatically, <a href="${escapedUrl}" rel="noopener noreferrer">continue to payment</a>.</p>
-     <script>window.location.replace(${jsUrl});</script>
-     <noscript><meta http-equiv="refresh" content="0;url=${escapedUrl}" /></noscript>`,
   );
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const shopifyOrderId = url.searchParams.get("shopifyOrderId") ?? "";
-  const amountInUSDStr = url.searchParams.get("amountInUSD") ?? "";
-  // `shop` is injected by the Shopify App Proxy (trusted after signature check)
   const shop = url.searchParams.get("shop") ?? "";
-  const email = url.searchParams.get("email") ?? undefined;
+  const email = (url.searchParams.get("email") ?? "").trim();
 
-  // --- Proxy signature verification ---
-  // When the request comes through the App Proxy, `signature` is present.
-  // Always verify it when present. If absent (dev / direct call) and SHOPIFY_API_SECRET
-  // is set, we still proceed — direct access without proxy is blocked by
-  // the missing `shop` param check below.
+  // Present only when the request came via the Shopify App Proxy. The extension
+  // navigates to the app URL directly, so it is usually absent; when present it
+  // must be valid.
   const signature = url.searchParams.get("signature");
-  const isProxyRequest = Boolean(signature);
-
-  console.info("[payram-proxy] request", {
-    shopifyOrderId,
-    shop,
-    hasSignature: isProxyRequest,
-  });
-
   if (signature) {
     const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
     if (!apiSecret || !verifyProxySignature(url.searchParams, apiSecret)) {
-      if (isProxyRequest) {
-        return renderProxyErrorPage(
-          "Invalid request",
-          "This payment request could not be verified.",
-        );
-      }
-      return new Response("Invalid proxy signature.", { status: 401 });
+      return errorPage(
+        "Invalid request",
+        "This payment request could not be verified. Please return to your order confirmation and try again.",
+        401,
+      );
     }
   }
 
-  // --- Input validation ---
   if (!/^\d+$/.test(shopifyOrderId) || shopifyOrderId === "0") {
-    if (isProxyRequest) {
-      return renderProxyErrorPage(
-        "Invalid order",
-        "The Shopify order ID was missing or invalid.",
-      );
-    }
-    return new Response("Invalid shopifyOrderId — must be a positive integer.", {
-      status: 400,
-    });
+    return errorPage(
+      "Invalid order",
+      "The order reference was missing or invalid. Please return to your order confirmation and try again.",
+      400,
+    );
   }
-  const amountInUSD = Number(amountInUSDStr);
-  if (isNaN(amountInUSD) || amountInUSD <= 0) {
-    if (isProxyRequest) {
-      return renderProxyErrorPage(
-        "Invalid amount",
-        "The payment amount was missing or invalid.",
-      );
-    }
-    return new Response("Invalid amountInUSD — must be a positive number.", {
-      status: 400,
-    });
+  if (!/^[a-z0-9-]+\.myshopify\.com$/.test(shop)) {
+    return errorPage(
+      "Invalid store",
+      "The store reference was missing or invalid. Please return to your order confirmation and try again.",
+      400,
+    );
   }
-  if (!shop || !/^[a-z0-9-]+\.myshopify\.com$/.test(shop)) {
-    if (isProxyRequest) {
-      return renderProxyErrorPage(
-        "Invalid shop",
-        "The Shopify shop parameter was missing or invalid.",
-      );
-    }
-    return new Response("Invalid or missing shop parameter.", { status: 400 });
+  if (email && !EMAIL_RE.test(email)) {
+    return errorPage(
+      "Invalid email",
+      "Please go back and enter a valid email address.",
+      400,
+    );
   }
+
+  // Hold the email against the order — but only ever as an UPDATE to a row that
+  // already exists, and never over one already set.
+  //
+  // This route is unauthenticated (MF-003) and order IDs are guessable, so an
+  // upsert here would let anyone (a) fabricate PaymentMapping rows for arbitrary
+  // order IDs, which then show up in the merchant's dashboard, and (b) overwrite
+  // a real buyer's receipt address with their own. `updateMany` touches nothing
+  // when no row matches, which is exactly the desired no-op.
   if (email) {
-    // Basic email format check
-    if (!/^[^@\s]{1,254}@[^@\s]{1,253}\.[^@\s]{1,63}$/.test(email)) {
-      if (isProxyRequest) {
-        return renderProxyErrorPage(
-          "Invalid email",
-          "Please enter a valid email address.",
-        );
-      }
-      return new Response("Invalid email format.", { status: 400 });
-    }
+    await prisma.paymentMapping
+      .updateMany({
+        where: { shop, shopifyOrderId, buyerEmail: null },
+        data: { buyerEmail: email, updatedAt: new Date() },
+      })
+      .catch((err) => {
+        // Not fatal: the email is a convenience for Payram's receipt.
+        console.error("[payram-entry] could not store buyer email:", err);
+      });
   }
 
-  // --- Idempotency: return existing checkout URL if already created ---
-  const existing = await prisma.paymentMapping.findUnique({
-    where: { shop_shopifyOrderId: { shop, shopifyOrderId } },
-  });
-  if (existing?.payramCheckoutUrl) {
-    console.info("[payram-proxy] reusing existing checkout url", {
-      shopifyOrderId,
-      payramReferenceId: existing.payramReferenceId,
-    });
-    return renderProxyRedirectPage(existing.payramCheckoutUrl);
-  }
-
-  // --- Create Payram payment ---
-  // Note: there is a small race window between the findUnique above and the
-  // upsert below. The upsert handles the conflict at DB level; the worst case
-  // is two Payram payments are created (one is discarded). Acceptable for dev.
-  let checkoutUrl: string;
-  let referenceId: string;
+  let token: string;
   try {
-    const result = await createPayramPayment({
-      shop,
-      shopifyOrderId,
-      amountInUSD,
-      customerEmail: email,
-    });
-    checkoutUrl = result.checkoutUrl;
-    referenceId = result.referenceId;
+    token = signOrderToken({ shop, shopifyOrderId });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Log the full cause chain so the real network error is visible
-    const cause = err instanceof Error ? (err.cause as Error | undefined) : undefined;
-    console.error("[payram] createPayramPayment failed:", msg, cause ? `| cause: ${cause.message ?? cause}` : "");
-    if (isProxyRequest) {
-      return renderProxyErrorPage(
-        "Payment creation failed",
-        `${msg}${cause ? ` (${cause.message ?? cause})` : ""}`,
-      );
-    }
-    return new Response(`Payment creation failed: ${msg}${cause ? ` (${cause.message ?? cause})` : ""}`, { status: 502 });
+    console.error("[payram-entry] token signing failed:", err);
+    return errorPage(
+      "Payments are not configured",
+      "This store cannot create payment links right now. Please contact the store.",
+      503,
+    );
   }
 
-  // --- Persist mapping ---
-  await prisma.paymentMapping.upsert({
-    where: { shop_shopifyOrderId: { shop, shopifyOrderId } },
-    create: {
-      shop,
-      shopifyOrderId,
-      payramReferenceId: referenceId,
-      payramCheckoutUrl: checkoutUrl,
-      payramStatus: "created",
-    },
-    update: {
-      payramReferenceId: referenceId,
-      payramCheckoutUrl: checkoutUrl,
-      payramStatus: "created",
-      updatedAt: new Date(),
-    },
-  });
+  console.info("[payram-entry] issuing payment page", { shop, shopifyOrderId });
 
-  console.info("[payram-proxy] created checkout url", {
-    shopifyOrderId,
-    payramReferenceId: referenceId,
-  });
+  // `auto=1`: the buyer just pressed "pay", so the page proceeds to checkout
+  // rather than stopping to show status.
+  //
+  // The email rides along for this one hop so a buyer's very first payment still
+  // reaches Payram with a receipt address even though nothing is stored yet
+  // (see above). The payment page strips it from the URL on load, so what the
+  // buyer can bookmark never contains an email address.
+  const params = new URLSearchParams({ auto: "1" });
+  if (email) params.set("email", email);
 
-  return renderProxyRedirectPage(checkoutUrl);
+  // App Proxy requests originate on the storefront domain, where a root-relative
+  // Location would resolve to https://{shop}/pay/... and 404. Absolute when the
+  // app URL is known.
+  const appUrl = (process.env.SHOPIFY_APP_URL ?? "").replace(/\/$/, "");
+  const target = `/pay/${token}?${params}`;
+  const location = signature && appUrl ? `${appUrl}${target}` : target;
+
+  return redirect(location, {
+    headers: { "Cache-Control": "no-store" },
+  });
 };

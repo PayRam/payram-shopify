@@ -67,8 +67,17 @@ function PayramBlock() {
   // orderId "0" is editor-preview mock data — treat as invalid
   const validOrderId = !!orderId && orderId !== "0" && /^\d+$/.test(orderId);
 
+  // Displayed for confirmation only — the total is NEVER sent to the server.
+  // The app reads the authoritative total from the Shopify Admin API and
+  // converts it to USD there, because Payram's API settles in USD only.
+  //
+  // `useTotalAmount()` returns a Money object, and the currencyCode matters as
+  // much as the amount: this block used to pass `totalAmount.amount` alone under
+  // the name `amountInUSD`, which booked a €50 order as a $50 payment.
   const totalAmount = useTotalAmount();
-  const amountInUSD = totalAmount.amount;
+  const orderTotalLabel = totalAmount?.amount
+    ? `${totalAmount.amount} ${totalAmount.currencyCode ?? ""}`.trim()
+    : "";
   const shopDomain = useShop().myshopifyDomain ?? "";
   const redirectBaseUrl = "__PAYRAM_REDIRECT_BASE_URL__";
   const hasRedirectBaseUrl = /^https:\/\//.test(redirectBaseUrl);
@@ -94,10 +103,15 @@ function PayramBlock() {
   // The installer injects the current public app URL into this bundle at deploy
   // time, so buyers can navigate directly to the app without relying on a
   // Shopify App Proxy round-trip.
+  // No amount is sent. The server reads the order total from Shopify itself, so
+  // a browser-supplied total could neither be trusted nor mistaken for USD.
+  //
+  // Navigates in the SAME tab. A new tab is easily lost on mobile, and the
+  // destination is a durable, bookmarkable payment page the buyer can return to
+  // via Back or history — so the tab is no longer what keeps the thread alive.
   const buildHref = () =>
     `${redirectBaseUrl}/api/payram/redirect-to-payment?${new URLSearchParams({
       shopifyOrderId: orderId,
-      amountInUSD: String(amountInUSD),
       email,
       shop: shopDomain,
     })}`;
@@ -122,6 +136,12 @@ function PayramBlock() {
           Enter your email address below and click the button to complete your
           crypto payment via Payram.
         </s-text>
+
+        {orderTotalLabel && (
+          <s-text tone="subdued">
+            Order total: {orderTotalLabel}. You'll pay the equivalent in crypto.
+          </s-text>
+        )}
 
         <s-text-field
           label="Email address"
@@ -149,13 +169,12 @@ function PayramBlock() {
               ? buildHref()
               : undefined
           }
-          target="_blank"
           disabled={
             !validOrderId || !shopDomain || !hasRedirectBaseUrl || undefined
           }
           onClick={handlePay}
         >
-          Complete Crypto Payment →
+          Continue to crypto payment →
         </s-button>
 
         {(!validOrderId || !shopDomain || !hasRedirectBaseUrl) && (

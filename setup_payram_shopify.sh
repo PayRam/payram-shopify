@@ -328,7 +328,7 @@ info "App and extension deployed successfully."
 info "  API Key: ${NEW_API_KEY}"
 
 # Normalize SCOPES so existing installs pick up the app proxy permission too.
-set_env SCOPES "read_orders,write_orders,read_customers,write_app_proxy"
+set_env SCOPES "read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards"
 
 # =============================================================================
 # STEP 5b — Shopify store domain

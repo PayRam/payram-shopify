@@ -14,7 +14,9 @@
     "info": "shopify app info",
     "auth": "shopify auth login",
     "prisma": "prisma",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@prisma/client": "^5.20.0",
@@ -38,7 +40,8 @@
     "prisma": "^5.20.0",
     "typescript": "^5.2.2",
     "vite": "^5.1.6",
-    "vite-tsconfig-paths": "^5.0.1"
+    "vite-tsconfig-paths": "^5.0.1",
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=18.20.0"

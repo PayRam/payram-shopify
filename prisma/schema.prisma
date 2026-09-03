@@ -35,6 +35,19 @@ model MerchantConfig {
   payramBaseUrl                String
   payramProjectApiKeyEncrypted String
   paymentMethodName            String   @default("Pay with Crypto via Payram")
+  // Overpayment handling. When a buyer sends more crypto than the invoice, the
+  // excess is returned as a Shopify gift card. Off by default because it needs
+  // the write_gift_cards scope, which forces merchants to re-authorize the app.
+  autoGiftCardOnOverpayment    Boolean  @default(false)
+  // Excess below this (USD, decimal string) is ignored rather than turned into a
+  // gift card — avoids issuing dust cards for a few cents of rounding.
+  giftCardMinimumUsd           String   @default("1.00")
+  // How close to the invoice counts as paid. Crypto arrives short for reasons
+  // outside the buyer's control — network fees, a price tick between quote and
+  // send — so the tolerance scales with order size rather than being a flat cent.
+  // Effective tolerance = max(invoice × percent, floor).
+  settlementTolerancePercent   String   @default("1.0")
+  settlementToleranceMinUsd    String   @default("1.00")
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }
@@ -53,8 +66,87 @@ model PaymentMapping {
   lastSyncAt             DateTime?
   // Stores sync errors when PCD blocks Shopify order mark-paid calls
   syncError              String?
+  // --- Currency conversion audit trail ---
+  // Payram settles in USD; Shopify orders may be in any presentment currency.
+  // These record exactly what was converted, at what rate, and from where, so a
+  // merchant can reconcile a Payram payment against the original Shopify order.
+  // Money is stored as TEXT, never Decimal: SQLite's NUMERIC affinity can demote
+  // DECIMAL values to floating point, and PayRam never represents money as a float.
+  orderCurrency          String?
+  orderAmount            String?
+  fxRate                 String?
+  fxSource               String?
+  amountInUsd            String?
+  // --- Settlement (what actually arrived vs what was invoiced) ---
+  // Payram reports FILLED / PARTIALLY_FILLED / OVER_FILLED; the connector needs
+  // all three, not a boolean paid/unpaid.
+  paymentState           String?
+  // Cumulative USD received across every Payram payment for this order,
+  // including top-ups that arrive under their own reference.
+  filledAmountInUsd      String?
+  // Signed USD difference: negative = still owed, positive = overpaid.
+  balanceUsd             String?
+  // Gift card issued for an overpayment. The full code is deliberately NOT
+  // stored — it is bearer value, like cash. Shopify keeps it; we keep a handle.
+  giftCardId             String?
+  giftCardLastChars      String?
+  giftCardAmount         String?
+  giftCardCurrency       String?
+  // --- The currently live checkout link ---
+  // payramCheckoutUrl/payramReferenceId above hold the link most recently issued.
+  // This records what it was issued FOR, so a repeat visit reuses the same link
+  // when the outstanding amount is unchanged, and replaces it when it is not.
+  linkAmountUsd          String?
+  linkCreatedAt          DateTime?
+  // Buyer-supplied email, collected in the Thank You block and forwarded to
+  // Payram for its receipt. Held here rather than passed through the payment
+  // URL so a bookmarkable link never carries someone's email address.
+  buyerEmail             String?
   createdAt              DateTime  @default(now())
   updatedAt              DateTime  @updatedAt
 
   @@unique([shop, shopifyOrderId])
+}
+
+// One row per Payram payment reference seen for an order.
+//
+// An order can have more than one: if a buyer underpays and then sends more
+// crypto, payram-core does NOT top up the original request — it creates a fresh
+// payment request with a new referenceID (deposit_repo_impl.go assigns
+// FilledAmount rather than accumulating). Those top-ups still carry the same
+// customer_id, which is how they are traced back to this order.
+//
+// Keying on the reference also makes settlement idempotent: webhook retries
+// upsert the same row instead of double-counting the money.
+model PayramPayment {
+  id                String   @id @default(cuid())
+  shop              String
+  shopifyOrderId    String
+  payramReferenceId String   @unique
+  // Payram's own classification: OPEN / FILLED / PARTIALLY_FILLED / OVER_FILLED / CANCELLED
+  state             String?
+  // USD actually received against this reference.
+  filledAmountInUsd String?
+  txHash            String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([shop, shopifyOrderId])
+}
+
+// Cached fiat→USD exchange rates.
+//
+// Payram's API takes `amountInUSD` only and payram-core's oracle handles crypto
+// exclusively, so the connector converts fiat itself. This table is the
+// equivalent of the WooCommerce connector's one-hour WP transient: DB-backed, so
+// the cache survives restarts and is shared across app instances.
+model FxRate {
+  // ISO-4217 alphabetic code, uppercase (e.g. "EUR"). One live rate per currency.
+  currency   String   @id
+  // USD value of one unit of `currency`, as a decimal string.
+  usdPerUnit String
+  // Provider the rate came from, for audit.
+  source     String
+  fetchedAt  DateTime
+  expiresAt  DateTime
 }
