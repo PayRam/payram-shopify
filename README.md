@@ -126,7 +126,7 @@ Approve the permission request. This installs the app on your store and creates 
 | `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server |
 | `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
 | `ENCRYPTION_KEY` | ✅ | 64-char hex key for encrypting stored API keys |
-| `SCOPES` | ✅ | `read_orders,write_orders,read_customers` (do not change) |
+| `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_app_proxy,write_gift_cards` (do not change) |
 | `PORT` | — | Server port (default: `2798`) |
 
 ---
@@ -208,7 +208,7 @@ Fill in:
 # from Shopify Partner Dashboard → App → Client credentials
 SHOPIFY_API_KEY=your_key
 SHOPIFY_API_SECRET=your_secret
-SCOPES=read_orders,write_orders,read_customers
+SCOPES=read_orders,write_orders,read_customers,write_app_proxy,write_gift_cards
 SHOPIFY_APP_URL=https://your-tunnel.trycloudflare.com
 
 DATABASE_URL="file:dev.sqlite"
@@ -275,7 +275,9 @@ Pay with Crypto via Payram
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/payram/redirect-to-payment` | Creates Payram payment and redirects buyer |
+| `GET` | `/pay/{token}` | **The buyer-facing payment page.** Status, first payment, top-up, receipt |
+| `POST` | `/api/payram/session` | Quote / create-checkout, called by the payment page |
+| `GET` | `/api/payram/redirect-to-payment` | Entry point from the Thank You block; mints a token and redirects to `/pay/{token}` |
 | `GET` | `/api/payram/status` | Returns PaymentMapping for an order or reference |
 | `POST` | `/api/payram/webhook` | Receives Payram payment status webhooks |
 
@@ -286,14 +288,19 @@ Query params:
 | Param | Required | Description |
 |-------|----------|-------------|
 | `shopifyOrderId` | Yes | Numeric Shopify order ID |
-| `amountInUSD` | Yes | Order total in USD |
 | `shop` | Yes | `*.myshopify.com` domain |
 | `email` | No | Buyer email for Payram receipt |
+| `amountInUSD` | — | **Ignored.** Older extension bundles still send it; the server never reads it. |
 
 Behaviour:
 - Validates params, loads merchant Payram config.
 - If a mapping already exists for the order, redirects to the existing checkout URL (idempotent).
-- Otherwise calls `POST {payramBaseUrl}/api/v1/payment`, stores the mapping, redirects buyer.
+- Reads the **authoritative order total from the Shopify Admin API** (`read_orders`), never from the
+  request. The buyer's browser cannot influence the amount charged.
+- Converts that total to USD (see [Currency Handling](#currency-handling)). If no live exchange rate
+  is available the payment is **not** created and the buyer is asked to retry.
+- Claims the order in the database, calls `POST {payramBaseUrl}/api/v1/payment`, stores the
+  reference, and redirects the buyer.
 
 ### `POST /api/payram/webhook`
 
@@ -321,7 +328,8 @@ Headers:
 Body:
 {
   "customerId": "shopify:{shop}:order:{shopifyOrderId}",
-  "amountInUSD": 50.00,
+  "amountInUSD": 54.22,                  // order total CONVERTED to USD
+  "invoiceID": "{shopifyOrderId}",       // shows the order number in Payram
   "customerEmail": "buyer@example.com"   // optional
 }
 
@@ -333,6 +341,175 @@ Expected response:
 ```
 
 The connector also accepts `reference_id`/`id` and `checkout_url`/`paymentUrl` variants.
+
+---
+
+## Currency Handling
+
+**Payram settles in USD.** `POST /api/v1/payment` accepts an `amountInUSD` field and nothing else —
+there is no fiat currency parameter, and payram-core's rate oracle converts *crypto* to USD only, so
+the server has no EUR or GBP rates to apply. A connector must therefore convert before it calls
+Payram.
+
+If your store prices in anything other than USD, the connector does this for you:
+
+1. The order total is read from Shopify server-side, using `currentTotalPriceSet.presentmentMoney` —
+   the amount and currency the buyer was actually invoiced in (this is what Shopify Markets shows a
+   buyer in their local currency, which can differ from your store's default).
+2. That total is converted to USD using a live rate from `open.er-api.com`, cached for one hour in
+   the `FxRate` table. This is the same provider and cache window the PayRam WooCommerce plugin uses.
+3. The original amount, currency, rate and source are written to `PaymentMapping` so every payment
+   can be reconciled against its Shopify order.
+
+**If no live rate is available, no payment is created.** The buyer sees "Exchange rate unavailable"
+and is asked to retry; the order is left untouched. Creating the payment at a guessed or unconverted
+rate would silently short the merchant, which is far more expensive to unwind than a retried
+checkout. This is the same stance payram-core takes on payouts, where a stale rate raises
+`EXCHANGE_RATE_UNAVAILABLE` rather than proceeding.
+
+Rate movement between checkout and settlement is not hedged, matching the WooCommerce connector's
+documented v1 behaviour.
+
+> **Historical note.** Before this was implemented, the Thank You block sent the raw order total to
+> the server under the name `amountInUSD` and the number was passed through untouched. A €50 order
+> was created in Payram as a $50 payment, and because nothing downstream compared amounts the order
+> was still tagged `payram_paid`. Every non-USD merchant lost the FX spread on every order. If you
+> ran an earlier build against a non-USD store, audit your Payram payments against the Shopify order
+> totals for that period.
+
+---
+
+## The Buyer's Journey
+
+```
+Shopify checkout          buyer picks "Pay with Crypto via Payram"
+        │                 order is placed, unpaid — works for guests
+        ▼
+Thank You page            our block: order total + "Continue to crypto payment →"
+        │                 same tab (a new tab is easily lost on mobile)
+        ▼
+/api/payram/redirect-to-payment    validates, stores the email, mints a signed token
+        │                          302 — does no slow work of its own
+        ▼
+/pay/{token}?auto=1       renders INSTANTLY, then shows real progress:
+        │                   Confirming your order total
+        │                   Fixing your exchange rate   →  €50.00 = $54.22 at 1.0845
+        │                   Opening secure checkout
+        ▼
+Payram hosted checkout    chain, coin, deposit address, confirmations
+```
+
+### Why the payment page is a separate, durable URL
+
+`/pay/{token}` is the **only** URL a buyer needs. It is the first payment, the live status, the
+top-up retry, and the paid confirmation — the same link, showing whichever of those is currently
+true. Consequences worth knowing:
+
+- **No login, ever.** The obvious alternative was a `customer-account.order-status.block.render`
+  extension, but that target requires `requireLogin` before interaction — a guest would have to
+  create an account to pay their own balance.
+- **Survives a closed tab.** It is bookmarkable and reachable from browser history, which is what
+  makes same-tab navigation safe.
+- **Cannot be repointed.** The order travels as an HMAC-signed token, so a link cannot be edited
+  into someone else's order. (This does not make orders unenumerable — see
+  `state/malicious-flows.md`, MF-003.)
+- **Renders before it knows anything.** It is a plain-HTML resource route with no React hydration
+  and no external calls in the loader. Previously the buyer got a blank tab for 0.5–2s while the
+  server did the Admin API lookup, the FX conversion and the Payram call before sending a byte.
+
+### Returning to pay a balance
+
+A buyer who underpays reopens the same link and sees what is still due, with a button to pay
+exactly that. The connector reuses the live Payram link while the amount is unchanged, and issues a
+new one when it moves — never on every page view, because `payram-core` cancels a member's
+previously open payment request, which would kill the link the buyer is part-way through paying.
+
+Set `PAYMENT_LINK_SECRET` in production. Without it the app falls back to `SHOPIFY_API_SECRET`, and
+rotating that would invalidate every outstanding payment link at once.
+
+---
+
+## Partial and Overpayments
+
+Crypto payments are not all-or-nothing. A buyer can send slightly less (network fees, rounding, a
+price tick between quote and send) or slightly more. Payram already classifies this on every webhook
+as `FILLED`, `PARTIALLY_FILLED` or `OVER_FILLED`, and the connector acts on all three.
+
+### What happens automatically
+
+| Situation | Order tags | Order note | Money |
+|---|---|---|---|
+| Paid in full | `payram_paid` | "paid in full" | — |
+| **Underpaid** | `payram_partially_paid` | "Still due €13.11 — do not fulfil" | none moved |
+| **Overpaid** | `payram_paid` + `payram_overpaid` | excess recorded | gift card issued for the difference |
+
+An underpaid order is **never** tagged `payram_paid`. That is the whole point: previously a short
+payment and a complete one were indistinguishable.
+
+Differences are shown in USD *and* in the currency the order was placed in, converted at the rate
+stored on the order when the invoice was struck — so "still due" does not drift as exchange rates
+move.
+
+### Top-ups
+
+If a buyer underpays and then sends more crypto, `payram-core` does **not** add it to the original
+payment request — it creates a new one with a new `referenceID`. The connector traces those back via
+`customer_id` (which is `shopify:{shop}:order:{orderId}` and unchanged), sums every payment for the
+order, and settles when the total covers the invoice. Webhook retries cannot double-count: payments
+are keyed by reference in the `PayramPayment` table.
+
+### Why gift cards, not store credit
+
+Overpayments are refunded as a **Shopify gift card**, not store credit:
+
+| | Guest buyer | Signed-in buyer |
+|---|---|---|
+| **Gift card** | ✅ works — it's a code, emailable to anyone | ✅ works |
+| **Store credit** | ❌ cannot be spent — requires customer accounts or Shop Pay sign-in | ✅ works |
+
+Most crypto checkouts are guest checkouts, so store credit would silently strand the refund for the
+majority of buyers. A gift card works for everyone, which is why it is the single path rather than a
+branch that can fail. Discount codes are not used: they are a percentage or amount off, not a stored
+balance — they don't decrement, can be shared, and don't represent money owed.
+
+### Merchant setup
+
+1. **Enable gift cards in Shopify** — Settings → *Gift cards*. Without this, card creation is
+   rejected and the connector records a warning on the order instead.
+2. **Re-authorize the app.** Issuing gift cards needs the `write_gift_cards` scope. Existing
+   installs must reopen the Payram app in Shopify Admin once and accept the updated permissions.
+3. **Turn it on** — in the Payram app, tick *Refund overpayments as a gift card* and set the minimum
+   (default `1.00` USD). It is **off by default**, because it moves money.
+
+### Merchant operations
+
+**Underpaid order**
+1. The order appears tagged `payram_partially_paid` with the shortfall in the note.
+2. Do not fulfil. Contact the buyer with the amount still due, or refund what was received.
+3. If the buyer sends the rest, the connector adds it automatically and re-tags the order
+   `payram_paid`. No merchant action needed.
+
+**Overpaid order**
+1. The order appears tagged `payram_paid` and `payram_overpaid`.
+2. A gift card for the difference is created and — when the order has a customer — emailed by
+   Shopify automatically. The note records the amount and the card's last characters.
+3. If the buyer had no customer record, the note says so; send the code from Shopify Admin →
+   *Gift cards*.
+4. Fulfil as normal. The order is paid.
+
+**Where to see problems.** Open the Payram app in Shopify Admin. Any order that is underpaid, or
+that the connector could not finish updating, is listed under *Recent crypto payments* with what
+happened in plain words, and the page warns you at the top if overpayment refunds are switched on
+without the permission needed to issue them.
+
+**When something needs a human.** Anything the connector could not do lands in
+`PaymentMapping.syncError` and in the order note, in plain words — gift cards disabled, an
+overpayment below the minimum, a payment Payram could not confirm. The connector never guesses and
+never silently swallows a discrepancy.
+
+> **Security note.** The Payram webhook is unsigned, so the connector re-reads every payment from
+> Payram (`GET /api/v1/payment/reference/{id}`) before acting, and issues a gift card only when that
+> verification succeeds. A forged webhook cannot mint value. See `state/malicious-flows.md` (MF-008).
 
 ---
 
@@ -358,6 +535,27 @@ The connector also accepts `reference_id`/`id` and `checkout_url`/`paymentUrl` v
 | `shopifyFinancialStatus` | Synced from Shopify after mark-paid |
 | `shopifyPaidSyncedAt` | Timestamp of successful sync |
 | `syncError` | Error from last Shopify sync attempt |
+| `orderCurrency` | Presentment currency of the Shopify order, e.g. `EUR` |
+| `orderAmount` | Original order total in `orderCurrency`, as a decimal string |
+| `fxRate` | USD per 1 unit of `orderCurrency` at the time of payment |
+| `fxSource` | Where the rate came from, e.g. `open.er-api.com` (`identity` for USD) |
+| `amountInUsd` | Converted total actually sent to Payram |
+
+Money is stored as `TEXT`, not `DECIMAL`: SQLite's NUMERIC affinity can silently demote decimal
+values to floating point, and PayRam never represents money as a float. Arithmetic is done with
+`Prisma.Decimal`.
+
+### `FxRate`
+
+One cached fiat→USD rate per currency — the equivalent of the WooCommerce connector's one-hour WP
+transient, DB-backed so it survives restarts.
+
+| Field | Description |
+|-------|-------------|
+| `currency` | ISO-4217 code, primary key |
+| `usdPerUnit` | USD value of one unit, as a decimal string |
+| `source` | Rate provider |
+| `fetchedAt` / `expiresAt` | Cache window (1 hour) |
 
 ---
 
@@ -376,8 +574,10 @@ The connector also accepts `reference_id`/`id` and `checkout_url`/`paymentUrl` v
 // Order ID (numeric) from GID
 const orderId = shopify.orderConfirmation.value.order.id.split("/").pop();
 
-// Amount in USD
-const amountInUSD = shopify.cost.totalAmount.value.amount;
+// Order total — DISPLAY ONLY, never sent to the server.
+// useTotalAmount() returns a Money object; the currencyCode matters as much as
+// the amount. The server reads the real total from the Admin API instead.
+const { amount, currencyCode } = useTotalAmount();
 
 // Email — PCD Level 2 gated, may be undefined
 const email = shopify.buyerIdentity?.email?.value;

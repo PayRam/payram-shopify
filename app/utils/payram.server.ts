@@ -1,10 +1,18 @@
+import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { decrypt } from "~/utils/encryption.server";
 
 export interface PayramCreatePaymentInput {
   shop: string;
   shopifyOrderId: string;
-  amountInUSD: number;
+  /**
+   * Order total already converted to USD.
+   *
+   * Payram's API has no fiat currency field — `amountInUSD` is taken literally.
+   * Callers MUST convert first (see `~/utils/fx.server`); passing a raw order
+   * total in the store's currency silently books a EUR/GBP amount as dollars.
+   */
+  amountInUsd: Prisma.Decimal;
   customerEmail?: string;
 }
 
@@ -116,7 +124,13 @@ export async function createPayramPayment(
 
   const body: Record<string, unknown> = {
     customerId,
-    amountInUSD: input.amountInUSD,
+    // Serialized as a JSON number, matching the WooCommerce connector's proven
+    // payload shape. The value is already rounded to cents, so it is exactly
+    // representable — all money arithmetic upstream is done in Decimal.
+    amountInUSD: input.amountInUsd.toNumber(),
+    // Surfaces the Shopify order number in the Payram dashboard for
+    // reconciliation, as the WooCommerce connector does.
+    invoiceID: input.shopifyOrderId,
   };
   if (input.customerEmail) {
     body.customerEmail = input.customerEmail;
@@ -165,4 +179,123 @@ export async function createPayramPayment(
   }
 
   return { checkoutUrl, referenceId };
+}
+
+/* ------------------------------------------------------------------ */
+/* Verification — never mint value from an unsigned webhook            */
+/* ------------------------------------------------------------------ */
+
+export interface PayramPaymentSnapshot {
+  paymentState: string | null;
+  filledAmountInUsd: string | null;
+  amountInUsd: string | null;
+  /**
+   * Payram's own customerId for this payment. The caller MUST check it against
+   * the order it resolved, otherwise verifying only proves the reference exists
+   * — not that the money belongs to this order.
+   */
+  customerId: string | null;
+}
+
+/** Non-negative money only — a negative fill would subtract from an order. */
+function pickDecimalString(...values: unknown[]): string | null {
+  for (const v of values) {
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim();
+    if (s && /^\d+(\.\d+)?$/.test(s)) return s;
+  }
+  return null;
+}
+
+/**
+ * Read a payment's authoritative state straight from Payram.
+ *
+ * The merchant webhook carries no signature (see state/malicious-flows.md,
+ * MF-004), so its amounts are attacker-controllable. Anything that moves money
+ * — notably issuing a gift card for an overpayment — must be based on this,
+ * not on the webhook body.
+ *
+ * This mirrors the WooCommerce connector's `fetch_payment_status()`, which
+ * re-verifies for exactly the same reason.
+ *
+ * GET {payramBaseUrl}/api/v1/payment/reference/{referenceId}
+ *
+ * Returns null when the payment cannot be verified; callers must then refuse to
+ * move money rather than fall back to the webhook's numbers.
+ */
+export async function fetchPayramPayment(
+  shop: string,
+  referenceId: string,
+): Promise<PayramPaymentSnapshot | null> {
+  const config = await getMerchantConfig(shop);
+
+  let baseUrlRaw: string;
+  let apiKey: string;
+  if (config) {
+    baseUrlRaw = config.payramBaseUrl;
+    apiKey = decrypt(config.payramProjectApiKeyEncrypted);
+  } else if (process.env.PAYRAM_BASE_URL && process.env.PAYRAM_PROJECT_API_KEY) {
+    baseUrlRaw = process.env.PAYRAM_BASE_URL;
+    apiKey = process.env.PAYRAM_PROJECT_API_KEY;
+  } else {
+    console.error(`[payram-verify] no Payram config for shop ${shop}`);
+    return null;
+  }
+
+  const baseUrl = baseUrlRaw.replace(/\/$/, "");
+  const url = `${baseUrl}/api/v1/payment/reference/${encodeURIComponent(referenceId)}`;
+
+  try {
+    validatePayramBaseUrl(url);
+  } catch (err) {
+    console.error("[payram-verify] base URL rejected:", err);
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15_000);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "API-Key": apiKey, Accept: "application/json" },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    console.error("[payram-verify] request failed:", err);
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!res.ok) {
+    console.error(`[payram-verify] HTTP ${res.status} for reference ${referenceId}`);
+    return null;
+  }
+
+  const json = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!json) {
+    console.error("[payram-verify] unreadable response");
+    return null;
+  }
+
+  // The two reference routes differ in casing: /payment/reference/:id returns
+  // camelCase, /payment/ref/:id returns snake_case. Accept either.
+  const state = json.paymentState ?? json.payment_state ?? json.status;
+  const customerId = json.customerID ?? json.customerId ?? json.customer_id;
+
+  return {
+    customerId: typeof customerId === "string" ? customerId : null,
+    paymentState: typeof state === "string" ? state : null,
+    filledAmountInUsd: pickDecimalString(
+      json.filledAmountInUSD,
+      json.filledAmountInUsd,
+      json.filled_amount_in_usd,
+    ),
+    amountInUsd: pickDecimalString(
+      json.amountInUSD,
+      json.amountInUsd,
+      json.amount_in_usd,
+    ),
+  };
 }
