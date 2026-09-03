@@ -1,6 +1,69 @@
 # Payram Shopify Connector
 
-Accept crypto payments on your Shopify store via [Payram](https://www.payram.com). The connector adds a **Pay with Crypto** block to the Shopify Thank You page — buyers enter their email, click the button, and are redirected to a Payram-hosted checkout to complete payment in crypto.
+**Accept crypto payments on Shopify — from your own server, into your own wallet.**
+
+There is no Payram account to create. No KYB, no application, no approval queue, no
+onboarding call. You run the connector on your own infrastructure and point it at your own
+[Payram](https://www.payram.com) instance — there is nothing to sign up for because there
+is no intermediary to sign up with.
+
+| What merchants ask | Why the answer holds here |
+|---|---|
+| Is my customer data shared? | It never leaves your server. Payram cannot see it. |
+| Can my account be locked? | There is no account to lock — you run the server. |
+| Can my funds be frozen? | Self-custody. Deposits land in your wallet, not someone else's float. |
+| Is anything reported about my sales? | Nothing is reported to anyone. |
+| What if my server is breached? | Deposit keys are not on it — smart contracts move funds on-chain. |
+
+Buyers pay in BTC, ETH, TRX, BASE or POLYGON assets and never create an account either —
+the whole flow works for **guest checkout**.
+
+---
+
+## For AI agents
+
+Read this section first if you are configuring, extending or debugging this connector.
+
+**What this is.** A [Remix](https://remix.run) app (Node ≥ 18, Prisma + SQLite) sitting
+between a Shopify store and a self-hosted Payram instance. It holds no funds and never sees
+a private key. It decides *how much to charge*, *in what currency*, and *what an arriving
+payment means for the Shopify order*.
+
+**The flow in one paragraph.** A buyer checks out with a manual payment method, so Shopify
+places the order unpaid. A checkout extension on the Thank You page links to
+`/api/payram/redirect-to-payment`, which mints a signed token and redirects to
+`/pay/{token}` — the durable payment page. That page reads the order total from the Shopify
+Admin API (never from the browser), converts it to USD (Payram settles in USD only), creates
+a Payram payment, and sends the buyer to Payram's hosted checkout. When funds arrive, Payram
+webhooks `/api/payram/webhook`, which settles the order: tag it paid, flag it underpaid, or
+refund an overpayment as a gift card.
+
+**Where to start, by task:**
+
+| Task | Go to |
+|---|---|
+| Install / configure a store | [Self-Hosted Installation](#self-hosted-installation), [Configuration Reference](#configuration-reference) |
+| Understand what a buyer sees | [The Buyer's Journey](#the-buyers-journey) |
+| Work out why an order looks wrong | [Diagnostics](#diagnostics) |
+| Understand money handling | [Currency Handling](#currency-handling), [Partial and Overpayments](#partial-and-overpayments) |
+| Change settlement behaviour | `app/utils/settlement.server.ts` |
+| Check the security posture | `state/malicious-flows.md` |
+
+**Invariants — do not break these.** Each one exists because breaking it cost real money:
+
+1. **Never take the amount from the browser.** It arrives on an unsigned request. Read it
+   from the Shopify Admin API.
+2. **Payram settles in USD only.** Its rate oracle handles crypto→USD; it has no fiat rates.
+   Convert before calling `/api/v1/payment`, and fail closed if no rate is available.
+3. **Money is `TEXT` in the database and `Decimal` in code — never a float.** SQLite's
+   NUMERIC affinity silently demotes `DECIMAL` to floating point.
+4. **The Payram webhook is unsigned.** Never mint value (gift cards) from it without
+   re-reading the payment from Payram *and* checking it belongs to that order.
+5. **An unrecognised payment status must never settle an order.** Unknown means unknown.
+6. **Never create a Payram payment from the webhook.** Payram re-sends every 3 seconds
+   during confirmation, and creating a payment cancels the buyer's live checkout link.
+7. **Charge the outstanding balance, not the order total** — otherwise an order part-paid
+   by a gift card gets billed twice.
 
 ---
 
@@ -117,17 +180,56 @@ Approve the permission request. This installs the app on your store and creates 
 
 ---
 
-## Environment Variables Reference
+## Configuration Reference
+
+Configuration lives in three places. An agent changing behaviour should know which.
+
+### 1. Environment (server)
 
 | Variable | Required | Description |
 |---|---|---|
 | `SHOPIFY_API_KEY` | ✅ | Shopify app Client ID |
-| `SHOPIFY_API_SECRET` | ✅ | Shopify app Client secret |
-| `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server |
+| `SHOPIFY_API_SECRET` | ✅ | Shopify app Client secret. Also the fallback signer for payment links |
+| `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server. Used to build absolute redirects for App Proxy requests |
 | `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
-| `ENCRYPTION_KEY` | ✅ | 64-char hex key for encrypting stored API keys |
+| `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM) |
 | `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_app_proxy,write_gift_cards` (do not change) |
-| `PORT` | — | Server port (default: `2798`) |
+| `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. Falls back to `SHOPIFY_API_SECRET` — see the warning below |
+| `PORT` | — | Server port (default `2798`) |
+| `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
+| `ALLOW_INSECURE_PAYRAM_URL` | — | Dev only. Disables SSRF protection on the Payram URL. **Never set in production** |
+
+> **Set `PAYMENT_LINK_SECRET` explicitly in production.** Without it, links are signed with
+> `SHOPIFY_API_SECRET`, so rotating your Shopify credentials invalidates *every outstanding
+> payment link* — including links held by buyers who have already part-paid.
+
+The installer (`setup_payram_shopify.sh`) **rewrites `SCOPES` on every run**. If you add a
+scope, change it there too or it will be silently reverted on the next install.
+
+### 2. Merchant settings (Payram app in Shopify Admin)
+
+Stored per shop in `MerchantConfig`. Everything money-affecting is validated on save and
+rejected — never silently defaulted.
+
+| Setting | Default | Effect |
+|---|---|---|
+| Payram Base URL | — | Your Payram instance. Must be HTTPS; private/loopback ranges are blocked |
+| Payram Project API Key | — | Encrypted at rest |
+| Payment Method Name | `Pay with Crypto via Payram` | Label buyers see |
+| Underpayment tolerance (%) | `1.0` | Shortfall that still counts as paid, as a share of the order |
+| Minimum tolerance (USD) | `1.00` | Floor for small orders. The **larger** of the two applies |
+| Refund overpayments as a gift card | `off` | Needs `write_gift_cards` **and** gift cards enabled in Shopify |
+| Minimum overpayment to refund (USD) | `1.00` | Smaller excess is noted on the order, not refunded |
+
+Effective tolerance is `max(invoice × percent, floor)` — proportional because network fees
+and price drift scale with order size. A $1,000 order allows $10; a $20 order allows $1.
+
+### 3. Shopify-side prerequisites
+
+- A **manual payment method** named to match the setting above.
+- The **Payram Thank You Block** added in the checkout editor.
+- **Gift cards enabled** (Settings → Gift cards) if refunding overpayments.
+- **Re-authorization** after any scope change — merchants must reopen the app and accept.
 
 ---
 
@@ -143,47 +245,6 @@ docker run -d \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
   payramapp/payram-shopify:latest
-```
-
----
-
-## Architecture
-
-```
-Shopify Thank You page
-  └── Checkout UI Extension (purchase.thank-you.block.render)
-        └── buyer enters email → clicks button
-              └── GET /api/payram/redirect-to-payment
-                    └── create Payram payment via Payram API
-                    └── store PaymentMapping in DB
-                    └── redirect buyer to Payram checkoutUrl
-
-Payram webhook → POST /api/payram/webhook
-  └── update payment status
-  └── attempt orderMarkAsPaid in Shopify
-
-Shopify Admin → /app (settings page)
-  └── merchant sets Payram Base URL + API Key (encrypted at rest)
-```
-
----
-
-## Architecture
-
-```
-Shopify Thank You page
-  └── Checkout UI Extension (purchase.thank-you.block.render)
-        └── buyer clicks link → GET /api/payram/redirect-to-payment
-              └── create Payram payment via POST {payramBaseUrl}/api/v1/payment
-              └── store PaymentMapping in SQLite
-              └── redirect buyer to Payram checkoutUrl
-
-Payram webhook → POST /api/payram/webhook
-  └── update payramStatus
-  └── attempt orderMarkAsPaid (PCD-gated, fault-tolerant)
-
-Shopify Admin → /app (settings page)
-  └── merchant sets Payram Base URL + API Key (encrypted at rest)
 ```
 
 ---
@@ -513,6 +574,77 @@ never silently swallows a discrepancy.
 
 ---
 
+## Diagnostics
+
+Every failure the connector can see is written somewhere observable. Nothing is swallowed.
+
+### Where to look, in order
+
+1. **The Payram app in Shopify Admin** — *Recent crypto payments* lists each order with what
+   was invoiced, what arrived, and any problem in plain words. Warning banners at the top
+   flag orders needing attention and misconfigured gift card refunds.
+2. **The Shopify order** — tags and an order note record every settlement decision.
+3. **`PaymentMapping.syncError`** — the durable record of anything that failed.
+4. **Server logs** — every line is prefixed, so grep by stage.
+
+### Log prefixes
+
+| Prefix | Stage |
+|---|---|
+| `[payram-entry]` | Thank You block → token minted → redirect to the payment page |
+| `[payram-session]` | Quote and checkout-link creation behind `/pay/{token}` |
+| `[payram-admin]` | Shopify Admin API calls (order lookup, tags, notes, gift cards) |
+| `[payram-fx]` | Fiat→USD rate lookups and caching |
+| `[payram-webhook]` | Inbound Payram webhooks |
+| `[payram-verify]` | Re-reading a payment from Payram before acting on it |
+| `[payram-settle]` | Settlement decisions |
+
+### Order tags
+
+| Tag | Meaning | Fulfil? |
+|---|---|---|
+| `payram_paid` | Settled — received covers the invoice within tolerance | Yes |
+| `payram_partially_paid` | Underpaid. The note names the exact balance due | **No** |
+| `payram_overpaid` | Paid, and the excess was refunded (or flagged for manual refund) | Yes |
+
+### Symptom → cause → fix
+
+| Symptom | Signal | Cause | Fix |
+|---|---|---|---|
+| Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
+| Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
+| Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, scope missing, or gift cards disabled in Shopify | The banner names which. Scope needs re-authorization |
+| Buyer sees "This payment link isn't valid" | — | `PAYMENT_LINK_SECRET` changed, or a truncated URL | Restore the previous secret, or have the buyer reopen from their order confirmation |
+| Buyer sees "already being prepared" | `409` from `/api/payram/session` | Two tabs claimed the order at once | Wait 60s and refresh — the claim self-expires |
+| Buyer sees "store not connected" | `no offline session for shop` | App installed without an offline grant | Merchant reopens the app in Shopify Admin |
+| `/pay` errors on a paid order | `[payram-session]` | — | Expected to show a receipt; if it 500s, check `amountInUsd` exists on the mapping |
+| Underpaid orders never resolve | Order stays `payram_partially_paid` | Buyer never returned | The payment link is durable — resend it, or refund what arrived |
+| Amounts look wrong on non-USD store | Order note shows the conversion | — | Compare `orderAmount`, `fxRate` and `amountInUsd` on `PaymentMapping`; the rate is the one struck at invoice time, deliberately not today's |
+
+### Health checks
+
+```bash
+npm test          # 99 tests: conversion, settlement, top-ups, tolerance, tokens
+npm run build     # Remix build
+npx prisma migrate deploy   # applies pending migrations (also run by scripts/start.sh)
+```
+
+The app's Settings page has **Test Payram Server** and **Create Test Payment Link** buttons
+that exercise connectivity and the payment API with the saved credentials.
+
+### Known-open security items
+
+`state/malicious-flows.md` is the registry. Two entries are **open** and deliberately
+documented rather than quietly carried:
+
+- **MF-003** — the entry route is unauthenticated, so a guessed order ID can trigger payment
+  creation. The signed token makes the resulting link tamper-proof but does not make orders
+  unenumerable.
+- **MF-004** — Payram webhooks are unsigned. Mitigated by re-reading every payment from
+  Payram and refusing to move money on anything unverified.
+
+---
+
 ## Database Models
 
 ### `MerchantConfig`
@@ -599,18 +731,22 @@ const appBackendBaseUrl = shopify.settings.value.appBackendBaseUrl;
 
 ### Protected Customer Data (PCD) limitations
 
-The following features require Shopify PCD approval (granted during public app review — not available in dev stores):
+Some customer-data fields require Shopify PCD approval (granted during public app review,
+not available in dev stores). The connector degrades rather than failing:
 
-| Feature | Status |
-|---------|--------|
-| `buyerIdentity.email` in extension | PCD Level 2 — returns `undefined` in dev |
-| `orderMarkAsPaid` GraphQL mutation | PCD-gated — `syncError` stored, webhook still returns 200 |
-| Order email via Admin REST | PCD-gated |
+| Feature | Status | Degraded behaviour |
+|---|---|---|
+| `buyerIdentity.email` in the extension | PCD Level 2 — `undefined` in dev | Email is collected by a text field in the block instead |
+| `order.customer` in the settlement lookup | PCD-gated | Retries the query without the field. Tags and notes still apply; a gift card is created but Shopify cannot email it, and the order note says to send it from Admin |
+| Order email via Admin REST | PCD-gated | Not used |
 
-Workarounds implemented:
-- Email is collected manually via a text field in the block.
-- `customerEmail` is optional when calling Payram.
-- `orderMarkAsPaid` failures are stored in `PaymentMapping.syncError` and do not cause webhook retries.
+`customerEmail` is optional when calling Payram, so a missing email never blocks a payment.
+
+**The connector does not use `orderMarkAsPaid`.** It is PCD-gated and would fail on exactly
+the stores that need it, so settlement records state as order **tags and notes**
+(`payram_paid`, `payram_partially_paid`, `payram_overpaid`) which work on every plan. This
+is deliberate, not a workaround pending approval: the connector never claims Shopify's own
+financial status for an off-platform payment it cannot prove to Shopify.
 
 ---
 
