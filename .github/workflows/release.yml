@@ -1,0 +1,109 @@
+# Build and publish the connector image.
+#
+# WHY THIS EXISTS
+# ---------------
+# The image was published by hand. Between 2026-05-11 and 2026-09-04 `main`
+# gained a currency fix, settlement, gift cards and a payment page, and none of
+# it reached a merchant — `payramapp/payram-shopify:latest` still served the
+# older build. Merging did not ship anything, and nothing said so.
+#
+# TAGGING
+# -------
+# Mirrors payramapp/payram so both images can be pinned the same way:
+#   sha-<short>   every build, immutable — the tag to pin in production
+#   <version>     on a v* tag, plus the major.minor ladder
+#   latest        main only
+#
+# The installer hardcodes `:latest`, so a merchant re-running it silently takes
+# whatever was last pushed. `sha-` tags give them something stable to pin to,
+# and give us something to roll back to.
+name: Release image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      DOCKER_IMAGE: payramapp/payram-shopify
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Fail here, loudly, rather than at `docker login` with an opaque error.
+      # These secrets exist on payram-core but are repo-scoped, so they must be
+      # added to this repository too.
+      - name: Check publishing credentials
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "${DOCKERHUB_USERNAME}" ] || [ -z "${DOCKERHUB_TOKEN}" ]; then
+            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are not set on this repository."
+            echo "::error::Add them under Settings → Secrets and variables → Actions."
+            echo "::error::payram-core already has them; they are repo-scoped, not org-wide."
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # arm64 is included because self-hosted merchants commonly run on ARM VPS
+      # (Ampere, Oracle free tier). Without it `docker pull` on those hosts
+      # either fails or silently runs emulated.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published \`${DOCKER_IMAGE}\`"
+            echo ""
+            echo "Commit \`${GITHUB_SHA::7}\` · platforms \`linux/amd64, linux/arm64\`"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Pin the \`sha-\` tag in production; \`latest\` moves."
+          } >> "$GITHUB_STEP_SUMMARY"
