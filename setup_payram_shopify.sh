@@ -207,6 +207,14 @@ docker volume create payram-shopify-cli-auth >/dev/null 2>&1 || true
 # Write shopify.app.toml.
 # client_id is empty on first run (CLI will link to new/existing app interactively).
 # client_id is set on re-runs so the CLI deploys to the known app without prompting.
+#
+# SCOPES ARE DECLARED IN THREE PLACES AND ALL THREE MUST AGREE:
+#   1. this generated toml  -> what the app declares to Shopify at deploy time
+#   2. set_env SCOPES below -> what the running server requests during OAuth
+#   3. repo shopify.app.toml -> the checked-in reference (overwritten by 1)
+# Changing only some of them fails silently: the merchant grants one set and the
+# server expects another, and the mismatch only shows up when a call needing the
+# missing scope returns 403 in production.
 printf '%s\n' \
   'name = "payram-checkout-plugin"' \
   "client_id = \"${SHOPIFY_API_KEY:-}\"" \
@@ -214,7 +222,7 @@ printf '%s\n' \
   'embedded = true' \
   '' \
   '[access_scopes]' \
-  'scopes = "read_orders,write_orders,read_customers,write_app_proxy"' \
+  'scopes = "read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards"' \
   '' \
   '[auth]' \
   'redirect_urls = [' \
