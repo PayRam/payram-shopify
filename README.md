@@ -153,6 +153,32 @@ Approve the permission request. This installs the app on your store and creates 
 
 ---
 
+### Step 5b — Point Payram's webhook at the connector
+
+**Do not skip this.** Without it the connector is never told that a payment
+arrived: the buyer pays, Payram shows the payment, and the Shopify order sits
+unpaid and untagged forever.
+
+In your **Payram dashboard**, open the project used for this store, go to
+**Webhooks**, and add:
+
+```
+https://YOUR_DOMAIN/api/payram/webhook
+```
+
+Use Payram's **Test webhook delivery** to confirm it arrives. From the server
+side you can watch for it:
+
+```bash
+docker logs -f payram-shopify-connector | grep payram-webhook
+```
+
+> Payram queues a delivery only for webhooks that exist **at the moment a payment
+> is processed**. Adding the webhook later does not back-fill past payments —
+> settle those with **Re-check payment** in the app.
+
+---
+
 ### Step 6 — Add the manual payment method in Shopify
 
 1. In Shopify Admin → **Settings** → **Payments** → **Manual payment methods** → **Add manual payment method**.
@@ -247,6 +273,8 @@ and price drift scale with order size. A $1,000 order allows $10; a $20 order al
 
 - A **manual payment method** named to match the setting above.
 - The **Payram Thank You Block** added in the checkout editor.
+- **A Payram webhook** pointing at `https://YOUR_DOMAIN/api/payram/webhook`, configured in the
+  Payram dashboard. Without it no payment is ever settled.
 - **Gift cards enabled** (Settings → Gift cards) if refunding overpayments.
 - **Up-to-date permissions.** When the permission list changes, re-run the installer so the app is
   redeployed with the new list, then open the app in Shopify Admin and approve. Reopening the app
@@ -740,7 +768,9 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 
 | Symptom | Signal | Cause | Fix |
 |---|---|---|---|
+| Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
+| Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
 | Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, payment not confirmed with Payram, a card already issued for this order, permissions missing, or gift cards disabled in Shopify | The banner or note names which. Missing permissions: re-run the installer, then approve in Shopify Admin |
 | Buyer sees "This payment link isn't valid" | — | `PAYMENT_LINK_SECRET` changed, or a truncated URL | Restore the previous secret, or have the buyer reopen from their order confirmation |
@@ -873,16 +903,49 @@ not available in dev stores). The connector degrades rather than failing:
 | Feature | Status | Degraded behaviour |
 |---|---|---|
 | `buyerIdentity.email` in the extension | PCD Level 2 — `undefined` in dev | Email is collected by a text field in the block instead |
-| `order.customer` in the settlement lookup | PCD-gated | Retries the query without the field. Tags and notes still apply; a gift card is created but Shopify cannot email it, and the order note says to send it from Admin |
+| `order.customer` in the settlement lookup | PCD-gated | Retries the query without the field. Tags, notes and marking paid still apply; a gift card is created but Shopify cannot email it, and the order note says to send it from Admin |
 | Order email via Admin REST | PCD-gated | Not used |
 
 `customerEmail` is optional when calling Payram, so a missing email never blocks a payment.
 
-**The connector does not use `orderMarkAsPaid`.** It is PCD-gated and would fail on exactly
-the stores that need it, so settlement records state as order **tags and notes**
-(`payram_paid`, `payram_partially_paid`, `payram_overpaid`) which work on every plan. This
-is deliberate, not a workaround pending approval: the connector never claims Shopify's own
-financial status for an off-platform payment it cannot prove to Shopify.
+**The connector marks settled orders paid** with `orderMarkAsPaid`, and keeps the tags
+(`payram_paid`, `payram_partially_paid`, `payram_overpaid`) as the audit trail. Tags alone
+were not enough: they are invisible to payouts, order filters, reports and fulfilment apps,
+so merchants had to click *Mark as paid* on every crypto order.
+
+Marking paid is **best-effort and deliberately gated**:
+
+- Only a payment **verified with Payram** can mark an order paid. The webhook is unsigned, and
+  setting Shopify's financial status is not reversible through the API, so it requires the same
+  trust level as issuing a gift card.
+- **Underpaid orders are never marked paid**, and no order is marked twice.
+- If Shopify refuses — most often because the staff member who installed the app lacks the
+  *mark orders as paid* permission — the order still settles and stays tagged, and the reason
+  appears on the order in the app. Use **Re-check payment** after granting the permission.
+
+> An earlier build avoided this mutation, believing it was PCD-gated. Shopify documents it as
+> needing `write_orders` plus the staff permission `mark_orders_as_paid`; Protected Customer
+> Data governs customer PII, not this mutation.
+
+---
+
+## What the connector sends out
+
+Two outbound calls, both off the merchant's own server, and neither carries store data:
+
+| Call | When | Contains |
+|---|---|---|
+| `open.er-api.com` | Converting a non-USD order, cached an hour | The currency code only |
+| `api.github.com` | Once a day, **only if enabled** | Nothing — an unauthenticated read of the public releases page |
+
+Everything else is between the merchant's server, their own Payram instance and their own
+Shopify store.
+
+**Update checks are off by default.** The product's promise is that nothing is reported to
+anyone and everything is the business's decision, so the connector does not phone anywhere
+until the merchant turns it on under *Check for connector updates*. Enabling it tells GitHub
+the server's IP exists, the same as any `docker pull` does — and nothing about the shop,
+its orders or its customers. Nothing is ever installed automatically.
 
 ---
 

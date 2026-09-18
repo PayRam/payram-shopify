@@ -23,6 +23,7 @@ const { db, admin, fx, store } = vi.hoisted(() => {
     addOrderTags: vi.fn(),
     appendOrderNote: vi.fn(),
     createGiftCard: vi.fn(),
+    markOrderPaid: vi.fn(),
   };
   const fx = {
     convertFromUsd: vi.fn(),
@@ -148,6 +149,11 @@ beforeEach(() => {
     shopCurrencyCode: "EUR",
   });
   admin.addOrderTags.mockResolvedValue(undefined);
+  admin.markOrderPaid.mockResolvedValue({
+    ok: true,
+    financialStatus: "PAID",
+    alreadyPaid: false,
+  });
   admin.appendOrderNote.mockResolvedValue(undefined);
   admin.createGiftCard.mockResolvedValue({
     id: "gid://shopify/GiftCard/9",
@@ -666,5 +672,97 @@ describe("settleOrder — review fixes", () => {
     admin.createGiftCard.mockClear();
     await settle("ref-2", "OVER_FILLED" as never, "60.00");
     expect(admin.createGiftCard).not.toHaveBeenCalled();
+  });
+});
+
+describe("settleOrder — marking the order paid in Shopify", () => {
+  it("marks a fully settled order paid, not just tagged", async () => {
+    seedMapping();
+    await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(admin.markOrderPaid).toHaveBeenCalledWith(SHOP, "token", ORDER);
+    expect(db.mapping?.shopifyMarkedPaidAt).toBeInstanceOf(Date);
+  });
+
+  it("never marks an underpaid order paid", async () => {
+    seedMapping();
+    await settle("ref-1", "PARTIALLY_FILLED" as never, "40.00");
+
+    expect(admin.markOrderPaid).not.toHaveBeenCalled();
+    expect(db.mapping?.shopifyMarkedPaidAt ?? null).toBeNull();
+  });
+
+  it("marks an overpaid order paid too", async () => {
+    seedMapping();
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    expect(admin.markOrderPaid).toHaveBeenCalled();
+  });
+
+  it("keeps the order settled when Shopify refuses, and says what to do", async () => {
+    seedMapping();
+    admin.markOrderPaid.mockResolvedValue({
+      ok: false,
+      financialStatus: null,
+      alreadyPaid: false,
+      error: "User does not have permission",
+    });
+
+    const out = await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(out.settled).toBe(true);
+    expect(admin.addOrderTags).toHaveBeenCalledWith(SHOP, "token", ORDER, [TAG_PAID]);
+    expect(out.warnings.join(" ")).toMatch(/Mark as paid/i);
+    expect(db.mapping?.shopifyMarkedPaidAt ?? null).toBeNull();
+  });
+
+  it("survives markOrderPaid throwing", async () => {
+    seedMapping();
+    admin.markOrderPaid.mockRejectedValue(new Error("network down"));
+
+    const out = await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(out.settled).toBe(true);
+    expect(out.warnings.join(" ")).toMatch(/mark orders as paid|Mark as paid/i);
+  });
+
+  it("does not mark an order paid twice", async () => {
+    seedMapping({ shopifyMarkedPaidAt: new Date() });
+    await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(admin.markOrderPaid).not.toHaveBeenCalled();
+  });
+
+  it("retries marking paid on a re-check, even though nothing changed", async () => {
+    seedMapping();
+    admin.markOrderPaid.mockResolvedValueOnce({
+      ok: false,
+      financialStatus: null,
+      alreadyPaid: false,
+      error: "temporary",
+    });
+
+    await settle("ref-1", "FILLED" as never, "54.22");
+    expect(db.mapping?.shopifyMarkedPaidAt ?? null).toBeNull();
+
+    // Merchant presses "Re-check payment".
+    admin.markOrderPaid.mockResolvedValue({
+      ok: true,
+      financialStatus: "PAID",
+      alreadyPaid: false,
+    });
+    await settleOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      referenceId: "ref-1",
+      state: "FILLED" as never,
+      filledAmountInUsd: "54.22",
+      txHash: null,
+      accessToken: "token",
+      verified: true,
+      force: true,
+    });
+
+    expect(db.mapping?.shopifyMarkedPaidAt).toBeInstanceOf(Date);
   });
 });

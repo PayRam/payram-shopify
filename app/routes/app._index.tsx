@@ -11,13 +11,17 @@ import {
   Layout,
   Page,
   Checkbox,
+  Collapsible,
   Text,
   TextField,
 } from "@shopify/polaris";
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
-import { validatePayramBaseUrl } from "~/utils/payram.server";
+import { fetchPayramPayment, validatePayramBaseUrl } from "~/utils/payram.server";
+import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
+import { normalizePayramState, settleOrder } from "~/utils/settlement.server";
+import { getUpdateStatus } from "~/utils/updates.server";
 
 function summarizeResponseText(value: string): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -87,11 +91,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   // Gift card refunds need a scope that existing installs were not granted.
+  // Never let a failed release check break the settings page.
+  const update = await getUpdateStatus(session.shop).catch(() => null);
+
   const grantedScopes = (session.scope ?? "").split(",").map((x) => x.trim());
   const hasGiftCardScope = grantedScopes.includes("write_gift_cards");
 
   return json({
     shop: session.shop,
+    update,
     needsAttention,
     hasGiftCardScope,
     payments: payments.map((p) => ({
@@ -109,6 +117,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       // Settlement applies a tolerance, so the sign of the balance is NOT the
       // same question as "is this order settled". Use what settlement recorded.
       settled: p.shopifyFinancialStatus === "payram_paid",
+      markedPaidInShopify: p.shopifyMarkedPaidAt !== null,
       unsettled: p.shopifyFinancialStatus === "payram_partially_paid",
       syncError: p.syncError,
       updatedAt: p.updatedAt.toISOString(),
@@ -121,6 +130,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     giftCardMinimumUsd: config?.giftCardMinimumUsd ?? "1.00",
     settlementTolerancePercent: config?.settlementTolerancePercent ?? "1.0",
     settlementToleranceMinUsd: config?.settlementToleranceMinUsd ?? "1.00",
+    updateChecksEnabled: config?.updateChecksEnabled ?? true,
   });
 };
 
@@ -153,6 +163,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   ).trim();
   const autoGiftCardOnOverpayment =
     String(formData.get("autoGiftCardOnOverpayment") ?? "") === "on";
+  const updateChecksEnabled =
+    String(formData.get("updateChecksEnabled") ?? "") === "on";
 
   // Fall back to what is STORED, not to the literal default. The gift-card
   // minimum field is disabled while the feature is off, and browsers do not
@@ -227,6 +239,102 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   // --- Test Payram server reachability ---
+  // --- Re-check a single order against Payram ---
+  // Webhooks are the normal path, but they can be missing (no webhook configured
+  // in Payram), late, or exhausted after retries. Settlement never depended on
+  // the webhook for its figures — it re-reads them from Payram — so the same
+  // work can be triggered on demand. This is the merchant's self-service repair.
+  if (intent === "recheck") {
+    const shopifyOrderId = String(formData.get("shopifyOrderId") ?? "").trim();
+    if (!/^\d+$/.test(shopifyOrderId)) {
+      return json({ error: "Invalid order reference." });
+    }
+
+    const mapping = await prisma.paymentMapping.findUnique({
+      where: { shop_shopifyOrderId: { shop: session.shop, shopifyOrderId } },
+    });
+    if (!mapping?.payramReferenceId) {
+      return json({
+        error:
+          `No Payram payment has been created for order ${shopifyOrderId} yet, so there is ` +
+          "nothing to re-check. This happens when the buyer never opened the payment page.",
+      });
+    }
+
+    const accessToken = await findOfflineAccessToken(session.shop);
+    if (!accessToken) {
+      return json({
+        error:
+          "This store is not fully connected to Shopify. Reopen this app from Shopify Admin, " +
+          "then try again.",
+      });
+    }
+
+    // Re-check EVERY reference we know for this order, not just the latest.
+    // A top-up arrives under a brand-new Payram reference, so an order that was
+    // underpaid and then topped up has more than one, and refreshing only the
+    // most recent would leave it reading "still short".
+    const known = await prisma.payramPayment.findMany({
+      where: { shop: session.shop, shopifyOrderId },
+      select: { payramReferenceId: true },
+    });
+    const references = Array.from(
+      new Set([mapping.payramReferenceId, ...known.map((k) => k.payramReferenceId)]),
+    );
+
+    let outcome: Awaited<ReturnType<typeof settleOrder>> | null = null;
+    const unreachable: string[] = [];
+
+    for (const referenceId of references) {
+      const snapshot = await fetchPayramPayment(session.shop, referenceId);
+      if (!snapshot) {
+        unreachable.push(referenceId);
+        continue;
+      }
+      outcome = await settleOrder({
+        shop: session.shop,
+        shopifyOrderId,
+        referenceId,
+        state: normalizePayramState(snapshot.paymentState),
+        filledAmountInUsd: snapshot.filledAmountInUsd,
+        txHash: null,
+        accessToken,
+        // Read straight from Payram over an authenticated call — the trust level
+        // marking an order paid and issuing a gift card both require.
+        verified: true,
+        // The merchant explicitly asked, so redo the Shopify side even if nothing
+        // about the payment changed. This is what repairs an order that settled
+        // but failed to be marked paid.
+        force: true,
+      });
+    }
+
+    if (!outcome) {
+      return json({
+        error:
+          "Payram did not return this payment. Check that the Payram Base URL and API Key " +
+          "above are correct and that your Payram server is reachable.",
+      });
+    }
+
+    // Warnings are informational (gift cards off, a note that could not be
+    // written). Reporting them as an error hid the fact that the re-check
+    // worked, and merchants pressed the button again.
+    const detail = [
+      outcome.settled
+        ? `Order ${shopifyOrderId} is settled — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Shopify has been updated.`
+        : `Order ${shopifyOrderId} is still short — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Do not fulfil until the balance is paid.`,
+      unreachable.length
+        ? `${unreachable.length} earlier payment reference(s) could not be read from Payram.`
+        : "",
+      ...outcome.warnings,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return json({ success: detail });
+  }
+
   if (intent === "test-server") {
     if (!payramBaseUrl) {
       return json({ error: "Enter a Payram Base URL to test." });
@@ -386,6 +494,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       giftCardMinimumUsd,
       settlementTolerancePercent,
       settlementToleranceMinUsd,
+      updateChecksEnabled,
     },
     update: {
       payramBaseUrl,
@@ -395,6 +504,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       giftCardMinimumUsd,
       settlementTolerancePercent,
       settlementToleranceMinUsd,
+      updateChecksEnabled,
     },
   });
 
@@ -414,6 +524,8 @@ export default function SettingsPage() {
     payments,
     needsAttention,
     hasGiftCardScope,
+    update,
+    updateChecksEnabled,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -424,6 +536,8 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [autoGiftCard, setAutoGiftCard] = useState(autoGiftCardOnOverpayment);
   const [giftCardMin, setGiftCardMin] = useState(giftCardMinimumUsd);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [updateChecks, setUpdateChecks] = useState(updateChecksEnabled);
   const [tolPct, setTolPct] = useState(settlementTolerancePercent);
   const [tolMin, setTolMin] = useState(settlementToleranceMinUsd);
 
@@ -510,6 +624,122 @@ export default function SettingsPage() {
               ) : null}
             </Banner>
           )}
+          {update && (update.updateAvailable || update.currentVersion) && (
+            <div style={{ marginBottom: "1rem" }}>
+              {update.updateAvailable ? (
+                <Banner
+                  tone="info"
+                  title={`Update available — version ${update.latestVersion}`}
+                >
+                  <BlockStack gap="200">
+                    <Text as="p">
+                      You are running version {update.currentVersion}.
+                      {update.requiresInstaller
+                        ? " This release changes the checkout block or app permissions, so re-run the installer — pulling the image alone is not enough."
+                        : " This release changes the server only."}
+                    </Text>
+
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Run this on the server where the connector is installed:
+                    </Text>
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-all",
+                        background: "var(--p-color-bg-surface-secondary, #f6f6f7)",
+                        border: "1px solid var(--p-color-border, #e3e3e3)",
+                        borderRadius: 8,
+                        padding: "0.75rem",
+                        margin: 0,
+                        fontSize: 12,
+                      }}
+                    >
+                      {update.requiresInstaller
+                        ? '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"'
+                        : `docker pull payramapp/payram-shopify:${update.latestVersion}
+docker stop payram-shopify-connector && docker rm payram-shopify-connector
+docker run -d --name payram-shopify-connector \\
+  --env-file ~/payram-shopify-connector/.env -p 2798:2798 \\
+  -v payram-shopify-data:/data --restart unless-stopped \\
+  payramapp/payram-shopify:${update.latestVersion}`}
+                    </pre>
+
+                    {update.requiresInstaller && (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Keep the same install directory, accept your existing
+                        values, and never pass <code>--reset</code>. Your settings
+                        and payment history are preserved. Afterwards, approve any
+                        new permissions in Shopify Admin.
+                      </Text>
+                    )}
+
+                    {update.releaseNotes && (
+                      <>
+                        <Button
+                          variant="plain"
+                          onClick={() => setNotesOpen((v) => !v)}
+                          ariaExpanded={notesOpen}
+                          ariaControls="payram-release-notes"
+                        >
+                          {notesOpen ? "Hide what's new" : "See what's new"}
+                        </Button>
+                        <Collapsible
+                          open={notesOpen}
+                          id="payram-release-notes"
+                          transition={{ duration: "150ms", timingFunction: "ease-in-out" }}
+                        >
+                          <pre
+                            style={{
+                              whiteSpace: "pre-wrap",
+                              margin: 0,
+                              fontSize: 12,
+                              lineHeight: 1.5,
+                              maxHeight: "22rem",
+                              overflowY: "auto",
+                            }}
+                          >
+                            {update.releaseNotes}
+                          </pre>
+                        </Collapsible>
+                      </>
+                    )}
+
+                    {update.latestUrl && (
+                      <Text as="p" variant="bodySm">
+                        <a href={update.latestUrl} target="_blank" rel="noreferrer">
+                          Full release notes on GitHub
+                        </a>
+                      </Text>
+                    )}
+                  </BlockStack>
+                </Banner>
+              ) : (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Running version {update.currentVersion}
+                  {update.currentCommit ? ` (${update.currentCommit.slice(0, 7)})` : ""}
+                  {/* "up to date" is a claim. Only make it when a check succeeded —
+                      otherwise a server with no route to GitHub would be told no
+                      security update exists. */}
+                  {update.checked
+                    ? " — up to date."
+                    : " — could not check for updates just now."}
+                </Text>
+              )}
+            </div>
+          )}
+
+          {update && !update.enabled && (
+            <Banner tone="info" title="Update notices are off">
+              <p>
+                Nothing is reported about your store, so we cannot tell you when a
+                security or correctness fix ships. Turning this on makes one
+                read-only request a day to GitHub's public releases page — no shop
+                domain, no orders, no customers — and never installs anything.
+                Enable it under <b>Check for connector updates</b> below.
+              </p>
+            </Banner>
+          )}
+
           {needsAttention > 0 && (
             <Banner tone="warning" title={`${needsAttention} order${needsAttention === 1 ? "" : "s"} need attention`}>
               <p>
@@ -587,6 +817,17 @@ export default function SettingsPage() {
                     helpText="A floor for small orders, where a percentage would be too tight. The larger of the two applies."
                   />
                   <Checkbox
+                    label="Check for connector updates"
+                    name="updateChecksEnabled"
+                    checked={updateChecks}
+                    onChange={setUpdateChecks}
+                    helpText={
+                      "Shows a notice here when a newer version is released. This is a " +
+                      "read-only check against GitHub — nothing about your store, orders or " +
+                      "customers is sent, and updates are never applied automatically."
+                    }
+                  />
+                  <Checkbox
                     label="Refund overpayments as a gift card"
                     name="autoGiftCardOnOverpayment"
                     checked={autoGiftCard}
@@ -649,6 +890,13 @@ export default function SettingsPage() {
                 Recent crypto payments
               </Text>
 
+              <Text as="p" variant="bodySm" tone="subdued">
+                Payram notifies this app when a payment arrives. If a notification
+                was missed — for example before the webhook was configured in
+                Payram — use <b>Re-check payment</b> to read the current state
+                straight from Payram and bring the order up to date.
+              </Text>
+
               {payments.length === 0 ? (
                 <Text as="p" tone="subdued">
                   No crypto payments yet. Once a buyer pays, each order appears
@@ -705,11 +953,38 @@ export default function SettingsPage() {
                             </Banner>
                           )}
 
+                          {p.settled && !p.markedPaidInShopify && (
+                            <Text as="p" variant="bodySm" tone="subdued">
+                              This app has not marked the order paid in Shopify.
+                              Orders settled before this feature shipped, or ones
+                              you marked paid yourself, are usually fine — check
+                              the order, or use <b>Re-check payment</b>.
+                            </Text>
+                          )}
+
+                          {p.settled && p.markedPaidInShopify && (
+                            <Text as="p" variant="bodySm" tone="success">
+                              Marked paid in Shopify
+                            </Text>
+                          )}
+
                           {p.syncError && (
                             <Banner tone="critical" title="Needs your attention">
                               <p>{p.syncError}</p>
                             </Banner>
                           )}
+
+                          <Form method="post">
+                            <input type="hidden" name="intent" value="recheck" />
+                            <input
+                              type="hidden"
+                              name="shopifyOrderId"
+                              value={p.shopifyOrderId}
+                            />
+                            <Button submit loading={isSubmitting} variant="plain">
+                              Re-check payment
+                            </Button>
+                          </Form>
                         </BlockStack>
                       </Card>
                     );
