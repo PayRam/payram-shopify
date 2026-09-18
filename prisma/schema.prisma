@@ -48,6 +48,14 @@ model MerchantConfig {
   // Effective tolerance = max(invoice × percent, floor).
   settlementTolerancePercent   String   @default("1.0")
   settlementToleranceMinUsd    String   @default("1.00")
+  // Whether this shop checks GitHub for new connector releases.
+  //
+  // OFF by default. The product's promise is "nothing is reported to anyone —
+  // everything is optional and the business's decision", and a daily call from
+  // the merchant's server tells GitHub that server's IP exists. Being told an
+  // update exists matters, but it is the merchant's call to make, so the
+  // dashboard offers it explicitly instead of assuming consent.
+  updateChecksEnabled          Boolean  @default(false)
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }
@@ -98,6 +106,11 @@ model PaymentMapping {
   // when the outstanding amount is unchanged, and replaces it when it is not.
   linkAmountUsd          String?
   linkCreatedAt          DateTime?
+  // When Shopify's own financial status was set to PAID via orderMarkAsPaid.
+  // Separate from shopifyPaidSyncedAt (which records the tag sync) because a
+  // tagged order and a Shopify-paid order are different facts, and the merchant
+  // only trusts the second one.
+  shopifyMarkedPaidAt    DateTime?
   // Buyer-supplied email, collected in the Thank You block and forwarded to
   // Payram for its receipt. Held here rather than passed through the payment
   // URL so a bookmarkable link never carries someone's email address.
@@ -149,4 +162,24 @@ model FxRate {
   source     String
   fetchedAt  DateTime
   expiresAt  DateTime
+}
+
+// Cached result of the connector's release check.
+//
+// Self-hosted merchants cannot be updated remotely, so the app tells them when a
+// newer release exists. One row: the release is the same for every shop on this
+// server. Cached so the dashboard never blocks on GitHub and the API is hit once
+// a day, not once per page view.
+model UpdateCheck {
+  id                String    @id @default("singleton")
+  latestVersion     String?
+  latestUrl         String?
+  releaseNotes      String?
+  publishedAt       DateTime?
+  // True when the release body carries [installer-required] — the checkout
+  // extension or the permission list changed, so pulling the image is not enough.
+  requiresInstaller Boolean   @default(false)
+  checkedAt         DateTime
+  // Set when the last check failed, so the UI can stay quiet instead of guessing.
+  lastError         String?
 }
