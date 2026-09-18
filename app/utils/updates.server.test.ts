@@ -36,6 +36,7 @@ function release(body: Record<string, unknown>) {
 }
 
 beforeEach(() => {
+  // Opt-in in production; tests enable it explicitly.
   db.config = { updateChecksEnabled: true };
   db.check = null;
   vi.clearAllMocks();
@@ -80,15 +81,38 @@ describe("runningVersion", () => {
   });
 });
 
+/**
+ * The check refreshes out of band so the dashboard never blocks on GitHub, so a
+ * caller sees a new release on the load AFTER the one that fetched it.
+ */
+async function statusAfterRefresh() {
+  await getUpdateStatus("demo.myshopify.com");
+  await vi.waitFor(() => expect(db.check).not.toBeNull());
+  return getUpdateStatus("demo.myshopify.com");
+}
+
 describe("getUpdateStatus", () => {
+  it("never blocks the dashboard on the network", async () => {
+    let release!: (v: unknown) => void;
+    fetchMock.mockReturnValue(new Promise((r) => (release = r)));
+
+    // Resolves while the request is still outstanding.
+    const s = await getUpdateStatus("demo.myshopify.com");
+    expect(s.updateAvailable).toBe(false);
+    expect(s.checked).toBe(false);
+
+    release({ ok: true, status: 200, json: async () => ({ tag_name: "v1.2.0" }) });
+  });
+
   it("reports an update when a newer release exists", async () => {
     fetchMock.mockResolvedValue(
       release({ tag_name: "v1.2.0", body: "Fixes things", html_url: "https://x", published_at: "2026-09-18T00:00:00Z" }),
     );
 
-    const s = await getUpdateStatus("demo.myshopify.com");
+    const s = await statusAfterRefresh();
 
     expect(s.updateAvailable).toBe(true);
+    expect(s.checked).toBe(true);
     expect(s.latestVersion).toBe("1.2.0");
     expect(s.releaseNotes).toBe("Fixes things");
     expect(s.requiresInstaller).toBe(false);
@@ -99,25 +123,25 @@ describe("getUpdateStatus", () => {
       release({ tag_name: "v1.2.0", body: "New checkout block [installer-required]" }),
     );
 
-    expect((await getUpdateStatus("demo.myshopify.com")).requiresInstaller).toBe(true);
+    expect((await statusAfterRefresh()).requiresInstaller).toBe(true);
   });
 
   it("stays quiet when the running version is already latest", async () => {
     fetchMock.mockResolvedValue(release({ tag_name: "v1.1.0", body: "notes" }));
-    expect((await getUpdateStatus("demo.myshopify.com")).updateAvailable).toBe(false);
+    expect((await statusAfterRefresh()).updateAvailable).toBe(false);
   });
 
   it("stays quiet when the running version is newer than the release", async () => {
     vi.stubEnv("PAYRAM_VERSION", "1.3.0");
     fetchMock.mockResolvedValue(release({ tag_name: "v1.2.0", body: "notes" }));
-    expect((await getUpdateStatus("demo.myshopify.com")).updateAvailable).toBe(false);
+    expect((await statusAfterRefresh()).updateAvailable).toBe(false);
   });
 
   it("stays quiet — and says so — when the image has no version stamp", async () => {
     vi.stubEnv("PAYRAM_VERSION", "");
     fetchMock.mockResolvedValue(release({ tag_name: "v9.9.9", body: "notes" }));
 
-    const s = await getUpdateStatus("demo.myshopify.com");
+    const s = await statusAfterRefresh();
 
     expect(s.updateAvailable).toBe(false);
     expect(s.versionUnknown).toBe(true);
@@ -140,12 +164,12 @@ describe("getUpdateStatus", () => {
     fetchMock.mockResolvedValue(
       release({ tag_name: "v2.0.0", body: "beta", draft: false, prerelease: true }),
     );
-    expect((await getUpdateStatus("demo.myshopify.com")).updateAvailable).toBe(false);
+    expect((await statusAfterRefresh()).updateAvailable).toBe(false);
   });
 
   it("serves the cache instead of calling GitHub again", async () => {
     fetchMock.mockResolvedValue(release({ tag_name: "v1.2.0", body: "notes" }));
-    await getUpdateStatus("demo.myshopify.com");
+    await statusAfterRefresh();
     await getUpdateStatus("demo.myshopify.com");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -153,9 +177,10 @@ describe("getUpdateStatus", () => {
   it("retries on the next load after a failure rather than going quiet for a day", async () => {
     fetchMock.mockRejectedValueOnce(new Error("timeout"));
     await getUpdateStatus("demo.myshopify.com");
+    await vi.waitFor(() => expect(db.check).not.toBeNull());
 
     fetchMock.mockResolvedValue(release({ tag_name: "v1.2.0", body: "notes" }));
-    const s = await getUpdateStatus("demo.myshopify.com");
+    const s = await statusAfterRefresh();
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(s.updateAvailable).toBe(true);
@@ -163,7 +188,7 @@ describe("getUpdateStatus", () => {
 
   it("sends nothing identifying about the store", async () => {
     fetchMock.mockResolvedValue(release({ tag_name: "v1.2.0", body: "notes" }));
-    await getUpdateStatus("demo.myshopify.com");
+    await statusAfterRefresh();
 
     const [url, init] = fetchMock.mock.calls[0];
     expect(String(url)).toBe(
@@ -171,5 +196,25 @@ describe("getUpdateStatus", () => {
     );
     expect(JSON.stringify(init ?? {})).not.toContain("demo.myshopify.com");
     expect((init as RequestInit | undefined)?.method ?? "GET").toBe("GET");
+  });
+});
+
+describe("getUpdateStatus — opt-in", () => {
+  it("stays off when a shop has no config row yet", async () => {
+    db.config = null;
+    const s = await getUpdateStatus("demo.myshopify.com");
+
+    expect(s.enabled).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed check as unchecked rather than up to date", async () => {
+    fetchMock.mockRejectedValue(new Error("ENOTFOUND"));
+    await getUpdateStatus("demo.myshopify.com");
+    await vi.waitFor(() => expect(db.check).not.toBeNull());
+
+    const s = await getUpdateStatus("demo.myshopify.com");
+    expect(s.checked).toBe(false);
+    expect(s.updateAvailable).toBe(false);
   });
 });

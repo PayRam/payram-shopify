@@ -28,7 +28,13 @@ const RELEASES_URL =
 /** GitHub allows 60 unauthenticated calls an hour per IP; once a day is ample. */
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 8_000;
+
+/**
+ * One refresh at a time per process. Several admins opening the dashboard at
+ * once would otherwise each fire a GitHub request and each write the same row.
+ */
+let inFlight: Promise<void> | null = null;
 
 /** Marker in a release body meaning "a docker pull is not enough". */
 const INSTALLER_MARKER = /\[installer-required\]/i;
@@ -51,6 +57,13 @@ export interface UpdateStatus {
   updateAvailable: boolean;
   /** True when the running image predates version stamping. */
   versionUnknown: boolean;
+  /** False when the shop has switched update checks off. */
+  enabled: boolean;
+  /**
+   * True when we have a successful check to report. When false the UI must say
+   * nothing about being current — silence is honest, "up to date" is a claim.
+   */
+  checked: boolean;
   checkedAt: Date | null;
 }
 
@@ -106,6 +119,8 @@ interface GithubRelease {
  * recorded so the UI can stay silent rather than guess.
  */
 async function refreshIfStale(): Promise<void> {
+  if (inFlight) return inFlight;
+
   const cached = await prisma.updateCheck.findUnique({
     where: { id: SINGLETON_ID },
   });
@@ -113,6 +128,16 @@ async function refreshIfStale(): Promise<void> {
   if (cached && Date.now() - cached.checkedAt.getTime() < CHECK_INTERVAL_MS) {
     return;
   }
+
+  inFlight = doRefresh(cached).finally(() => {
+    inFlight = null;
+  });
+  return inFlight;
+}
+
+async function doRefresh(
+  cached: Awaited<ReturnType<typeof prisma.updateCheck.findUnique>>,
+): Promise<void> {
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -191,6 +216,8 @@ export async function getUpdateStatus(shop: string): Promise<UpdateStatus> {
     requiresInstaller: false,
     updateAvailable: false,
     versionUnknown: version === null,
+    enabled: true,
+    checked: false,
     checkedAt: null,
   };
 
@@ -198,19 +225,25 @@ export async function getUpdateStatus(shop: string): Promise<UpdateStatus> {
     where: { shop },
     select: { updateChecksEnabled: true },
   });
-  if (config && !config.updateChecksEnabled) return quiet;
+  if (!config?.updateChecksEnabled) return { ...quiet, enabled: false };
 
-  try {
-    await refreshIfStale();
-  } catch (err) {
-    console.warn("[payram-update] could not refresh release cache:", err);
-    return quiet;
-  }
-
+  // Serve whatever is cached and refresh out of band. Awaiting the network here
+  // would block the merchant's dashboard for the full timeout on the first load
+  // after the cache expires — on exactly the locked-down self-hosted servers
+  // most likely to have no egress to GitHub.
   const cached = await prisma.updateCheck.findUnique({
     where: { id: SINGLETON_ID },
   });
-  if (!cached?.latestVersion) return quiet;
+
+  const stale =
+    !cached || Date.now() - cached.checkedAt.getTime() >= CHECK_INTERVAL_MS;
+  if (stale) {
+    void refreshIfStale().catch((err) =>
+      console.warn("[payram-update] background refresh failed:", err),
+    );
+  }
+
+  if (!cached?.latestVersion || cached.lastError) return quiet;
 
   return {
     currentVersion: version,
@@ -224,6 +257,8 @@ export async function getUpdateStatus(shop: string): Promise<UpdateStatus> {
     updateAvailable:
       version !== null && compareVersions(cached.latestVersion, version) > 0,
     versionUnknown: version === null,
+    enabled: true,
+    checked: true,
     checkedAt: cached.checkedAt,
   };
 }

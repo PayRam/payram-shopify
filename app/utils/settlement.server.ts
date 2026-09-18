@@ -311,18 +311,12 @@ export async function settleOrder(params: {
   // in the right state, so touching Shopify again would burn rate limit for no
   // change. A stored syncError means the last attempt did not finish, so those
   // are always retried.
-  // A settled order that Shopify still shows as unpaid has unfinished work, so
-  // it must not short-circuit either.
-  const shopifyPaidUpToDate =
-    mapping.shopifyFinancialStatus !== TAG_PAID || mapping.shopifyMarkedPaidAt !== null;
-
-  if (
-    !force &&
-    unchanged &&
-    mapping.paymentState === state &&
-    !mapping.syncError &&
-    shopifyPaidUpToDate
-  ) {
+  // A failed mark-paid always pushes a warning, which `persist` writes to
+  // syncError — so `!mapping.syncError` already forces the retry. An extra
+  // "is Shopify paid" clause would add nothing for those, and for rows that
+  // predate the column it would defeat the short-circuit entirely, running four
+  // Admin API calls every three seconds for the whole confirmation window.
+  if (!force && unchanged && mapping.paymentState === state && !mapping.syncError) {
     // `settled` must mean the same thing here as on the first delivery. Deriving
     // it from the balance sign would report a shortfall absorbed by the
     // tolerance as unsettled on every re-delivery, while the order stays tagged
@@ -410,18 +404,28 @@ export async function settleOrder(params: {
     );
   }
 
-  try {
-    await appendOrderNote(
-      shop,
-      accessToken,
-      shopifyOrderId,
-      orderContext?.note ?? null,
-      note,
-    );
-  } catch (err) {
+  if (!orderContext) {
+    // appendOrderNote treats a null existing note as "empty" and writes ours as
+    // the whole note. Without a successful read we cannot know what the merchant
+    // had written there, and overwriting it would be silent data loss.
     warnings.push(
-      `Could not add the order note: ${err instanceof Error ? err.message : String(err)}`,
+      "The order note was not updated because the existing note could not be read. " +
+        "Use Re-check payment to try again.",
     );
+  } else {
+    try {
+      await appendOrderNote(
+        shop,
+        accessToken,
+        shopifyOrderId,
+        orderContext.note,
+        note,
+      );
+    } catch (err) {
+      warnings.push(
+        `Could not add the order note: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // --- Make Shopify's own status agree ---
@@ -433,7 +437,16 @@ export async function settleOrder(params: {
   // Best-effort: a failure here must never undo a settled payment. The tag and
   // note still stand, and the merchant is told what to do.
   let markedPaidAt: Date | null = mapping.shopifyMarkedPaidAt ?? null;
-  if (settled && !markedPaidAt) {
+  if (settled && !markedPaidAt && !verified) {
+    // The webhook is unsigned, so an unverified payment is attacker-supplied.
+    // Marking an order PAID is not reversible through the API and is what
+    // payouts, order filters and fulfilment apps read — strictly more damaging
+    // than a tag. It belongs behind the same gate as minting a gift card.
+    warnings.push(
+      "This payment could not be verified with Payram, so the order was tagged but not " +
+        "marked paid in Shopify. Confirm it in Payram, then use Re-check payment.",
+    );
+  } else if (settled && !markedPaidAt) {
     try {
       const res = await markOrderPaid(shop, accessToken, shopifyOrderId);
       if (res.ok) {
@@ -548,7 +561,8 @@ export async function settleOrder(params: {
             // Pass the note as Shopify last reported it and let appendOrderNote
             // append. Synthesising `existing + settlement line` here duplicated
             // that line on any retry, because the fetched note already had it.
-            orderContext?.note ?? null,
+            // Only reached when orderContext loaded, so this is never a blind null.
+            orderContext?.note ?? "",
             `Payram: refunded overpayment as gift card ${money(
               giftAmount,
               giftFields.giftCardCurrency ?? "",

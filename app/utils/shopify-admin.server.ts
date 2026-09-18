@@ -765,17 +765,30 @@ export async function markOrderPaid(
   if (errs.length) {
     const message = errs.map((e) => e.message).join("; ");
 
-    // Shopify refuses when there is nothing left to capture. That means the
-    // order is already paid, which is the state we wanted — not an error.
-    if (/already|no outstanding|not.*outstanding|cannot be marked as paid/i.test(message)) {
+    // Only "there is nothing left to capture" means the order is already in the
+    // state we wanted. Everything else is a real refusal and must surface.
+    //
+    // Deliberately narrow: "cannot be marked as paid" is returned for cancelled
+    // orders and for gateways awaiting capture, and a bare "already" matches
+    // unrelated errors like "A refund is already pending". Treating those as
+    // success would stamp the order as paid while Shopify still shows it unpaid.
+    if (/order (is )?already paid|no outstanding balance|nothing to capture/i.test(message)) {
       return { ok: true, financialStatus: "PAID", alreadyPaid: true };
     }
     return { ok: false, financialStatus: null, alreadyPaid: false, error: message };
   }
 
-  return {
-    ok: true,
-    financialStatus: data.orderMarkAsPaid?.order?.displayFinancialStatus ?? null,
-    alreadyPaid: false,
-  };
+  // Trust Shopify's own answer rather than the absence of an error: a response
+  // still reading PENDING or PARTIALLY_PAID has not done what we asked.
+  const status = data.orderMarkAsPaid?.order?.displayFinancialStatus ?? null;
+  if (status && status.toUpperCase() !== "PAID") {
+    return {
+      ok: false,
+      financialStatus: status,
+      alreadyPaid: false,
+      error: `Shopify reported the order as ${status} after marking it paid.`,
+    };
+  }
+
+  return { ok: true, financialStatus: status, alreadyPaid: false };
 }

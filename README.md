@@ -903,16 +903,49 @@ not available in dev stores). The connector degrades rather than failing:
 | Feature | Status | Degraded behaviour |
 |---|---|---|
 | `buyerIdentity.email` in the extension | PCD Level 2 — `undefined` in dev | Email is collected by a text field in the block instead |
-| `order.customer` in the settlement lookup | PCD-gated | Retries the query without the field. Tags and notes still apply; a gift card is created but Shopify cannot email it, and the order note says to send it from Admin |
+| `order.customer` in the settlement lookup | PCD-gated | Retries the query without the field. Tags, notes and marking paid still apply; a gift card is created but Shopify cannot email it, and the order note says to send it from Admin |
 | Order email via Admin REST | PCD-gated | Not used |
 
 `customerEmail` is optional when calling Payram, so a missing email never blocks a payment.
 
-**The connector does not use `orderMarkAsPaid`.** It is PCD-gated and would fail on exactly
-the stores that need it, so settlement records state as order **tags and notes**
-(`payram_paid`, `payram_partially_paid`, `payram_overpaid`) which work on every plan. This
-is deliberate, not a workaround pending approval: the connector never claims Shopify's own
-financial status for an off-platform payment it cannot prove to Shopify.
+**The connector marks settled orders paid** with `orderMarkAsPaid`, and keeps the tags
+(`payram_paid`, `payram_partially_paid`, `payram_overpaid`) as the audit trail. Tags alone
+were not enough: they are invisible to payouts, order filters, reports and fulfilment apps,
+so merchants had to click *Mark as paid* on every crypto order.
+
+Marking paid is **best-effort and deliberately gated**:
+
+- Only a payment **verified with Payram** can mark an order paid. The webhook is unsigned, and
+  setting Shopify's financial status is not reversible through the API, so it requires the same
+  trust level as issuing a gift card.
+- **Underpaid orders are never marked paid**, and no order is marked twice.
+- If Shopify refuses — most often because the staff member who installed the app lacks the
+  *mark orders as paid* permission — the order still settles and stays tagged, and the reason
+  appears on the order in the app. Use **Re-check payment** after granting the permission.
+
+> An earlier build avoided this mutation, believing it was PCD-gated. Shopify documents it as
+> needing `write_orders` plus the staff permission `mark_orders_as_paid`; Protected Customer
+> Data governs customer PII, not this mutation.
+
+---
+
+## What the connector sends out
+
+Two outbound calls, both off the merchant's own server, and neither carries store data:
+
+| Call | When | Contains |
+|---|---|---|
+| `open.er-api.com` | Converting a non-USD order, cached an hour | The currency code only |
+| `api.github.com` | Once a day, **only if enabled** | Nothing — an unauthenticated read of the public releases page |
+
+Everything else is between the merchant's server, their own Payram instance and their own
+Shopify store.
+
+**Update checks are off by default.** The product's promise is that nothing is reported to
+anyone and everything is the business's decision, so the connector does not phone anywhere
+until the merchant turns it on under *Check for connector updates*. Enabling it tells GitHub
+the server's IP exists, the same as any `docker pull` does — and nothing about the shop,
+its orders or its customers. Nothing is ever installed automatically.
 
 ---
 

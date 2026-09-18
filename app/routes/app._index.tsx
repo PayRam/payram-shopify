@@ -270,8 +270,46 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     }
 
-    const snapshot = await fetchPayramPayment(session.shop, mapping.payramReferenceId);
-    if (!snapshot) {
+    // Re-check EVERY reference we know for this order, not just the latest.
+    // A top-up arrives under a brand-new Payram reference, so an order that was
+    // underpaid and then topped up has more than one, and refreshing only the
+    // most recent would leave it reading "still short".
+    const known = await prisma.payramPayment.findMany({
+      where: { shop: session.shop, shopifyOrderId },
+      select: { payramReferenceId: true },
+    });
+    const references = Array.from(
+      new Set([mapping.payramReferenceId, ...known.map((k) => k.payramReferenceId)]),
+    );
+
+    let outcome: Awaited<ReturnType<typeof settleOrder>> | null = null;
+    const unreachable: string[] = [];
+
+    for (const referenceId of references) {
+      const snapshot = await fetchPayramPayment(session.shop, referenceId);
+      if (!snapshot) {
+        unreachable.push(referenceId);
+        continue;
+      }
+      outcome = await settleOrder({
+        shop: session.shop,
+        shopifyOrderId,
+        referenceId,
+        state: normalizePayramState(snapshot.paymentState),
+        filledAmountInUsd: snapshot.filledAmountInUsd,
+        txHash: null,
+        accessToken,
+        // Read straight from Payram over an authenticated call — the trust level
+        // marking an order paid and issuing a gift card both require.
+        verified: true,
+        // The merchant explicitly asked, so redo the Shopify side even if nothing
+        // about the payment changed. This is what repairs an order that settled
+        // but failed to be marked paid.
+        force: true,
+      });
+    }
+
+    if (!outcome) {
       return json({
         error:
           "Payram did not return this payment. Check that the Payram Base URL and API Key " +
@@ -279,40 +317,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     }
 
-    const outcome = await settleOrder({
-      shop: session.shop,
-      shopifyOrderId,
-      referenceId: mapping.payramReferenceId,
-      state: normalizePayramState(snapshot.paymentState),
-      filledAmountInUsd: snapshot.filledAmountInUsd,
-      txHash: null,
-      accessToken,
-      // Read straight from Payram over an authenticated call — the trust level
-      // a gift card requires.
-      verified: true,
-      // The merchant explicitly asked, so redo the Shopify side even if nothing
-      // about the payment changed. This is what repairs an order that settled
-      // but failed to be marked paid.
-      force: true,
-    });
+    // Warnings are informational (gift cards off, a note that could not be
+    // written). Reporting them as an error hid the fact that the re-check
+    // worked, and merchants pressed the button again.
+    const detail = [
+      outcome.settled
+        ? `Order ${shopifyOrderId} is settled — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Shopify has been updated.`
+        : `Order ${shopifyOrderId} is still short — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Do not fulfil until the balance is paid.`,
+      unreachable.length
+        ? `${unreachable.length} earlier payment reference(s) could not be read from Payram.`
+        : "",
+      ...outcome.warnings,
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-    if (outcome.warnings.length) {
-      return json({
-        error: `Order ${shopifyOrderId}: ${outcome.warnings.join(" ")}`,
-      });
-    }
-    if (outcome.settled) {
-      return json({
-        success:
-          `Order ${shopifyOrderId} is settled — $${outcome.receivedUsd} received of ` +
-          `$${outcome.invoicedUsd}. Shopify has been updated.`,
-      });
-    }
-    return json({
-      success:
-        `Order ${shopifyOrderId} is still short — $${outcome.receivedUsd} received of ` +
-        `$${outcome.invoicedUsd}. Do not fulfil until the balance is paid.`,
-    });
+    return json({ success: detail });
   }
 
   if (intent === "test-server") {
@@ -636,12 +656,12 @@ export default function SettingsPage() {
                     >
                       {update.requiresInstaller
                         ? '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"'
-                        : `docker pull payramapp/payram-shopify:latest
+                        : `docker pull payramapp/payram-shopify:${update.latestVersion}
 docker stop payram-shopify-connector && docker rm payram-shopify-connector
 docker run -d --name payram-shopify-connector \\
   --env-file ~/payram-shopify-connector/.env -p 2798:2798 \\
   -v payram-shopify-data:/data --restart unless-stopped \\
-  payramapp/payram-shopify:latest`}
+  payramapp/payram-shopify:${update.latestVersion}`}
                     </pre>
 
                     {update.requiresInstaller && (
@@ -696,10 +716,28 @@ docker run -d --name payram-shopify-connector \\
               ) : (
                 <Text as="p" variant="bodySm" tone="subdued">
                   Running version {update.currentVersion}
-                  {update.currentCommit ? ` (${update.currentCommit.slice(0, 7)})` : ""} — up to date.
+                  {update.currentCommit ? ` (${update.currentCommit.slice(0, 7)})` : ""}
+                  {/* "up to date" is a claim. Only make it when a check succeeded —
+                      otherwise a server with no route to GitHub would be told no
+                      security update exists. */}
+                  {update.checked
+                    ? " — up to date."
+                    : " — could not check for updates just now."}
                 </Text>
               )}
             </div>
+          )}
+
+          {update && !update.enabled && (
+            <Banner tone="info" title="Update notices are off">
+              <p>
+                Nothing is reported about your store, so we cannot tell you when a
+                security or correctness fix ships. Turning this on makes one
+                read-only request a day to GitHub's public releases page — no shop
+                domain, no orders, no customers — and never installs anything.
+                Enable it under <b>Check for connector updates</b> below.
+              </p>
+            </Banner>
           )}
 
           {needsAttention > 0 && (
@@ -916,13 +954,12 @@ docker run -d --name payram-shopify-connector \\
                           )}
 
                           {p.settled && !p.markedPaidInShopify && (
-                            <Banner tone="warning">
-                              <p>
-                                Payment confirmed, but this order still shows as
-                                unpaid in Shopify. Use <b>Re-check payment</b>, or
-                                open the order and click <b>Mark as paid</b>.
-                              </p>
-                            </Banner>
+                            <Text as="p" variant="bodySm" tone="subdued">
+                              This app has not marked the order paid in Shopify.
+                              Orders settled before this feature shipped, or ones
+                              you marked paid yourself, are usually fine — check
+                              the order, or use <b>Re-check payment</b>.
+                            </Text>
                           )}
 
                           {p.settled && p.markedPaidInShopify && (

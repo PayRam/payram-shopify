@@ -94,9 +94,14 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Readable from inside the running container, unlike the OCI labels.
+          # APP_VERSION comes from the TAG, never from metadata-action's `version`
+          # output: on a main build that output resolves to the literal "latest"
+          # (the raw tag outranks the sha tag), which would stamp every merchant's
+          # image PAYRAM_VERSION=latest and make the update banner nag forever.
+          # Untagged builds ship no version, and the app then stays silent.
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
-            APP_VERSION=${{ steps.meta.outputs.version }}
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -110,10 +115,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          # The annotated tag's message becomes the top of the release body, so a
+          # releaser writes [installer-required] there when the checkout extension
+          # or the permission list changed. --generate-notes alone is machine-written
+          # and could never carry that marker, which would leave the connector
+          # telling merchants "server only" for a release that is not.
+          TAG_BODY="$(git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}")"
+          SUBJECT="$(git tag -l --format='%(contents:subject)' "${GITHUB_REF_NAME}")"
+          NOTES="${SUBJECT}"$'\n\n'"${TAG_BODY}"
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
+            --notes "${NOTES}" \
             --generate-notes \
-            --verify-tag || gh release edit "${GITHUB_REF_NAME}" --draft=false
+            --verify-tag
 
       - name: Summary
         run: |

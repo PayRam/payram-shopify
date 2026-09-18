@@ -48,10 +48,14 @@ model MerchantConfig {
   // Effective tolerance = max(invoice × percent, floor).
   settlementTolerancePercent   String   @default("1.0")
   settlementToleranceMinUsd    String   @default("1.00")
-  // Whether this shop checks GitHub for new connector releases. On by default:
-  // self-hosting means nobody can push a fix to a merchant, so being told one
-  // exists is the only substitute. The check sends nothing about the store.
-  updateChecksEnabled          Boolean  @default(true)
+  // Whether this shop checks GitHub for new connector releases.
+  //
+  // OFF by default. The product's promise is "nothing is reported to anyone —
+  // everything is optional and the business's decision", and a daily call from
+  // the merchant's server tells GitHub that server's IP exists. Being told an
+  // update exists matters, but it is the merchant's call to make, so the
+  // dashboard offers it explicitly instead of assuming consent.
+  updateChecksEnabled          Boolean  @default(false)
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }

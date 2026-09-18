@@ -56,16 +56,6 @@ RUN npm prune --omit=dev
 # ---- runner ----------------------------------------------------------------
 FROM node:20-alpine AS runner
 
-# Baked in by the release workflow so the RUNNING APP can report its own version.
-# The image already carries org.opencontainers.image.revision as an OCI label, but
-# labels live on the image config — a process inside the container cannot read
-# them without the Docker socket. These env vars are what the dashboard shows and
-# what the update check compares against.
-ARG SOURCE_COMMIT=""
-ARG APP_VERSION=""
-ENV PAYRAM_BUILD_SHA=$SOURCE_COMMIT
-ENV PAYRAM_VERSION=$APP_VERSION
-
 WORKDIR /app
 
 # Runtime-only OS packages
@@ -97,6 +87,21 @@ COPY --from=builder --chown=appuser:appgroup /app/scripts/start.sh ./scripts/sta
 RUN chmod +x ./scripts/start.sh
 
 USER appuser
+
+# Baked in by the release workflow so the RUNNING APP can report its own version.
+# The image already carries org.opencontainers.image.revision as an OCI label, but
+# labels live on the image config — a process inside the container cannot read
+# them without the Docker socket. These env vars are what the dashboard shows and
+# what the update check compares against.
+#
+# Placed last on purpose: SOURCE_COMMIT changes on every build, and an ENV layer
+# invalidates everything below it, so higher up this would rebuild the whole
+# runner stage each time and the build cache could never hit — twice over, since
+# arm64 builds under emulation.
+ARG SOURCE_COMMIT=""
+ARG APP_VERSION=""
+ENV PAYRAM_BUILD_SHA=$SOURCE_COMMIT
+ENV PAYRAM_VERSION=$APP_VERSION
 
 EXPOSE 2798
 

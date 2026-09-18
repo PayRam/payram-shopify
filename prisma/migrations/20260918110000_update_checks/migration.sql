@@ -4,7 +4,7 @@
 -- a published image for four months partly because there was no way to learn an
 -- update existed. The connector now checks for releases and shows the notes and
 -- the exact command, while leaving the decision to the merchant.
-ALTER TABLE "MerchantConfig" ADD COLUMN "updateChecksEnabled" BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE "MerchantConfig" ADD COLUMN "updateChecksEnabled" BOOLEAN NOT NULL DEFAULT false;
 
 -- CreateTable
 CREATE TABLE "UpdateCheck" (
