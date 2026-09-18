@@ -45,6 +45,7 @@ refund an overpayment as a gift card.
 | Install / configure a store | [Self-Hosted Installation](#self-hosted-installation), [Configuration Reference](#configuration-reference) |
 | Understand what a buyer sees | [The Buyer's Journey](#the-buyers-journey) |
 | Work out why an order looks wrong | [Diagnostics](#diagnostics) |
+| Update an existing install | [Updating](#updating) |
 | Understand money handling | [Currency Handling](#currency-handling), [Partial and Overpayments](#partial-and-overpayments) |
 | Change settlement behaviour | `app/utils/settlement.server.ts` |
 | Check the security posture | `state/malicious-flows.md` |
@@ -91,26 +92,29 @@ On your server (Linux or macOS), run:
 
 The script will:
 
-1. Check Docker is installed and running
-2. Ask for an install directory (default: `~/payram-shopify-connector`)
-3. Prompt for your Shopify app's **Client ID** and **Client Secret** — get these from [partners.shopify.com](https://partners.shopify.com) → Apps → your app → API credentials
-4. Ask for your server's public HTTPS URL and optional database connection string
-5. Auto-generate an encryption key using `openssl`
-6. Pull the Docker image and start the container
-7. Optionally deploy the checkout UI extension to Shopify's CDN
+1. Check that Docker is installed and running. It does **not** install Docker for you.
+2. Ask for an install directory (default: `~/payram-shopify-connector`).
+3. Ask for your server's public HTTPS URL.
+4. Show a **Shopify login link** — open it in a browser. The installer then creates (or reuses)
+   the Shopify app under your Partner account and saves its credentials itself. You never copy an
+   API key or secret by hand.
+5. Ask for your store domain and, optionally, a database connection string.
+6. Generate an encryption key with `openssl` (kept on re-runs — back it up).
+7. Pull `payramapp/payram-shopify:latest`, deploy the checkout block with your server URL built in,
+   and start the container.
 
 ---
 
-### Step 2 — Deploy the checkout UI extension
+### Step 2 — The checkout block is deployed for you
 
-The installer offers to do this automatically. If you skipped it, run:
+The installer deploys the checkout extension as part of Step 1, with your server URL written into
+it. There is nothing to do here.
 
-```bash
-docker run --rm -it \
-  --env-file ~/payram-shopify-connector/.env \
-  payramapp/payram-shopify:latest \
-  npx shopify app deploy
-```
+> **Don't run `shopify app deploy` straight from the image.** The published image contains
+> placeholders — `__PAYRAM_REDIRECT_BASE_URL__` in the block and `{{ CLIENT_ID }}` in the app
+> config — that only the installer fills in. Deploying without them ships a block that shows
+> *"Payment link is not configured yet"*. To redeploy, re-run the installer
+> (see [Updating](#updating)).
 
 ---
 
@@ -140,11 +144,12 @@ Approve the permission request. This installs the app on your store and creates 
 
 ### Step 5 — Configure Payram credentials
 
-1. After installation, the app opens in **Shopify Admin → Apps → Payram Connector**.
-2. On the **Settings** page, enter:
-   - **Payram Base URL** — your Payram instance URL (e.g. `https://api.payram.com`)
+1. Open **Shopify Admin → Apps** and open the Payram app.
+2. Enter:
+   - **Payram Base URL** — your own Payram server, e.g. `https://payram.your-domain.com`
    - **Payram Project API Key** — from your Payram dashboard
-3. Click **Save Settings**, then **Test Payram Connection** to verify.
+3. Click **Save Settings**, then **Test Payram Server** and **Create Test Payment Link** to confirm
+   both the connection and the payment API work.
 
 ---
 
@@ -163,20 +168,34 @@ Approve the permission request. This installs the app on your store and creates 
 1. In Shopify Admin → **Online Store** → **Checkout** → **Customize**.
 2. Switch to the **Thank You** page using the page selector at the top.
 3. Click **Add block** → select **Payram Thank You Block**.
-4. In the block settings panel set **App backend base URL** to your server's public URL, e.g.:
-   ```
-   https://YOUR_DOMAIN
-   ```
-5. Click **Save**.
+4. Click **Save**.
+
+There is nothing to configure on the block — the installer already built your server URL into it.
 
 ---
 
 ### Step 8 — Test end-to-end
 
 1. Go to your store and place an order using the *Pay with Crypto via Payram* payment method.
-2. On the Thank You page the Payram block appears.
-3. Enter an email address and click **Complete Crypto Payment**.
-4. You are redirected to a Payram-hosted checkout to complete the crypto payment.
+2. On the Thank You page the Payram block shows the order total with its currency.
+3. Enter an email address (required — it's where Payram sends the receipt) and click
+   **Continue to crypto payment**.
+4. The payment page opens in the same tab, confirms the total and the exchange rate, then takes you
+   to your Payram checkout.
+
+---
+
+### Step 9 — Choose how partial and overpayments are handled
+
+Crypto payments don't always arrive as the exact amount. In the Payram app you can set:
+
+- **Underpayment tolerance** — how far short a payment can be and still count as paid
+  (default 1%, at least $1).
+- **Refund overpayments as a gift card** — **off by default**. Turning it on needs gift cards
+  enabled in Shopify.
+
+What each setting does, and what the connector does automatically, is explained in
+[Partial and Overpayments](#partial-and-overpayments).
 
 ---
 
@@ -216,9 +235,9 @@ rejected — never silently defaulted.
 | Payram Base URL | — | Your Payram instance. Must be HTTPS; private/loopback ranges are blocked |
 | Payram Project API Key | — | Encrypted at rest |
 | Payment Method Name | `Pay with Crypto via Payram` | Label buyers see |
-| Underpayment tolerance (%) | `1.0` | Shortfall that still counts as paid, as a share of the order |
+| Underpayment tolerance (%) | `1.0` | Shortfall that still counts as paid, as a share of the order. Maximum `10` |
 | Minimum tolerance (USD) | `1.00` | Floor for small orders. The **larger** of the two applies |
-| Refund overpayments as a gift card | `off` | Needs `write_gift_cards` **and** gift cards enabled in Shopify |
+| Refund overpayments as a gift card | `off` | Needs gift cards enabled in Shopify and the `write_gift_cards` + `write_customers` permissions |
 | Minimum overpayment to refund (USD) | `1.00` | Smaller excess is noted on the order, not refunded |
 
 Effective tolerance is `max(invoice × percent, floor)` — proportional because network fees
@@ -229,11 +248,40 @@ and price drift scale with order size. A $1,000 order allows $10; a $20 order al
 - A **manual payment method** named to match the setting above.
 - The **Payram Thank You Block** added in the checkout editor.
 - **Gift cards enabled** (Settings → Gift cards) if refunding overpayments.
-- **Re-authorization** after any scope change — merchants must reopen the app and accept.
+- **Up-to-date permissions.** When the permission list changes, re-run the installer so the app is
+  redeployed with the new list, then open the app in Shopify Admin and approve. Reopening the app
+  alone is not enough — it can only request what the deployed app declares.
 
 ---
 
 ## Updating
+
+Updates happen **on your server**, not from the Shopify App Store — this is your own app, so
+Shopify has nothing to push. Every merge to `main` publishes a new image automatically.
+
+### Recommended: re-run the installer
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"
+```
+
+- Press Enter to keep the **same install directory**. A different directory is treated as a brand
+  new install: new encryption key, new Shopify app, and your saved Payram API key is lost.
+- Accept your existing values when asked. If a Shopify login link appears, open it.
+- **Never pass `--reset`** — that deletes the container, data volume and configuration.
+
+It pulls the latest image, redeploys the checkout block and app permissions, and replaces the
+container. Settings, the saved API key and payment history live in the `payram-shopify-data`
+volume and carry over; database migrations run on start.
+
+Afterwards, open the app in Shopify Admin and approve any new permissions.
+
+**Use this path whenever a release changes the checkout block or the permission list** — the server
+commands below do not touch either.
+
+### Server only
+
+For releases that change only server code:
 
 ```bash
 docker pull payramapp/payram-shopify:latest
@@ -246,6 +294,19 @@ docker run -d \
   --restart unless-stopped \
   payramapp/payram-shopify:latest
 ```
+
+### Check which version you're running
+
+```bash
+docker inspect payram-shopify-connector \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+```
+
+This prints the commit the running image was built from. Every image is also published with an
+immutable `sha-<commit>` tag you can pin to instead of `latest`.
+
+> **Installed before May 11, 2026?** Early installers pulled `mason0816/payram-shopify-test`.
+> Re-running the installer moves you to `payramapp/payram-shopify`.
 
 ---
 
@@ -299,10 +360,10 @@ This starts the Remix server, creates a Cloudflare tunnel, and streams logs.
 
 1. Open the app in Shopify Admin (follow the install URL from the terminal).
 2. On the **Settings** page enter:
-   - **Payram Base URL** — e.g. `https://api.payram.io`
+   - **Payram Base URL** — your Payram server, e.g. `https://payram.your-domain.com`
    - **Payram Project API Key**
 3. Click **Save Settings**.
-4. Click **Test Payram Connection** to verify the credentials.
+4. Click **Test Payram Server** and **Create Test Payment Link** to verify.
 
 ### 6. Add the manual payment method in Shopify
 
@@ -317,18 +378,22 @@ Pay with Crypto via Payram
 1. In Shopify Admin → Online Store → Checkout → Customize.
 2. Navigate to the **Thank You** page.
 3. Add the **Payram Thank You Block** from the extension list.
-4. In the block settings, set:
-   - **App backend base URL** → the current Cloudflare tunnel URL (e.g. `https://xyz.trycloudflare.com`)
-5. Save.
+4. Save.
 
-> **Important:** The Cloudflare tunnel URL changes every time you restart `shopify app dev`. Update this setting each time.
+The block has no settings. Its server URL is a build-time placeholder that the installer fills in,
+so in local dev you fill it in yourself: replace `__PAYRAM_REDIRECT_BASE_URL__` in
+`extensions/thank-you-block/src/Checkout.tsx` with your current tunnel URL
+(e.g. `https://xyz.trycloudflare.com`). **Don't commit that change.**
+
+> **Important:** The tunnel URL changes every time you restart `shopify app dev`, so update the
+> placeholder replacement each time.
 
 ### 8. Place a test order
 
 1. Go to your development store → place an order using the manual payment method.
 2. On the Thank You page the Payram block appears.
-3. Optionally enter an email address.
-4. Click **Open Payram checkout** — you will be redirected to the Payram payment page.
+3. Enter an email address — without a valid one, clicking the button shows an error instead of continuing.
+4. Click **Continue to crypto payment** — the payment page opens, then redirects to Payram.
 
 ---
 
@@ -512,13 +577,25 @@ Crypto payments are not all-or-nothing. A buyer can send slightly less (network 
 price tick between quote and send) or slightly more. Payram already classifies this on every webhook
 as `FILLED`, `PARTIALLY_FILLED` or `OVER_FILLED`, and the connector acts on all three.
 
+### When a payment counts
+
+- **Only after Payram confirms it on-chain.** While a deposit is still collecting confirmations the
+  order is left untouched; it is updated once Payram reports the payment as received.
+- **Everything is added up.** A buyer can pay in more than one go — every payment made for the
+  order counts toward its total.
+- **Within tolerance is paid.** A shortfall or excess smaller than the tolerance —
+  `max(order × percent, floor)`, default `max(1%, $1)`, capped at 10% — is treated as an exact
+  payment. Nothing is flagged and nothing is refunded.
+- **Amounts are fixed at invoice time.** The order total is converted to USD when the buyer opens
+  the payment, and that rate is stored on the order. Balances are always shown at that rate.
+
 ### What happens automatically
 
-| Situation | Order tags | Order note | Money |
-|---|---|---|---|
-| Paid in full | `payram_paid` | "paid in full" | — |
-| **Underpaid** | `payram_partially_paid` | "Still due €13.11 — do not fulfil" | none moved |
-| **Overpaid** | `payram_paid` + `payram_overpaid` | excess recorded | gift card issued for the difference |
+| Situation | Order tags | Order note | Money | Fulfil? |
+|---|---|---|---|---|
+| Paid in full (within tolerance) | `payram_paid` | "paid in full" | — | Yes |
+| **Underpaid** | `payram_partially_paid` | "Still due €13.11 — do not fulfil" | none moved | **No** |
+| **Overpaid** | `payram_paid` + `payram_overpaid` | excess recorded | gift card for the excess, *if turned on* | Yes |
 
 An underpaid order is **never** tagged `payram_paid`. That is the whole point: previously a short
 payment and a complete one were indistinguishable.
@@ -549,22 +626,58 @@ majority of buyers. A gift card works for everyone, which is why it is the singl
 branch that can fail. Discount codes are not used: they are a percentage or amount off, not a stored
 balance — they don't decrement, can be shared, and don't represent money owed.
 
+### Overpayment refund rules
+
+- **The order is filled first.** Only the amount *above* the invoice is refunded — never the whole
+  payment. This also applies when extra funds arrive after the order was already paid.
+- **At most one automatic gift card per order.** If more money arrives after a card was issued, no
+  second card is created; the app tells you the extra amount to refund yourself.
+- **Only confirmed payments are refunded.** If the connector cannot confirm the payment with Payram,
+  no card is issued and you are asked to refund manually.
+- **Small excesses are kept on record, not refunded.** Anything below *Minimum overpayment to
+  refund* (default $1) is noted on the order.
+- **Issued in your store's currency.** Converted at the order's stored rate when the order was in
+  that currency, otherwise at a live rate.
+- **Delivered by Shopify** *when the app can read the order's customer*. The card is attached to
+  that customer and Shopify emails it. If the order has no customer, or Protected Customer Data
+  restrictions hide it from the app, the card is still created but nobody is emailed — the order
+  note says so, and you send it from Shopify Admin → *Gift cards*.
+- **The order stays paid if refunding fails.** A failed card is recorded as a warning; the order is
+  still tagged paid and can be fulfilled.
+- **The full card code is never stored** by the connector — only the card's ID and last characters.
+  Shopify keeps the code.
+
 ### Merchant setup
 
+Gift card refunds are **off by default**, because they move money. To turn them on:
+
 1. **Enable gift cards in Shopify** — Settings → *Gift cards*. Without this, card creation is
-   rejected and the connector records a warning on the order instead.
-2. **Re-authorize the app.** Issuing gift cards needs the `write_gift_cards` scope. Existing
-   installs must reopen the Payram app in Shopify Admin once and accept the updated permissions.
-3. **Turn it on** — in the Payram app, tick *Refund overpayments as a gift card* and set the minimum
-   (default `1.00` USD). It is **off by default**, because it moves money.
+   rejected and a warning is recorded on the order instead.
+2. **Make sure the app has permission.** Refunds need the `write_gift_cards` scope, and
+   `write_customers` so the card can be attached to the buyer and emailed. Installs from before
+   September 17, 2026 do not declare them: [re-run the installer](#updating), then open the app in
+   Shopify Admin and approve.
+3. **Turn it on** — in the Payram app, tick *Refund overpayments as a gift card*, set the minimum,
+   and save.
+
+If anything is missing, the app shows a red warning at the top of its page saying which.
+
+Underpayment tolerance needs no setup — it is on by default at 1% / $1. Change it in the same
+settings page (maximum 10%).
 
 ### Merchant operations
 
 **Underpaid order**
-1. The order appears tagged `payram_partially_paid` with the shortfall in the note.
-2. Do not fulfil. Contact the buyer with the amount still due, or refund what was received.
-3. If the buyer sends the rest, the connector adds it automatically and re-tags the order
-   `payram_paid`. No merchant action needed.
+1. The order appears tagged `payram_partially_paid` with the shortfall in the note, in USD and in
+   the order's currency.
+2. Do not fulfil.
+3. The buyer pays the balance from their **payment link** — the page opened from the Thank You
+   block. It shows what is still owed with a button to pay it, and asks the buyer to bookmark it.
+   When the rest arrives the order is re-tagged `payram_paid` automatically.
+4. If the buyer doesn't return, contact them, or refund what was received and cancel the order.
+
+> **Known gap:** the app cannot yet show or resend a buyer's payment link. A buyer who loses it
+> cannot currently be sent a new one from the admin.
 
 **Overpaid order**
 1. The order appears tagged `payram_paid` and `payram_overpaid`.
@@ -629,12 +742,13 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 |---|---|---|---|
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
-| Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, scope missing, or gift cards disabled in Shopify | The banner names which. Scope needs re-authorization |
+| Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, payment not confirmed with Payram, a card already issued for this order, permissions missing, or gift cards disabled in Shopify | The banner or note names which. Missing permissions: re-run the installer, then approve in Shopify Admin |
 | Buyer sees "This payment link isn't valid" | — | `PAYMENT_LINK_SECRET` changed, or a truncated URL | Restore the previous secret, or have the buyer reopen from their order confirmation |
 | Buyer sees "already being prepared" | `409` from `/api/payram/session` | Two tabs claimed the order at once | Wait 60s and refresh — the claim self-expires |
 | Buyer sees "store not connected" | `no offline session for shop` | App installed without an offline grant | Merchant reopens the app in Shopify Admin |
+| Block says "Payment link is not configured yet" | — | Extension deployed without the installer, so the server URL placeholder was never filled in | Re-run the installer |
 | `/pay` errors on a paid order | `[payram-session]` | — | Expected to show a receipt; if it 500s, check `amountInUsd` exists on the mapping |
-| Underpaid orders never resolve | Order stays `payram_partially_paid` | Buyer never returned | The payment link is durable — resend it, or refund what arrived |
+| Underpaid orders never resolve | Order stays `payram_partially_paid` | Buyer never returned to their payment link | Contact the buyer, or refund what arrived. The admin can't resend the link yet |
 | Amounts look wrong on non-USD store | Order note shows the conversion | — | Compare `orderAmount`, `fxRate` and `amountInUsd` on `PaymentMapping`; the rate is the one struck at invoice time, deliberately not today's |
 
 ### Health checks
@@ -712,26 +826,31 @@ transient, DB-backed so it survives restarts.
 | File | Purpose |
 |------|---------|
 | `extensions/thank-you-block/src/Checkout.tsx` | UI extension — Preact component for the Thank You block |
-| `extensions/thank-you-block/shopify.extension.toml` | Extension config — target, settings field |
+| `extensions/thank-you-block/shopify.extension.toml` | Extension config — target only. The block has no merchant settings |
 | `extensions/thank-you-block/package.json` | `@shopify/ui-extensions@2026.1.3` + `preact` |
 | `extensions/thank-you-block/tsconfig.json` | `jsxImportSource: preact`, `moduleResolution: Bundler` |
 
 ### How the extension reads order data
 
 ```typescript
-// Order ID (numeric) from GID
-const orderId = shopify.orderConfirmation.value.order.id.split("/").pop();
+// Order ID (numeric) from the order confirmation GID
+const api = useApi<"purchase.thank-you.block.render">();
+const orderId = (api.orderConfirmation.value?.order?.id ?? "").split("/").pop();
 
 // Order total — DISPLAY ONLY, never sent to the server.
 // useTotalAmount() returns a Money object; the currencyCode matters as much as
 // the amount. The server reads the real total from the Admin API instead.
-const { amount, currencyCode } = useTotalAmount();
+const totalAmount = useTotalAmount();
 
-// Email — PCD Level 2 gated, may be undefined
-const email = shopify.buyerIdentity?.email?.value;
+// Shop domain, sent so the server knows which store the order belongs to
+const shopDomain = useShop().myshopifyDomain;
 
-// App backend URL from extension settings (set in checkout editor)
-const appBackendBaseUrl = shopify.settings.value.appBackendBaseUrl;
+// Email — typed into a text field in the block. buyerIdentity.email is
+// PCD-gated and not relied on.
+
+// Server URL — a build-time placeholder the installer replaces before deploy.
+// There is no block setting for it.
+const redirectBaseUrl = "__PAYRAM_REDIRECT_BASE_URL__";
 ```
 
 ---
@@ -743,7 +862,8 @@ const appBackendBaseUrl = shopify.settings.value.appBackendBaseUrl;
 `shopify app dev` creates a new tunnel URL on every start. After restarting:
 1. Copy the new URL from the terminal output.
 2. Update `SHOPIFY_APP_URL` in `.env`.
-3. In the checkout editor → Payram block settings → update **App backend base URL**.
+3. Replace the URL in `extensions/thank-you-block/src/Checkout.tsx` (where
+   `__PAYRAM_REDIRECT_BASE_URL__` was) with the new tunnel URL. Don't commit it.
 
 ### Protected Customer Data (PCD) limitations
 
