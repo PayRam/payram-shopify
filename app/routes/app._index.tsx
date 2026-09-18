@@ -17,7 +17,9 @@ import {
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
-import { validatePayramBaseUrl } from "~/utils/payram.server";
+import { fetchPayramPayment, validatePayramBaseUrl } from "~/utils/payram.server";
+import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
+import { normalizePayramState, settleOrder } from "~/utils/settlement.server";
 
 function summarizeResponseText(value: string): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -109,6 +111,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       // Settlement applies a tolerance, so the sign of the balance is NOT the
       // same question as "is this order settled". Use what settlement recorded.
       settled: p.shopifyFinancialStatus === "payram_paid",
+      markedPaidInShopify: p.shopifyMarkedPaidAt !== null,
       unsettled: p.shopifyFinancialStatus === "payram_partially_paid",
       syncError: p.syncError,
       updatedAt: p.updatedAt.toISOString(),
@@ -227,6 +230,82 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   // --- Test Payram server reachability ---
+  // --- Re-check a single order against Payram ---
+  // Webhooks are the normal path, but they can be missing (no webhook configured
+  // in Payram), late, or exhausted after retries. Settlement never depended on
+  // the webhook for its figures — it re-reads them from Payram — so the same
+  // work can be triggered on demand. This is the merchant's self-service repair.
+  if (intent === "recheck") {
+    const shopifyOrderId = String(formData.get("shopifyOrderId") ?? "").trim();
+    if (!/^\d+$/.test(shopifyOrderId)) {
+      return json({ error: "Invalid order reference." });
+    }
+
+    const mapping = await prisma.paymentMapping.findUnique({
+      where: { shop_shopifyOrderId: { shop: session.shop, shopifyOrderId } },
+    });
+    if (!mapping?.payramReferenceId) {
+      return json({
+        error:
+          `No Payram payment has been created for order ${shopifyOrderId} yet, so there is ` +
+          "nothing to re-check. This happens when the buyer never opened the payment page.",
+      });
+    }
+
+    const accessToken = await findOfflineAccessToken(session.shop);
+    if (!accessToken) {
+      return json({
+        error:
+          "This store is not fully connected to Shopify. Reopen this app from Shopify Admin, " +
+          "then try again.",
+      });
+    }
+
+    const snapshot = await fetchPayramPayment(session.shop, mapping.payramReferenceId);
+    if (!snapshot) {
+      return json({
+        error:
+          "Payram did not return this payment. Check that the Payram Base URL and API Key " +
+          "above are correct and that your Payram server is reachable.",
+      });
+    }
+
+    const outcome = await settleOrder({
+      shop: session.shop,
+      shopifyOrderId,
+      referenceId: mapping.payramReferenceId,
+      state: normalizePayramState(snapshot.paymentState),
+      filledAmountInUsd: snapshot.filledAmountInUsd,
+      txHash: null,
+      accessToken,
+      // Read straight from Payram over an authenticated call — the trust level
+      // a gift card requires.
+      verified: true,
+      // The merchant explicitly asked, so redo the Shopify side even if nothing
+      // about the payment changed. This is what repairs an order that settled
+      // but failed to be marked paid.
+      force: true,
+    });
+
+    if (outcome.warnings.length) {
+      return json({
+        error: `Order ${shopifyOrderId}: ${outcome.warnings.join(" ")}`,
+      });
+    }
+    if (outcome.settled) {
+      return json({
+        success:
+          `Order ${shopifyOrderId} is settled — $${outcome.receivedUsd} received of ` +
+          `$${outcome.invoicedUsd}. Shopify has been updated.`,
+      });
+    }
+    return json({
+      success:
+        `Order ${shopifyOrderId} is still short — $${outcome.receivedUsd} received of ` +
+        `$${outcome.invoicedUsd}. Do not fulfil until the balance is paid.`,
+    });
+  }
+
   if (intent === "test-server") {
     if (!payramBaseUrl) {
       return json({ error: "Enter a Payram Base URL to test." });
@@ -649,6 +728,13 @@ export default function SettingsPage() {
                 Recent crypto payments
               </Text>
 
+              <Text as="p" variant="bodySm" tone="subdued">
+                Payram notifies this app when a payment arrives. If a notification
+                was missed — for example before the webhook was configured in
+                Payram — use <b>Re-check payment</b> to read the current state
+                straight from Payram and bring the order up to date.
+              </Text>
+
               {payments.length === 0 ? (
                 <Text as="p" tone="subdued">
                   No crypto payments yet. Once a buyer pays, each order appears
@@ -705,11 +791,39 @@ export default function SettingsPage() {
                             </Banner>
                           )}
 
+                          {p.settled && !p.markedPaidInShopify && (
+                            <Banner tone="warning">
+                              <p>
+                                Payment confirmed, but this order still shows as
+                                unpaid in Shopify. Use <b>Re-check payment</b>, or
+                                open the order and click <b>Mark as paid</b>.
+                              </p>
+                            </Banner>
+                          )}
+
+                          {p.settled && p.markedPaidInShopify && (
+                            <Text as="p" variant="bodySm" tone="success">
+                              Marked paid in Shopify
+                            </Text>
+                          )}
+
                           {p.syncError && (
                             <Banner tone="critical" title="Needs your attention">
                               <p>{p.syncError}</p>
                             </Banner>
                           )}
+
+                          <Form method="post">
+                            <input type="hidden" name="intent" value="recheck" />
+                            <input
+                              type="hidden"
+                              name="shopifyOrderId"
+                              value={p.shopifyOrderId}
+                            />
+                            <Button submit loading={isSubmitting} variant="plain">
+                              Re-check payment
+                            </Button>
+                          </Form>
                         </BlockStack>
                       </Card>
                     );

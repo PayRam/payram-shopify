@@ -153,6 +153,32 @@ Approve the permission request. This installs the app on your store and creates 
 
 ---
 
+### Step 5b — Point Payram's webhook at the connector
+
+**Do not skip this.** Without it the connector is never told that a payment
+arrived: the buyer pays, Payram shows the payment, and the Shopify order sits
+unpaid and untagged forever.
+
+In your **Payram dashboard**, open the project used for this store, go to
+**Webhooks**, and add:
+
+```
+https://YOUR_DOMAIN/api/payram/webhook
+```
+
+Use Payram's **Test webhook delivery** to confirm it arrives. From the server
+side you can watch for it:
+
+```bash
+docker logs -f payram-shopify-connector | grep payram-webhook
+```
+
+> Payram queues a delivery only for webhooks that exist **at the moment a payment
+> is processed**. Adding the webhook later does not back-fill past payments —
+> settle those with **Re-check payment** in the app.
+
+---
+
 ### Step 6 — Add the manual payment method in Shopify
 
 1. In Shopify Admin → **Settings** → **Payments** → **Manual payment methods** → **Add manual payment method**.
@@ -247,6 +273,8 @@ and price drift scale with order size. A $1,000 order allows $10; a $20 order al
 
 - A **manual payment method** named to match the setting above.
 - The **Payram Thank You Block** added in the checkout editor.
+- **A Payram webhook** pointing at `https://YOUR_DOMAIN/api/payram/webhook`, configured in the
+  Payram dashboard. Without it no payment is ever settled.
 - **Gift cards enabled** (Settings → Gift cards) if refunding overpayments.
 - **Up-to-date permissions.** When the permission list changes, re-run the installer so the app is
   redeployed with the new list, then open the app in Shopify Admin and approve. Reopening the app
@@ -740,7 +768,9 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 
 | Symptom | Signal | Cause | Fix |
 |---|---|---|---|
+| Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
+| Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
 | Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, payment not confirmed with Payram, a card already issued for this order, permissions missing, or gift cards disabled in Shopify | The banner or note names which. Missing permissions: re-run the installer, then approve in Shopify Admin |
 | Buyer sees "This payment link isn't valid" | — | `PAYMENT_LINK_SECRET` changed, or a truncated URL | Restore the previous secret, or have the buyer reopen from their order confirmation |

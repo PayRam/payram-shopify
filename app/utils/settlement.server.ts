@@ -45,6 +45,7 @@ import {
   appendOrderNote,
   createGiftCard,
   fetchOrderSettlementContext,
+  markOrderPaid,
 } from "~/utils/shopify-admin.server";
 
 /** Payram's payment classification, as sent on the merchant webhook. */
@@ -172,6 +173,14 @@ export async function settleOrder(params: {
   accessToken: string;
   /** True only when the amounts were re-read from Payram, not taken from the webhook. */
   verified: boolean;
+  /**
+   * Re-run the Shopify side even when nothing has changed.
+   *
+   * Repeat webhook deliveries short-circuit to avoid burning rate limit, but a
+   * merchant pressing "Re-check payment" is asking us to try again — usually
+   * because marking the order paid failed the first time.
+   */
+  force?: boolean;
 }): Promise<SettlementOutcome> {
   const {
     shop,
@@ -182,6 +191,7 @@ export async function settleOrder(params: {
     txHash,
     accessToken,
     verified,
+    force = false,
   } = params;
 
   const warnings: string[] = [];
@@ -301,7 +311,18 @@ export async function settleOrder(params: {
   // in the right state, so touching Shopify again would burn rate limit for no
   // change. A stored syncError means the last attempt did not finish, so those
   // are always retried.
-  if (unchanged && mapping.paymentState === state && !mapping.syncError) {
+  // A settled order that Shopify still shows as unpaid has unfinished work, so
+  // it must not short-circuit either.
+  const shopifyPaidUpToDate =
+    mapping.shopifyFinancialStatus !== TAG_PAID || mapping.shopifyMarkedPaidAt !== null;
+
+  if (
+    !force &&
+    unchanged &&
+    mapping.paymentState === state &&
+    !mapping.syncError &&
+    shopifyPaidUpToDate
+  ) {
     // `settled` must mean the same thing here as on the first delivery. Deriving
     // it from the balance sign would report a shortfall absorbed by the
     // tolerance as unsettled on every re-delivery, while the order stays tagged
@@ -401,6 +422,41 @@ export async function settleOrder(params: {
     warnings.push(
       `Could not add the order note: ${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+
+  // --- Make Shopify's own status agree ---
+  // Tags are an audit trail; they are invisible to payouts, order filters,
+  // reports and fulfilment apps. Without this the merchant sees "Payment
+  // pending" on an order we have confirmed was paid, and has to take our word
+  // for it over their own admin.
+  //
+  // Best-effort: a failure here must never undo a settled payment. The tag and
+  // note still stand, and the merchant is told what to do.
+  let markedPaidAt: Date | null = mapping.shopifyMarkedPaidAt ?? null;
+  if (settled && !markedPaidAt) {
+    try {
+      const res = await markOrderPaid(shop, accessToken, shopifyOrderId);
+      if (res.ok) {
+        markedPaidAt = new Date();
+        console.info("[payram-settle] marked order paid in Shopify", {
+          shopifyOrderId,
+          alreadyPaid: res.alreadyPaid,
+          financialStatus: res.financialStatus,
+        });
+      } else {
+        warnings.push(
+          `The payment is confirmed and the order is tagged, but Shopify would not mark it ` +
+            `paid: ${res.error}. Open the order and use "Mark as paid".`,
+        );
+      }
+    } catch (err) {
+      warnings.push(
+        `The payment is confirmed and the order is tagged, but marking it paid in Shopify ` +
+          `failed: ${err instanceof Error ? err.message : String(err)}. ` +
+          `Open the order and use "Mark as paid". If this keeps happening, check that whoever ` +
+          `installed the app has the "mark orders as paid" staff permission.`,
+      );
+    }
   }
 
   // --- Overpayment: return the excess as a gift card ---
@@ -530,6 +586,7 @@ export async function settleOrder(params: {
     payramStatus: state,
     shopifyFinancialStatus: settled ? TAG_PAID : TAG_PARTIAL,
     shopifyPaidSyncedAt: settled ? new Date() : null,
+    shopifyMarkedPaidAt: markedPaidAt,
     lastSyncAt: new Date(),
     syncError: warnings.length ? warnings.join(" ") : null,
     ...giftFields,

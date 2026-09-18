@@ -98,6 +98,11 @@ model PaymentMapping {
   // when the outstanding amount is unchanged, and replaces it when it is not.
   linkAmountUsd          String?
   linkCreatedAt          DateTime?
+  // When Shopify's own financial status was set to PAID via orderMarkAsPaid.
+  // Separate from shopifyPaidSyncedAt (which records the tag sync) because a
+  // tagged order and a Shopify-paid order are different facts, and the merchant
+  // only trusts the second one.
+  shopifyMarkedPaidAt    DateTime?
   // Buyer-supplied email, collected in the Thank You block and forwarded to
   // Payram for its receipt. Held here rather than passed through the payment
   // URL so a bookmarkable link never carries someone's email address.

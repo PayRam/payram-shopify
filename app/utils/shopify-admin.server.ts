@@ -4,9 +4,10 @@
  * Two jobs:
  *  1. Read the authoritative order total + presentment currency when creating a
  *     Payram payment. The buyer's browser must never be the source of the amount.
- *  2. Sync a completed Payram payment back into Shopify by tagging the order.
- *     This avoids the PCD-gated orderMarkAsPaid mutation while still giving
- *     merchants a visible signal in Shopify Admin.
+ *  2. Settle a completed Payram payment back into Shopify: mark the order paid
+ *     and tag it. The tag is the audit trail (`payram_paid`,
+ *     `payram_partially_paid`, `payram_overpaid`); marking paid is what makes
+ *     Shopify's own payouts, filters and reports agree with reality.
  */
 import prisma from "~/db.server";
 import { sessionStorage } from "~/shopify.server";
@@ -696,4 +697,85 @@ export async function createGiftCard(
   }
 
   throw new Error(`Gift card could not be created: ${lastError}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* Marking an order paid in Shopify                                    */
+/* ------------------------------------------------------------------ */
+
+const ORDER_MARK_AS_PAID_MUTATION = /* graphql */ `
+  mutation payramOrderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+    orderMarkAsPaid(input: $input) {
+      order {
+        id
+        displayFinancialStatus
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+export interface MarkPaidResult {
+  ok: boolean;
+  /** Shopify's financial status after the call, when it reported one. */
+  financialStatus: string | null;
+  /** True when the order was already paid — treated as success, not failure. */
+  alreadyPaid: boolean;
+  error?: string;
+}
+
+/**
+ * Set Shopify's own financial status to PAID.
+ *
+ * The connector used to only tag orders `payram_paid` and leave Shopify showing
+ * "Payment pending" forever. Tags are invisible to payouts, order filters,
+ * reports and fulfilment apps, so every merchant had to click "Mark as paid" by
+ * hand on each crypto order — and had to trust a label over their own admin.
+ *
+ * The original code called this mutation and was changed in April 2026 with a
+ * note saying it was "PCD-gated". That looks wrong: Shopify documents
+ * `orderMarkAsPaid` as needing the `write_orders` scope plus the staff
+ * permission `mark_orders_as_paid`. Protected Customer Data governs customer
+ * PII, not this mutation — and the connector already reads and writes these
+ * orders to invoice and tag them.
+ *
+ * Still treated as best-effort: the staff member who installed the app may lack
+ * `mark_orders_as_paid`, and no failure here should undo a settled payment.
+ * Callers record the problem and carry on.
+ */
+export async function markOrderPaid(
+  shop: string,
+  accessToken: string,
+  shopifyOrderId: string,
+): Promise<MarkPaidResult> {
+  const data = await adminGraphql<{
+    orderMarkAsPaid?: {
+      order?: { displayFinancialStatus?: string } | null;
+      userErrors?: { field?: string[]; message: string }[];
+    };
+  }>(
+    shop,
+    accessToken,
+    ORDER_MARK_AS_PAID_MUTATION,
+    { input: { id: `gid://shopify/Order/${shopifyOrderId}` } },
+    "mark order paid",
+  );
+
+  const errs = data.orderMarkAsPaid?.userErrors ?? [];
+  if (errs.length) {
+    const message = errs.map((e) => e.message).join("; ");
+
+    // Shopify refuses when there is nothing left to capture. That means the
+    // order is already paid, which is the state we wanted — not an error.
+    if (/already|no outstanding|not.*outstanding|cannot be marked as paid/i.test(message)) {
+      return { ok: true, financialStatus: "PAID", alreadyPaid: true };
+    }
+    return { ok: false, financialStatus: null, alreadyPaid: false, error: message };
+  }
+
+  return {
+    ok: true,
+    financialStatus: data.orderMarkAsPaid?.order?.displayFinancialStatus ?? null,
+    alreadyPaid: false,
+  };
 }
