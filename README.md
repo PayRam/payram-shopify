@@ -638,9 +638,10 @@ balance — they don't decrement, can be shared, and don't represent money owed.
   refund* (default $1) is noted on the order.
 - **Issued in your store's currency.** Converted at the order's stored rate when the order was in
   that currency, otherwise at a live rate.
-- **Delivered by Shopify.** When the order has a customer record — including most guest checkouts —
-  Shopify emails the card to the buyer. Otherwise the card is still created and the order note tells
-  you to send it from Shopify Admin → *Gift cards*.
+- **Delivered by Shopify** *when the app can read the order's customer*. The card is attached to
+  that customer and Shopify emails it. If the order has no customer, or Protected Customer Data
+  restrictions hide it from the app, the card is still created but nobody is emailed — the order
+  note says so, and you send it from Shopify Admin → *Gift cards*.
 - **The order stays paid if refunding fails.** A failed card is recorded as a warning; the order is
   still tagged paid and can be fulfilled.
 - **The full card code is never stored** by the connector — only the card's ID and last characters.
