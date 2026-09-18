@@ -56,6 +56,16 @@ RUN npm prune --omit=dev
 # ---- runner ----------------------------------------------------------------
 FROM node:20-alpine AS runner
 
+# Baked in by the release workflow so the RUNNING APP can report its own version.
+# The image already carries org.opencontainers.image.revision as an OCI label, but
+# labels live on the image config — a process inside the container cannot read
+# them without the Docker socket. These env vars are what the dashboard shows and
+# what the update check compares against.
+ARG SOURCE_COMMIT=""
+ARG APP_VERSION=""
+ENV PAYRAM_BUILD_SHA=$SOURCE_COMMIT
+ENV PAYRAM_VERSION=$APP_VERSION
+
 WORKDIR /app
 
 # Runtime-only OS packages

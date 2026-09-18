@@ -11,6 +11,7 @@ import {
   Layout,
   Page,
   Checkbox,
+  Collapsible,
   Text,
   TextField,
 } from "@shopify/polaris";
@@ -20,6 +21,7 @@ import { decrypt, encrypt } from "~/utils/encryption.server";
 import { fetchPayramPayment, validatePayramBaseUrl } from "~/utils/payram.server";
 import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
 import { normalizePayramState, settleOrder } from "~/utils/settlement.server";
+import { getUpdateStatus } from "~/utils/updates.server";
 
 function summarizeResponseText(value: string): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -89,11 +91,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   // Gift card refunds need a scope that existing installs were not granted.
+  // Never let a failed release check break the settings page.
+  const update = await getUpdateStatus(session.shop).catch(() => null);
+
   const grantedScopes = (session.scope ?? "").split(",").map((x) => x.trim());
   const hasGiftCardScope = grantedScopes.includes("write_gift_cards");
 
   return json({
     shop: session.shop,
+    update,
     needsAttention,
     hasGiftCardScope,
     payments: payments.map((p) => ({
@@ -124,6 +130,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     giftCardMinimumUsd: config?.giftCardMinimumUsd ?? "1.00",
     settlementTolerancePercent: config?.settlementTolerancePercent ?? "1.0",
     settlementToleranceMinUsd: config?.settlementToleranceMinUsd ?? "1.00",
+    updateChecksEnabled: config?.updateChecksEnabled ?? true,
   });
 };
 
@@ -156,6 +163,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   ).trim();
   const autoGiftCardOnOverpayment =
     String(formData.get("autoGiftCardOnOverpayment") ?? "") === "on";
+  const updateChecksEnabled =
+    String(formData.get("updateChecksEnabled") ?? "") === "on";
 
   // Fall back to what is STORED, not to the literal default. The gift-card
   // minimum field is disabled while the feature is off, and browsers do not
@@ -465,6 +474,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       giftCardMinimumUsd,
       settlementTolerancePercent,
       settlementToleranceMinUsd,
+      updateChecksEnabled,
     },
     update: {
       payramBaseUrl,
@@ -474,6 +484,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       giftCardMinimumUsd,
       settlementTolerancePercent,
       settlementToleranceMinUsd,
+      updateChecksEnabled,
     },
   });
 
@@ -493,6 +504,8 @@ export default function SettingsPage() {
     payments,
     needsAttention,
     hasGiftCardScope,
+    update,
+    updateChecksEnabled,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -503,6 +516,8 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [autoGiftCard, setAutoGiftCard] = useState(autoGiftCardOnOverpayment);
   const [giftCardMin, setGiftCardMin] = useState(giftCardMinimumUsd);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [updateChecks, setUpdateChecks] = useState(updateChecksEnabled);
   const [tolPct, setTolPct] = useState(settlementTolerancePercent);
   const [tolMin, setTolMin] = useState(settlementToleranceMinUsd);
 
@@ -589,6 +604,104 @@ export default function SettingsPage() {
               ) : null}
             </Banner>
           )}
+          {update && (update.updateAvailable || update.currentVersion) && (
+            <div style={{ marginBottom: "1rem" }}>
+              {update.updateAvailable ? (
+                <Banner
+                  tone="info"
+                  title={`Update available — version ${update.latestVersion}`}
+                >
+                  <BlockStack gap="200">
+                    <Text as="p">
+                      You are running version {update.currentVersion}.
+                      {update.requiresInstaller
+                        ? " This release changes the checkout block or app permissions, so re-run the installer — pulling the image alone is not enough."
+                        : " This release changes the server only."}
+                    </Text>
+
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Run this on the server where the connector is installed:
+                    </Text>
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-all",
+                        background: "var(--p-color-bg-surface-secondary, #f6f6f7)",
+                        border: "1px solid var(--p-color-border, #e3e3e3)",
+                        borderRadius: 8,
+                        padding: "0.75rem",
+                        margin: 0,
+                        fontSize: 12,
+                      }}
+                    >
+                      {update.requiresInstaller
+                        ? '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"'
+                        : `docker pull payramapp/payram-shopify:latest
+docker stop payram-shopify-connector && docker rm payram-shopify-connector
+docker run -d --name payram-shopify-connector \\
+  --env-file ~/payram-shopify-connector/.env -p 2798:2798 \\
+  -v payram-shopify-data:/data --restart unless-stopped \\
+  payramapp/payram-shopify:latest`}
+                    </pre>
+
+                    {update.requiresInstaller && (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Keep the same install directory, accept your existing
+                        values, and never pass <code>--reset</code>. Your settings
+                        and payment history are preserved. Afterwards, approve any
+                        new permissions in Shopify Admin.
+                      </Text>
+                    )}
+
+                    {update.releaseNotes && (
+                      <>
+                        <Button
+                          variant="plain"
+                          onClick={() => setNotesOpen((v) => !v)}
+                          ariaExpanded={notesOpen}
+                          ariaControls="payram-release-notes"
+                        >
+                          {notesOpen ? "Hide what's new" : "See what's new"}
+                        </Button>
+                        <Collapsible
+                          open={notesOpen}
+                          id="payram-release-notes"
+                          transition={{ duration: "150ms", timingFunction: "ease-in-out" }}
+                        >
+                          <pre
+                            style={{
+                              whiteSpace: "pre-wrap",
+                              margin: 0,
+                              fontSize: 12,
+                              lineHeight: 1.5,
+                              maxHeight: "22rem",
+                              overflowY: "auto",
+                            }}
+                          >
+                            {update.releaseNotes}
+                          </pre>
+                        </Collapsible>
+                      </>
+                    )}
+
+                    {update.latestUrl && (
+                      <Text as="p" variant="bodySm">
+                        <a href={update.latestUrl} target="_blank" rel="noreferrer">
+                          Full release notes on GitHub
+                        </a>
+                      </Text>
+                    )}
+                  </BlockStack>
+                </Banner>
+              ) : (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Running version {update.currentVersion}
+                  {update.currentCommit ? ` (${update.currentCommit.slice(0, 7)})` : ""} — up to date.
+                </Text>
+              )}
+            </div>
+          )}
+
           {needsAttention > 0 && (
             <Banner tone="warning" title={`${needsAttention} order${needsAttention === 1 ? "" : "s"} need attention`}>
               <p>
@@ -664,6 +777,17 @@ export default function SettingsPage() {
                     onChange={setTolMin}
                     autoComplete="off"
                     helpText="A floor for small orders, where a percentage would be too tight. The larger of the two applies."
+                  />
+                  <Checkbox
+                    label="Check for connector updates"
+                    name="updateChecksEnabled"
+                    checked={updateChecks}
+                    onChange={setUpdateChecks}
+                    helpText={
+                      "Shows a notice here when a newer version is released. This is a " +
+                      "read-only check against GitHub — nothing about your store, orders or " +
+                      "customers is sent, and updates are never applied automatically."
+                    }
                   />
                   <Checkbox
                     label="Refund overpayments as a gift card"

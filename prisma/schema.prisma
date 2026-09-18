@@ -48,6 +48,10 @@ model MerchantConfig {
   // Effective tolerance = max(invoice × percent, floor).
   settlementTolerancePercent   String   @default("1.0")
   settlementToleranceMinUsd    String   @default("1.00")
+  // Whether this shop checks GitHub for new connector releases. On by default:
+  // self-hosting means nobody can push a fix to a merchant, so being told one
+  // exists is the only substitute. The check sends nothing about the store.
+  updateChecksEnabled          Boolean  @default(true)
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }
@@ -154,4 +158,24 @@ model FxRate {
   source     String
   fetchedAt  DateTime
   expiresAt  DateTime
+}
+
+// Cached result of the connector's release check.
+//
+// Self-hosted merchants cannot be updated remotely, so the app tells them when a
+// newer release exists. One row: the release is the same for every shop on this
+// server. Cached so the dashboard never blocks on GitHub and the API is hit once
+// a day, not once per page view.
+model UpdateCheck {
+  id                String    @id @default("singleton")
+  latestVersion     String?
+  latestUrl         String?
+  releaseNotes      String?
+  publishedAt       DateTime?
+  // True when the release body carries [installer-required] — the checkout
+  // extension or the permission list changed, so pulling the image is not enough.
+  requiresInstaller Boolean   @default(false)
+  checkedAt         DateTime
+  // Set when the last check failed, so the UI can stay quiet instead of guessing.
+  lastError         String?
 }

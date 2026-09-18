@@ -33,7 +33,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write: v* builds also publish a GitHub Release, which is what the
+      # connector's in-app update notice reads.
+      contents: write
 
     env:
       DOCKER_IMAGE: payramapp/payram-shopify
@@ -91,8 +93,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Readable from inside the running container, unlike the OCI labels.
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            APP_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # A tagged build is a release merchants are told about in-app, so publish
+      # the notes they will read. Mark the release body with [installer-required]
+      # when the checkout extension or the permission list changed — the connector
+      # then tells merchants to re-run the installer instead of just pulling the
+      # image, which a plain `docker pull` would silently leave stale.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag || gh release edit "${GITHUB_REF_NAME}" --draft=false
 
       - name: Summary
         run: |
