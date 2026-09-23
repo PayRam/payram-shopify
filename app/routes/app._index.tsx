@@ -130,7 +130,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     giftCardMinimumUsd: config?.giftCardMinimumUsd ?? "1.00",
     settlementTolerancePercent: config?.settlementTolerancePercent ?? "1.0",
     settlementToleranceMinUsd: config?.settlementToleranceMinUsd ?? "1.00",
-    updateChecksEnabled: config?.updateChecksEnabled ?? true,
+    updateChecksEnabled: config?.updateChecksEnabled ?? false,
   });
 };
 
@@ -483,6 +483,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Payram Project API Key is required." });
   }
 
+  // Log what the browser actually submitted. A merchant reporting "it says
+  // saved but the box is unticked again" can only be explained by one of two
+  // things: the field never arrived, or it arrived and was written false. The
+  // submitted key list distinguishes them immediately.
+  console.info("[payram-settings] saving", {
+    shop: session.shop,
+    submittedFields: Array.from(formData.keys()).sort(),
+    autoGiftCardOnOverpayment,
+    updateChecksEnabled,
+    giftCardMinimumUsd,
+    settlementTolerancePercent,
+    settlementToleranceMinUsd,
+  });
+
   await prisma.merchantConfig.upsert({
     where: { shop: session.shop },
     create: {
@@ -508,7 +522,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     },
   });
 
-  return json({ success: "Settings saved." });
+  const savedRow = await prisma.merchantConfig.findUnique({
+    where: { shop: session.shop },
+    select: { autoGiftCardOnOverpayment: true, updateChecksEnabled: true },
+  });
+  console.info("[payram-settings] saved", {
+    shop: session.shop,
+    autoGiftCardOnOverpayment: savedRow?.autoGiftCardOnOverpayment,
+    updateChecksEnabled: savedRow?.updateChecksEnabled,
+  });
+
+  // Report what was actually stored, read back from the database. "Settings
+  // saved." on its own cannot distinguish a save that worked from one that
+  // wrote a value the merchant did not choose.
+  return json({
+    success: `Settings saved. Overpayment gift cards: ${
+      savedRow?.autoGiftCardOnOverpayment ? "on" : "off"
+    }. Update notices: ${savedRow?.updateChecksEnabled ? "on" : "off"}.`,
+  });
 };
 
 export default function SettingsPage() {
@@ -849,6 +880,16 @@ docker run -d --name payram-shopify-connector \\
                     disabled={!autoGiftCard}
                     helpText="Smaller overpayments are noted on the order but not refunded, to avoid issuing gift cards for a few cents of rounding."
                   />
+                  {actionData && "error" in actionData && (
+                    <Banner tone="critical" title="Not saved">
+                      <p>{String(actionData.error)}</p>
+                    </Banner>
+                  )}
+                  {actionData && "success" in actionData && (
+                    <Banner tone="success">
+                      <p>{String(actionData.success)}</p>
+                    </Banner>
+                  )}
                   <Button submit loading={isSubmitting} variant="primary">
                     Save Settings
                   </Button>
