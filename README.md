@@ -45,6 +45,7 @@ refund an overpayment as a gift card.
 | Install / configure a store | [Self-Hosted Installation](#self-hosted-installation), [Configuration Reference](#configuration-reference) |
 | Understand what a buyer sees | [The Buyer's Journey](#the-buyers-journey) |
 | Work out why an order looks wrong | [Diagnostics](#diagnostics) |
+| Nothing responds — 404 on every URL | `curl https://YOUR_DOMAIN/healthz` **first**. A 404 there means the hostname is not reaching this container at all, so no amount of app config will help — see [Diagnostics](#symptom--cause--fix) |
 | Update an existing install | [Updating](#updating) |
 | Understand money handling | [Currency Handling](#currency-handling), [Partial and Overpayments](#partial-and-overpayments) |
 | Change settlement behaviour | `app/utils/settlement.server.ts` |
@@ -429,6 +430,7 @@ so in local dev you fill it in yourself: replace `__PAYRAM_REDIRECT_BASE_URL__` 
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/healthz` | Liveness + identity. Returns `{"app":"payram-shopify-connector","ok":true}`. No auth, no database, no version — use it to prove a hostname reaches *this* container |
 | `GET` | `/pay/{token}` | **The buyer-facing payment page.** Status, first payment, top-up, receipt |
 | `POST` | `/api/payram/session` | Quote / create-checkout, called by the payment page |
 | `GET` | `/api/payram/redirect-to-payment` | Entry point from the Thank You block; mints a token and redirects to `/pay/{token}` |
@@ -768,6 +770,7 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 
 | Symptom | Signal | Cause | Fix |
 |---|---|---|---|
+| **Every connector URL 404s** — the install link, `/pay/...`, the webhook | `curl https://YOUR_DOMAIN/healthz` returns someone else's page, and `curl http://127.0.0.1:2798/healthz` from the server works | **The hostname never reaches the container.** Your web server has no entry for it, so nginx answers from its *default* server block — on a box that also runs the Payram dashboard, that is what buyers get. A 404 here is the dashboard's, not the connector's | Add the reverse-proxy entry for that hostname → `127.0.0.1:2798`. Re-running the installer prints the exact nginx block and the `certbot` command. A **502** instead means routing is right and the container is down |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
@@ -784,10 +787,18 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 ### Health checks
 
 ```bash
-npm test          # 99 tests: conversion, settlement, top-ups, tolerance, tokens
+# Is the hostname Shopify calls actually reaching this container?
+curl https://YOUR_DOMAIN/healthz      # => {"app":"payram-shopify-connector","ok":true}
+curl http://127.0.0.1:2798/healthz    # same, run on the server itself
+
+npm test          # unit tests: conversion, settlement, top-ups, tolerance, tokens
 npm run build     # Remix build
 npx prisma migrate deploy   # applies pending migrations (also run by scripts/start.sh)
 ```
+
+If the second command answers and the first does not, the container is healthy and the
+problem is your reverse proxy — not the connector. Anything other than that exact JSON
+from the public URL means the request is being served by a different application.
 
 The app's Settings page has **Test Payram Server** and **Create Test Payment Link** buttons
 that exercise connectivity and the payment API with the saved credentials.

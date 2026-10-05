@@ -458,12 +458,116 @@ docker run -d \
 info "Container started."
 
 # =============================================================================
+# STEP 7 — Verify the connector is reachable at the URL Shopify will call
+#
+# Binding port 2798 is not the same as being reachable. The merchant points a
+# hostname at this container with their own reverse proxy, and if that hostname
+# has no server block, nginx answers it from its DEFAULT server instead — on a
+# box that already runs the Payram dashboard, that means every connector URL
+# returns the dashboard's 404 while the installer cheerfully reports success.
+# The first person to find out is a buyer staring at a 404 at checkout.
+# =============================================================================
+step "Verifying the connector is reachable"
+
+HEALTH_MARKER="payram-shopify-connector"
+APP_URL="${SHOPIFY_APP_URL%/}"
+APP_HOST="${APP_URL#https://}"; APP_HOST="${APP_HOST%%/*}"
+URL_REACHABLE=false
+
+# ── 1. Did the container itself come up? ─────────────────────────────────────
+CONTAINER_HEALTHY=false
+info "Waiting for the container to start ..."
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 3 "http://127.0.0.1:2798/healthz" 2>/dev/null | grep -q "$HEALTH_MARKER"; then
+    CONTAINER_HEALTHY=true
+    break
+  fi
+  sleep 1
+done
+
+if [ "$CONTAINER_HEALTHY" != true ]; then
+  warn "The connector is NOT answering on http://127.0.0.1:2798 after 30s."
+  echo ""
+  warn "Last 30 lines of container log:"
+  docker logs --tail 30 payram-shopify-connector 2>&1 | sed 's/^/    /' || true
+  echo ""
+  warn "Fix the error above, then re-run this installer."
+else
+  info "Container is answering on port 2798."
+
+  # ── 2. Does the public URL actually arrive at THIS container? ─────────────
+  if curl -fsSL --max-time 10 "${APP_URL}/healthz" 2>/dev/null | grep -q "$HEALTH_MARKER"; then
+    info "${APP_URL} reaches this connector. ✓"
+    URL_REACHABLE=true
+  else
+    echo ""
+    echo -e "${BOLD}${YELLOW}────────────────────────────────────────────────────────────${RESET}"
+    echo -e "${BOLD}${YELLOW}  Could not confirm ${APP_URL} reaches this connector${RESET}"
+    echo -e "${BOLD}${YELLOW}────────────────────────────────────────────────────────────${RESET}"
+    echo ""
+    warn "The container is running, but a request to"
+    warn "  ${BOLD}${APP_URL}/healthz${RESET}"
+    warn "did not come back from it. Until that URL reaches this container,"
+    warn "${BOLD}installing the app and every buyer payment link will return 404.${RESET}"
+    echo ""
+    warn "Most common cause: your web server has no entry for ${BOLD}${APP_HOST}${RESET},"
+    warn "so it is serving a different site (often the Payram dashboard) instead."
+    echo ""
+    echo -e "  ${CYAN}Fix for nginx${RESET} — save as /etc/nginx/sites-available/${APP_HOST}"
+    echo -e "  and symlink it into sites-enabled:"
+    echo ""
+    cat <<NGINX
+    server {
+        listen 80;
+        server_name ${APP_HOST};
+
+        location / {
+            proxy_pass         http://127.0.0.1:2798;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              \$host;
+            proxy_set_header   X-Real-IP         \$remote_addr;
+            proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto \$scheme;
+            proxy_set_header   Upgrade           \$http_upgrade;
+            proxy_set_header   Connection        "upgrade";
+        }
+    }
+NGINX
+    echo ""
+    echo -e "  ${CYAN}Then:${RESET}"
+    echo -e "    ln -s /etc/nginx/sites-available/${APP_HOST} /etc/nginx/sites-enabled/"
+    echo -e "    nginx -t && systemctl reload nginx"
+    echo -e "    certbot --nginx -d ${APP_HOST}        ${YELLOW}# adds HTTPS${RESET}"
+    echo ""
+    echo -e "  ${CYAN}Verify:${RESET} curl ${APP_URL}/healthz"
+    echo -e "    Expected: ${BOLD}{\"app\":\"payram-shopify-connector\",\"ok\":true}${RESET}"
+    echo ""
+    warn "Using a Cloudflare Tunnel? Check the tunnel points at"
+    warn "http://localhost:2798 and is running. If the tunnel blocks this"
+    warn "server from calling its own public hostname, the check above can"
+    warn "fail even though buyers can reach it — confirm with the curl from"
+    warn "your laptop before changing anything."
+  fi
+fi
+
+# =============================================================================
 # Done
 # =============================================================================
 echo ""
-echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
-echo -e "${BOLD}${GREEN}  Payram Shopify Connector is running!${RESET}"
-echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
+# Only claim success for what was actually verified. Handing out an install URL
+# that returns 404 costs a merchant a support round-trip and a lost sale.
+if [ "$URL_REACHABLE" = true ]; then
+  echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
+  echo -e "${BOLD}${GREEN}  Payram Shopify Connector is running!${RESET}"
+  echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
+else
+  echo -e "${BOLD}${YELLOW}════════════════════════════════════════════${RESET}"
+  echo -e "${BOLD}${YELLOW}  Installed — but not reachable yet${RESET}"
+  echo -e "${BOLD}${YELLOW}════════════════════════════════════════════${RESET}"
+  echo ""
+  echo -e "  ${YELLOW}Point ${BOLD}${APP_HOST:-your domain}${RESET}${YELLOW} at this container first (see above).${RESET}"
+  echo -e "  ${YELLOW}The steps below will return 404 until that is done.${RESET}"
+fi
 echo ""
 echo -e "  ${CYAN}1.${RESET} Install the app on your Shopify store:"
 echo -e "       ${BOLD}${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/auth?shop=${SHOPIFY_STORE_DOMAIN:-your-store.myshopify.com}${RESET}"
