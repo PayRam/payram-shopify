@@ -10,6 +10,62 @@ for was misdiagnosed twice by assuming a topology the server did not have.
 
 ---
 
+## Short version — for Telegram, WhatsApp or any chat
+
+Plain text, no markdown, split to clear Telegram's 4096-character limit. Send part 1,
+then part 2; the handoff line stops the assistant answering before it has the whole
+brief. Sending it as a .txt attachment instead works too and avoids the split.
+
+It keeps the discovery-first contract: no advice until a read-only inventory is printed
+and confirmed.
+
+### Part 1 of 2
+
+```text
+I need to expose a self-hosted PayRam Shopify connector on its own hostname. This is a LIVE crypto payments server - a bad restart loses money.
+
+RULES
+1. No fix, config or recommendation until you finish Phase 1 and print Phase 2. Refuse if I try to skip ahead.
+2. Phase 1 is read-only: no installs, restarts or writes. Assume nothing exists - if an output is missing or unclear, ask me for that exact thing instead of inferring it.
+3. Before anything that restarts the payram container, make me back up its config and confirm I saved it.
+
+MY SETUP (established - do not re-derive)
+- Container "payram" publishes 80, 443, 8443: a bundled nginx plus a backend on :8080 and a dashboard on :3000.
+- Container "payram-shopify-connector" publishes 2798. This is what needs a public HTTPS hostname.
+- PayRam's nginx is a CATCH-ALL (listen default_server, server_name _, no conf.d include), so it answers for EVERY hostname and my new subdomain gets served the dashboard - the 404 I see is the dashboard's, not the connector's. That config is baked into the image and wiped on every PayRam upgrade, so there is nowhere inside it to add a vhost.
+- Certs come from SSL_CERT_PATH (usually /etc/letsencrypt/live/DOMAIN) bind-mounted from the host, so certbot runs on the HOST.
+- PayRam's apex sends HSTS includeSubDomains, so the connector hostname must be HTTPS on 443. A non-standard port will not work either (Shopify embedded admin).
+- A 302 to /app on port 2798 means the connector is HEALTHY. Older builds have no /healthz.
+
+TARGET: one process owns 80/443 and routes by Host; each hostname reaches the right app; certs renew unattended; routing survives a PayRam upgrade; 2798 not public.
+
+PHASE 1 - give me ONE read-only copy-paste block, then STOP and wait. Have me redact secret values, keeping their names. Cover: listening sockets with owning process; docker ps with ports; full docker inspect of BOTH containers (env names, mounts, networks, restart policy); whether nginx, caddy, traefik, haproxy and cloudflared exist as binaries, systemd units AND config dirs, reporting each present or absent and never assuming; curl against 127.0.0.1:2798; docker networks and the docker0 bridge IP; certbot certificates with SANs and renewal timer; connector logs; curl -sI both hostnames from outside.
+
+Also ask me: which hostname I want for the connector, what it resolves to, who runs my DNS (if Cloudflare, proxied or DNS-only), and HOW I got my current certificate - certbot standalone needs port 80, which payram owns, so that decides which renewal method can keep working.
+
+(PART 2 of 2 follows in my next message. Wait for it, then begin Phase 1. Do not reply to this message yet.)
+```
+
+### Part 2 of 2
+
+```text
+PART 2 of 2 - continuing the same task.
+
+PHASE 2 - list what you OBSERVED, one line each: fact, value, which command proved it, confirmed or unknown. Never infer. Then the gap against TARGET, the root cause in one sentence, open questions, and the specific risks of restarting payram. Ask me to confirm before continuing.
+
+PHASE 3 - at least 3 options. For each: how it works, whether payram must restart, downtime, how certs renew afterwards, what breaks on a PayRam upgrade, main failure mode. Cover at least (a) a containerised proxy (Caddy/nginx/Traefik) on 80/443 with both apps on a shared Docker network and no published ports; (b) a host proxy, Caddy simplest as it gets certs automatically; (c) a Cloudflare Tunnel for the connector hostname only, to http://localhost:2798 - no host ports and payram untouched, but my DNS must be on Cloudflare. Then recommend ONE: I will not run a second proxy fighting PayRam for ports, and I cannot afford a long gateway outage.
+
+DO NOT recommend editing nginx inside the payram container (wiped on upgrade), or path-prefix routing like /shopify/ - the connector serves absolute paths /app, /pay/..., /auth, /api/payram/... with no base-path setting.
+
+PHASE 4 - runbook: backup and rollback FIRST, with the exact command that captures payram's full config. Then each change as a block with expected output; validate config before reloading, never reload first; say how long PayRam will be down; cert issuance plus a renewal dry-run; verify the two hostnames serve DIFFERENT apps and 2798 is not publicly reachable; confirm SHOPIFY_APP_URL matches the connector hostname and PayRam's webhook points at https://CONNECTOR-HOST/api/payram/webhook.
+
+If it still 404s, the catch-all is still winning. If it 502s, routing is right but the upstream is wrong: inside a container 127.0.0.1 is that container itself, so the proxy must use the docker bridge gateway 172.17.0.1 or the container name on a shared network.
+
+Start with Phase 1 only. No fixes in your first reply.
+```
+
+---
+
 ## Copy everything below this line
 
 ---
