@@ -510,13 +510,64 @@ else
     warn "did not come back from it. Until that URL reaches this container,"
     warn "${BOLD}installing the app and every buyer payment link will return 404.${RESET}"
     echo ""
-    warn "Most common cause: your web server has no entry for ${BOLD}${APP_HOST}${RESET},"
-    warn "so it is serving a different site (often the Payram dashboard) instead."
-    echo ""
-    echo -e "  ${CYAN}Fix for nginx${RESET} — save as /etc/nginx/sites-available/${APP_HOST}"
-    echo -e "  and symlink it into sites-enabled:"
-    echo ""
-    cat <<NGINX
+    # Who owns the public front door decides what the fix even is.
+    #
+    # On a single-server PayRam install the `payram` container publishes 80/443
+    # and its bundled nginx is a CATCH-ALL (`listen ... default_server`,
+    # `server_name _`) with no conf.d include. It therefore answers for any new
+    # hostname, and there is nowhere inside that image to add a vhost that would
+    # survive an upgrade. Telling such a merchant to write an nginx block in
+    # /etc/nginx is wrong twice over: there is no nginx on the host, and the port
+    # it would need is already taken.
+    FRONT_DOOR=""
+    if command -v docker >/dev/null 2>&1; then
+      FRONT_DOOR=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null \
+        | grep -E '\|.*:443->' \
+        | grep -v '^payram-shopify-connector|' \
+        | head -1 | cut -d'|' -f1)
+    fi
+
+    if [ -n "$FRONT_DOOR" ]; then
+      warn "Cause: the container ${BOLD}${FRONT_DOOR}${RESET} already owns port 443 on this"
+      warn "server, and PayRam's bundled nginx is a ${BOLD}catch-all${RESET} — it answers for"
+      warn "${BOLD}every${RESET} hostname, so ${APP_HOST} is being served the PayRam dashboard."
+      echo ""
+      warn "${BOLD}Do not add an nginx config inside that container.${RESET} Its config is baked"
+      warn "into the image and is replaced on every PayRam upgrade."
+      echo ""
+      echo -e "  ${CYAN}What you need${RESET} is one front door that routes by hostname:"
+      echo ""
+      echo -e "      :443  ──  front door  ──┬──  ${FRONT_DOOR} container      (PayRam dashboard)"
+      echo -e "                              └──  127.0.0.1:2798           (this connector)"
+      echo ""
+      echo -e "  ${CYAN}Three ways to get there${RESET} — pick based on your tolerance for restarting"
+      echo -e "  the gateway:"
+      echo ""
+      echo -e "    ${BOLD}1. Containerised proxy${RESET} (Caddy/nginx/Traefik on 80/443). Put both"
+      echo -e "       containers on a shared Docker network with no published ports. Routing"
+      echo -e "       lives in your config, so it survives PayRam upgrades. Requires"
+      echo -e "       re-creating the ${FRONT_DOOR} container without -p 80/-p 443."
+      echo -e "    ${BOLD}2. Host proxy${RESET} (Caddy is simplest — it gets certificates for both"
+      echo -e "       hostnames automatically). Same requirement: free up 80/443 first."
+      echo -e "    ${BOLD}3. Cloudflare Tunnel${RESET} for ${APP_HOST} only, pointed at"
+      echo -e "       http://localhost:2798. Needs no host ports and leaves the ${FRONT_DOOR}"
+      echo -e "       container untouched — but your DNS must be on Cloudflare."
+      echo ""
+      echo -e "  ${YELLOW}Before re-creating the ${FRONT_DOOR} container, save its current${RESET}"
+      echo -e "  ${YELLOW}configuration — it holds the gateway's environment and volumes:${RESET}"
+      echo -e "      docker inspect ${FRONT_DOOR} > ~/${FRONT_DOOR}-container-backup.json"
+      echo ""
+      echo -e "  ${CYAN}Full step-by-step diagnostic${RESET} (paste into any AI assistant; it runs"
+      echo -e "  discovery on your server before suggesting anything):"
+      echo -e "      ${BOLD}docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md${RESET} in the connector repo"
+    elif [ -d /etc/nginx ]; then
+      warn "Cause: nginx on this host has no entry for ${BOLD}${APP_HOST}${RESET}, so it is"
+      warn "serving that hostname from its ${BOLD}default${RESET} server block instead."
+      echo ""
+      echo -e "  ${CYAN}Fix${RESET} — save as /etc/nginx/sites-available/${APP_HOST}"
+      echo -e "  and symlink it into sites-enabled:"
+      echo ""
+      cat <<NGINX
     server {
         listen 80;
         server_name ${APP_HOST};
@@ -533,20 +584,31 @@ else
         }
     }
 NGINX
+      echo ""
+      echo -e "  ${CYAN}Then:${RESET}"
+      echo -e "    ln -s /etc/nginx/sites-available/${APP_HOST} /etc/nginx/sites-enabled/"
+      echo -e "    nginx -t && systemctl reload nginx"
+      echo -e "    certbot --nginx -d ${APP_HOST}        ${YELLOW}# adds HTTPS${RESET}"
+    else
+      warn "Cause: nothing on this server is routing ${BOLD}${APP_HOST}${RESET} to port 2798."
+      echo ""
+      echo -e "  No reverse proxy was found on the host. You need something that"
+      echo -e "  terminates HTTPS for ${APP_HOST} and forwards to ${BOLD}127.0.0.1:2798${RESET} —"
+      echo -e "  Caddy (gets certificates automatically), nginx + certbot, or a"
+      echo -e "  Cloudflare Tunnel pointed at http://localhost:2798."
+      echo ""
+      echo -e "  ${CYAN}Full step-by-step diagnostic${RESET} (paste into any AI assistant):"
+      echo -e "      ${BOLD}docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md${RESET} in the connector repo"
+    fi
+
     echo ""
-    echo -e "  ${CYAN}Then:${RESET}"
-    echo -e "    ln -s /etc/nginx/sites-available/${APP_HOST} /etc/nginx/sites-enabled/"
-    echo -e "    nginx -t && systemctl reload nginx"
-    echo -e "    certbot --nginx -d ${APP_HOST}        ${YELLOW}# adds HTTPS${RESET}"
-    echo ""
-    echo -e "  ${CYAN}Verify:${RESET} curl ${APP_URL}/healthz"
+    echo -e "  ${CYAN}Verify once routing is in place:${RESET} curl ${APP_URL}/healthz"
     echo -e "    Expected: ${BOLD}{\"app\":\"payram-shopify-connector\",\"ok\":true}${RESET}"
     echo ""
-    warn "Using a Cloudflare Tunnel? Check the tunnel points at"
-    warn "http://localhost:2798 and is running. If the tunnel blocks this"
-    warn "server from calling its own public hostname, the check above can"
-    warn "fail even though buyers can reach it — confirm with the curl from"
-    warn "your laptop before changing anything."
+    warn "Using a Cloudflare Tunnel already? Check it points at http://localhost:2798"
+    warn "and is running. If the tunnel blocks this server from calling its own"
+    warn "public hostname, the check above can fail even though buyers can reach"
+    warn "it — confirm with the curl from your laptop before changing anything."
   fi
 fi
 

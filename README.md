@@ -733,6 +733,70 @@ never silently swallows a discrepancy.
 
 ---
 
+## Where the connector sits on your server
+
+The connector is a separate container listening on **2798**. Something must terminate HTTPS
+for its hostname and forward to it. That is not optional and the installer does not do it —
+it is the one piece that depends on how your server is already arranged.
+
+**The one rule:** exactly one process owns ports 80 and 443 and routes by hostname.
+
+```
+            Internet
+                │
+        :80 / :443  ──────────────  ONE front door (routes by Host header)
+                │                   terminates TLS for BOTH hostnames
+       ┌────────┴────────┐
+       │                 │
+  pay.example.com   shopify.example.com
+       │                 │
+  Payram container   Connector container
+  (loopback only)    127.0.0.1:2798
+```
+
+### If Payram runs on the same server
+
+Payram's container publishes 80/443 and its bundled nginx is a **catch-all** —
+`listen ... default_server` with `server_name _`, and no `conf.d` include. It answers for
+any hostname you point at the server, which is why a new subdomain silently serves the
+Payram dashboard instead of the connector.
+
+Two consequences:
+
+- **There is no supported place inside that container to add a virtual host.** Its config is
+  baked into the image and replaced on every Payram upgrade.
+- **A host-level nginx block will not help on its own** — port 443 is already taken, and on
+  many installs there is no nginx on the host at all.
+
+Workable topologies, in rough order of robustness:
+
+| Approach | Payram container restart? | Survives a Payram upgrade | Notes |
+|---|---|---|---|
+| **Containerised proxy** (Caddy / nginx / Traefik on 80/443, both apps on a shared Docker network, no published ports) | Yes — re-created without `-p 80`/`-p 443` | Yes, routing is in your own config | Most robust. Caddy also handles certificates for both hostnames |
+| **Host proxy** (Caddy or nginx + certbot on 80/443) | Yes — same reason | Yes | Familiar; Caddy needs the least certificate work |
+| **Tunnel for the connector only** (e.g. Cloudflare Tunnel → `http://localhost:2798`) | **No** | Yes | Leaves Payram untouched and needs no host ports, but your DNS must be on that provider |
+
+Two things that look like solutions and are not:
+
+- **Editing nginx inside the Payram container** — lost on the next upgrade.
+- **Path-prefix routing** (serving the connector under `/shopify/`) — the connector serves
+  absolute paths (`/app`, `/pay/...`, `/auth`, `/api/payram/...`) and has no base-path
+  setting, so it breaks.
+
+Note that Payram's apex sends `Strict-Transport-Security` with `includeSubDomains`, so
+browsers force HTTPS on every subdomain. An HTTP-only connector hostname cannot work, even
+temporarily.
+
+### Working it out on a server you did not set up
+
+[`docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md`](docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md) is a
+prompt to paste into any AI assistant. It is deliberately **discovery-first**: it runs a
+read-only inventory of ports, containers, certificates and DNS, prints what it actually
+found, and is instructed not to suggest a change until that inventory is confirmed. It also
+captures the Payram container's configuration before anything is restarted.
+
+---
+
 ## Diagnostics
 
 Every failure the connector can see is written somewhere observable. Nothing is swallowed.
@@ -770,7 +834,7 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 
 | Symptom | Signal | Cause | Fix |
 |---|---|---|---|
-| **Every connector URL 404s** — the install link, `/pay/...`, the webhook | `curl https://YOUR_DOMAIN/healthz` returns someone else's page, and `curl http://127.0.0.1:2798/healthz` from the server works | **The hostname never reaches the container.** Your web server has no entry for it, so nginx answers from its *default* server block — on a box that also runs the Payram dashboard, that is what buyers get. A 404 here is the dashboard's, not the connector's | Add the reverse-proxy entry for that hostname → `127.0.0.1:2798`. Re-running the installer prints the exact nginx block and the `certbot` command. A **502** instead means routing is right and the container is down |
+| **Every connector URL 404s** — the install link, `/pay/...`, the webhook | `curl https://YOUR_DOMAIN/healthz` returns someone else's page, while `curl http://127.0.0.1:2798/healthz` on the server works | **The hostname never reaches the container.** Whatever owns port 443 is answering for it. If Payram runs on the same server, that is Payram's bundled nginx — a deliberate catch-all (`server_name _`) that answers for *every* hostname, so buyers get the dashboard's 404, not the connector's | You need one front door that routes by hostname — see [Where the connector sits on your server](#where-the-connector-sits-on-your-server). Re-running the installer detects which case you are in and prints the right fix. A **502** instead means routing is right and the container is down |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
