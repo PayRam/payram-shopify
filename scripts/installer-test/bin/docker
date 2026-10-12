@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+echo "docker $*" >> "$FAKE_LOG"
+case "$1" in
+  info)
+    # docker info --format <template>: report the rootless marker on request
+    [ "${2:-}" = "--format" ] && echo "name=seccomp${FAKE_ROOTLESS:+,name=rootless}"
+    exit 0 ;;
+  --version) echo "Docker version 29.5.3, build abc" ;;
+  pull) echo "pulled $2" ;;
+  volume) exit 0 ;;
+  inspect)
+    # FAKE_EXISTING_BIND unset → no such container. Otherwise its value is the
+    # HostIp of the one binding ("" = bare -p), or "none" = no published ports.
+    [ -n "${FAKE_EXISTING_BIND+x}" ] || exit 1
+    case "$*" in
+      *PortBindings*) [ "$FAKE_EXISTING_BIND" = none ] || printf 'ip=%s\n' "$FAKE_EXISTING_BIND" ;;
+      *Networks*)     printf 'bridge\n'; for n in ${FAKE_EXTRA_NETWORKS:-}; do printf '%s\n' "$n"; done ;;
+    esac
+    exit 0 ;;
+  exec) echo '{"app":"payram-shopify-connector","ok":true}' ;;
+  network) exit 0 ;;
+  port) exit 1 ;;
+  ps)
+    case "$*" in
+      *-a*) [ -n "${FAKE_EXISTING_BIND+x}" ] && echo "payram-shopify-connector" ;;
+      *) : ;;   # front-door scan: nothing owns 443
+    esac ;;
+  stop|rm) exit 0 ;;
+  logs) echo "fake log line" ;;
+  run)
+    all="$*"
+    if [[ "$all" == *".payram-deploy.sh"* ]]; then
+      ws=$(printf '%s\n' "$@" | grep ':/workspace$' | sed 's|:/workspace$||')
+      uid=$(printf '%s\n' "$@" | grep '^HOST_UID=' | cut -d= -f2)
+      printf 'SHOPIFY_API_KEY=%s\nSHOPIFY_API_SECRET=%s\n' "fakekey123" 'fakesecret|with&nasty\chars' > "$ws/.shopify-creds.env"
+      chmod 600 "$ws/.shopify-creds.env"
+      [ -f "$ws/.payram-deploy.sh" ] || { echo "deploy script missing in workspace" >&2; exit 1; }
+      grep -q 'umask 077' "$ws/.payram-deploy.sh" || { echo "deploy script lacks umask" >&2; exit 1; }
+      # shellcheck disable=SC2016  # literal match against the generated script
+      grep -q 'chown "${HOST_UID}:${HOST_GID}"' "$ws/.payram-deploy.sh" || { echo "deploy script lacks chown" >&2; exit 1; }
+      echo "[payram-deploy] SUCCESS (fake, HOST_UID=$uid)"
+    elif [[ "$all" == *"store list"* ]]; then
+      echo "│ demo-store.myshopify.com │"
+    else
+      echo "0123456789ab"
+    fi ;;
+esac

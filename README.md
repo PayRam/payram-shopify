@@ -240,14 +240,17 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
 | `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM) |
 | `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards` (do not change) |
-| `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. Falls back to `SHOPIFY_API_SECRET` — see the warning below |
+| `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. The installer generates it; set it yourself on a manual install — see the warning below |
 | `PORT` | — | Server port (default `2798`) |
+| `CONNECTOR_BIND_ADDRESS` | — | Installer only. How port 2798 is published: an address (`127.0.0.1` on new installs), `all` (every interface, IPv4+IPv6) or `none` (Docker networks only). A re-run keeps whatever the existing container had |
 | `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
 | `ALLOW_INSECURE_PAYRAM_URL` | — | Dev only. Disables SSRF protection on the Payram URL. **Never set in production** |
 
 > **Set `PAYMENT_LINK_SECRET` explicitly in production.** Without it, links are signed with
 > `SHOPIFY_API_SECRET`, so rotating your Shopify credentials invalidates *every outstanding
-> payment link* — including links held by buyers who have already part-paid.
+> payment link* — including links held by buyers who have already part-paid. The installer
+> does this for you: a fresh install gets a random secret, and an upgrade of an install that
+> never had one pins it to the Shopify secret the outstanding links were already signed with.
 
 The installer (`setup_payram_shopify.sh`) **rewrites `SCOPES` on every run**. If you add a
 scope, change it there too or it will be silently reverted on the next install.
@@ -314,15 +317,23 @@ For releases that change only server code:
 
 ```bash
 docker pull payramapp/payram-shopify:latest
+docker port payram-shopify-connector 2798     # note the address — reuse it in -p below
 docker stop payram-shopify-connector && docker rm payram-shopify-connector
 docker run -d \
   --name payram-shopify-connector \
   --env-file ~/payram-shopify-connector/.env \
-  -p 2798:2798 \
+  -p 127.0.0.1:2798:2798 \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
   payramapp/payram-shopify:latest
 ```
+
+**Keep the binding your container already has.** New installs use `127.0.0.1` so only the
+reverse proxy or tunnel on this host can reach the connector. If `docker port` showed
+`0.0.0.0`, use a bare `-p 2798:2798` (an explicit `0.0.0.0` would drop IPv6). If it showed
+nothing, the connector is reached over a Docker network: omit `-p` and re-run
+`docker network connect <network> payram-shopify-connector` afterwards. Re-running the
+installer does all of this for you and records the result as `CONNECTOR_BIND_ADDRESS` in `.env`.
 
 ### Check which version you're running
 
@@ -735,9 +746,10 @@ never silently swallows a discrepancy.
 
 ## Where the connector sits on your server
 
-The connector is a separate container listening on **2798**. Something must terminate HTTPS
-for its hostname and forward to it. That is not optional and the installer does not do it —
-it is the one piece that depends on how your server is already arranged.
+The connector is a separate container listening on **2798**, published on `127.0.0.1` only,
+so the proxy or tunnel is the only way in. Something must terminate HTTPS for its hostname
+and forward to it. That is not optional and the installer does not do it — it is the one
+piece that depends on how your server is already arranged.
 
 **The one rule:** exactly one process owns ports 80 and 443 and routes by hostname.
 
@@ -772,7 +784,7 @@ Workable topologies, in rough order of robustness:
 
 | Approach | Payram container restart? | Survives a Payram upgrade | Notes |
 |---|---|---|---|
-| **Containerised proxy** (Caddy / nginx / Traefik on 80/443, both apps on a shared Docker network, no published ports) | Yes — re-created without `-p 80`/`-p 443` | Yes, routing is in your own config | Most robust. Caddy also handles certificates for both hostnames |
+| **Containerised proxy** (Caddy / nginx / Traefik on 80/443, both apps on a shared Docker network, no published ports) | Yes — re-created without `-p 80`/`-p 443` | Yes, routing is in your own config | Most robust. Caddy also handles certificates for both hostnames. The connector's port is loopback-only on the host, so attach it to the proxy's network (`docker network connect <net> payram-shopify-connector`) and proxy to `http://payram-shopify-connector:2798` |
 | **Host proxy** (Caddy or nginx + certbot on 80/443) | Yes — same reason | Yes | Familiar; Caddy needs the least certificate work |
 | **Tunnel for the connector only** (e.g. Cloudflare Tunnel → `http://localhost:2798`) | **No** | Yes | Leaves Payram untouched and needs no host ports, but your DNS must be on that provider |
 

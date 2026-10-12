@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# emulate: script -qec CMD /dev/null
+eval "$2"

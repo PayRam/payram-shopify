@@ -16,6 +16,7 @@
     "prisma": "prisma",
     "typecheck": "tsc",
     "test": "vitest run",
+    "test:installer": "bash scripts/installer-test/run.sh",
     "test:watch": "vitest"
   },
   "dependencies": {

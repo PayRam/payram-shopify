@@ -104,7 +104,7 @@ My server runs **two Docker containers**:
 | Container | Ports (host:container) | What it is |
 |---|---|---|
 | `payram` | `80:80`, `443:443`, `8443:8443` | The PayRam gateway: a bundled **nginx** plus a Go backend on loopback `:8080` and a Next.js dashboard on loopback `:3000`. |
-| `payram-shopify-connector` | `2798:2798` | The Shopify connector (a Remix app). Shopify and buyers must reach this over HTTPS. |
+| `payram-shopify-connector` | `127.0.0.1:2798:2798` (older installs: `2798:2798`, all interfaces) | The Shopify connector (a Remix app). Shopify and buyers must reach this over HTTPS. |
 
 Two facts about PayRam's bundled nginx that are **already established** — do not re-derive
 them, and do not suggest editing this config as a first resort:
