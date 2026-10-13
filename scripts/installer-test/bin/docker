@@ -39,8 +39,6 @@ case "$1" in
       # shellcheck disable=SC2016  # literal match against the generated script
       grep -q 'chown "${HOST_UID}:${HOST_GID}"' "$ws/.payram-deploy.sh" || { echo "deploy script lacks chown" >&2; exit 1; }
       echo "[payram-deploy] SUCCESS (fake, HOST_UID=$uid)"
-    elif [[ "$all" == *"store list"* ]]; then
-      echo "│ demo-store.myshopify.com │"
     else
       echo "0123456789ab"
     fi ;;

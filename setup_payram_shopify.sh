@@ -7,6 +7,15 @@
 #
 # Usage:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"
+#   … --reset            remove the container, volumes and generated files
+#
+# Unattended runs (CI, an agent): every question has an environment override —
+# PAYRAM_INSTALL_DIR, SHOPIFY_APP_URL, SHOPIFY_STORE_DOMAIN — and a question
+# with nobody to answer it either takes its default or stops and names the
+# variable. A first install additionally needs SHOPIFY_API_KEY (the Client ID
+# of an app created in the Partner Dashboard) or a terminal; the Shopify login
+# itself always needs a person to open the printed link. Values already in .env
+# win over the environment on a re-run — edit .env to change them.
 #
 # =============================================================================
 set -euo pipefail
@@ -57,17 +66,57 @@ for arg in ${INSTALLER_ARGS[@]+"${INSTALLER_ARGS[@]}"}; do
 done
 
 # ── colours ──────────────────────────────────────────────────────────────────
-BOLD="\033[1m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RED="\033[31m"
-RESET="\033[0m"
+# Only when a person is looking. Captured by an agent or written to a log, the
+# escape codes are noise around the one line the reader needs. NO_COLOR honoured.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD="\033[1m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; RED="\033[31m"; RESET="\033[0m"
+else
+  BOLD=""; GREEN=""; YELLOW=""; CYAN=""; RED=""; RESET=""
+fi
 
 info()  { echo -e "${GREEN}[payram]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[payram]${RESET} $*"; }
 step()  { echo -e "\n${CYAN}${BOLD}▶ $*${RESET}"; }
 die()   { echo -e "\n${RED}[payram] ERROR:${RESET} $*\n" >&2; exit 1; }
+
+# ── prompts ──────────────────────────────────────────────────────────────────
+# ask VAR "question" [may-be-empty]
+#
+# Every question goes through here so a run with nobody at the keyboard behaves
+# predictably. `read` on an exhausted stdin returns 1, and under `set -e` that
+# ended the script with no message at all — which is what an agent driving this
+# installer used to see. The rules:
+#   • VAR already set in the environment  → that is the answer, nothing asked
+#     (how automation pre-answers: PAYRAM_INSTALL_DIR=/srv/payram bash setup…)
+#   • a line can be read                  → that is the answer
+#   • nothing to read, empty is allowed   → empty, which callers take as "default"
+#   • nothing to read, an answer required → stop, naming the variable to pre-set
+# When answers do not come from a terminal the question is echoed as well, so a
+# captured log reads as a transcript (`read -p` prints only to a terminal).
+ask() {
+  local var="$1" question="$2" answer="" prompt=""
+  if [ -n "${!var:-}" ]; then
+    echo -e "${question} ${CYAN}${!var}${RESET}  (from environment)"
+    return 0
+  fi
+  if [ -t "$PROMPT_FD" ]; then
+    prompt="$(echo -e "${question}") "
+  else
+    echo -en "${question} "
+  fi
+  if read -u "$PROMPT_FD" -rp "$prompt" answer; then
+    [ -t "$PROMPT_FD" ] || echo "$answer"
+  else
+    echo ""
+    if [ $# -ge 3 ]; then
+      warn "No input available — using the default."
+    else
+      die "No terminal is attached and nothing answered: $(echo -e "${question}")
+  Pre-set ${var} in the environment and re-run."
+    fi
+  fi
+  printf -v "$var" '%s' "$answer"
+}
 
 # ── banner ────────────────────────────────────────────────────────────────────
 echo ""
@@ -88,8 +137,8 @@ echo -e "${RESET}"
 if [ "$RESET_MODE" = true ]; then
   step "Reset — removing all Payram Shopify Connector data"
 
-  read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Install directory to reset${RESET} [${DEFAULT_INSTALL_DIR}]: ")" RESET_DIR
-  RESET_DIR="${RESET_DIR:-$DEFAULT_INSTALL_DIR}"
+  ask PAYRAM_INSTALL_DIR "${BOLD}Install directory to reset${RESET} [${DEFAULT_INSTALL_DIR}]:" may-be-empty
+  RESET_DIR="${PAYRAM_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
   RESET_DIR="${RESET_DIR/#\~/$HOME}"
 
   echo ""
@@ -98,7 +147,8 @@ if [ "$RESET_MODE" = true ]; then
   warn "  • Delete Docker volumes:     payram-shopify-data, payram-shopify-cli-auth"
   warn "  • Delete .env, shopify.app.toml and any leftover deploy files in: ${RESET_DIR}"
   echo ""
-  read -u "$PROMPT_FD" -rp "$(echo -e "${RED}${BOLD}Type 'yes' to confirm reset:${RESET} ")" confirm
+  confirm=""
+  ask confirm "${RED}${BOLD}Type 'yes' to confirm reset:${RESET}" may-be-empty
   [ "$confirm" != "yes" ] && { info "Reset cancelled."; exit 0; }
 
   echo ""
@@ -154,8 +204,8 @@ info "docker $(docker --version | awk '{print $3}' | tr -d ',')"
 # =============================================================================
 step "Install location"
 
-read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Install directory${RESET} [${DEFAULT_INSTALL_DIR}]: ")" INSTALL_DIR
-INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+ask PAYRAM_INSTALL_DIR "${BOLD}Install directory${RESET} [${DEFAULT_INSTALL_DIR}]:" may-be-empty
+INSTALL_DIR="${PAYRAM_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
 mkdir -p "$INSTALL_DIR"
@@ -219,32 +269,42 @@ warn "If using Cloudflare Tunnel, the URL changes on every restart — update it
 warn "Examples: https://your-tunnel.trycloudflare.com  or  https://payram.yourstore.com"
 echo ""
 
+# _read_app_url VAR — asks until VAR holds an https:// URL. It fills the
+# caller's variable rather than echoing the answer: with no terminal attached,
+# ask() writes the question to stdout too, and on a fresh install the variable
+# is SHOPIFY_APP_URL itself, so an unattended run that stops here is told to
+# pre-set the name it actually needs.
 _read_app_url() {
+  local var="$1"
   while true; do
-    read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Public HTTPS App URL (no trailing slash):${RESET} ")" app_url_input
-    app_url_input="${app_url_input%/}"
-    if [ -z "$app_url_input" ]; then
+    ask "$var" "${BOLD}Public HTTPS App URL (no trailing slash):${RESET}"
+    printf -v "$var" '%s' "${!var%/}"
+    if [ -z "${!var}" ]; then
       warn "URL cannot be empty. Enter the full https:// address."
-    elif [[ "$app_url_input" != https://* ]]; then
-      warn "URL must start with https:// — got: ${app_url_input}"
+    elif [[ "${!var}" != https://* ]]; then
+      warn "URL must start with https:// — got: ${!var}"
+      # '%s' with an empty argument, not an empty format: on bash 3.2 the
+      # latter is a no-op and the rejected answer would be asked again forever.
+      printf -v "$var" '%s' ''
     else
-      break
+      return 0
     fi
   done
-  echo "$app_url_input"
 }
 
 if [ -z "${SHOPIFY_APP_URL:-}" ]; then
-  SHOPIFY_APP_URL=$(_read_app_url)
+  _read_app_url SHOPIFY_APP_URL
   set_env SHOPIFY_APP_URL "$SHOPIFY_APP_URL"
 else
   echo -e "  Current App URL: ${CYAN}${SHOPIFY_APP_URL}${RESET}"
-  read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Press Enter to keep it, or type a new URL:${RESET} ")" app_url_update
+  app_url_update=""
+  ask app_url_update "${BOLD}Press Enter to keep it, or type a new URL:${RESET}" may-be-empty
   app_url_update="${app_url_update%/}"
   if [ -n "$app_url_update" ]; then
     if [[ "$app_url_update" != https://* ]]; then
       warn "URL must start with https:// — got: ${app_url_update}"
-      app_url_update=$(_read_app_url)
+      app_url_update=""
+      _read_app_url app_url_update
     fi
     set_env SHOPIFY_APP_URL "$app_url_update"
     SHOPIFY_APP_URL="$app_url_update"
@@ -252,6 +312,19 @@ else
   else
     info "Keeping existing App URL: ${SHOPIFY_APP_URL}"
   fi
+fi
+
+# Who answers the Shopify CLI? Logging in happens in a browser — the CLI prints
+# the link, and the image's xdg-open stub makes sure of that on a headless box.
+# Choosing the organisation and creating the app happen HERE, in the terminal,
+# and an unattended run has nobody to answer: it would sit on that question
+# forever. Say so now, before the image pull and the login, and say what the
+# unattended path is.
+HAS_TERMINAL=false
+if [ -t 0 ] || [ "$PROMPT_FD" = 3 ]; then HAS_TERMINAL=true; fi
+if [ -z "${SHOPIFY_API_KEY:-}" ] && [ "$HAS_TERMINAL" != true ]; then
+  die "First-time setup needs a terminal: the Shopify CLI asks which organisation to use and whether to create the app, and nobody is here to answer.
+  Either run this once from an interactive terminal, or create the app in the Shopify Partner Dashboard first and pre-set SHOPIFY_API_KEY=<its Client ID> — the login link is then the only step that needs a person, and the installer prints it."
 fi
 
 # =============================================================================
@@ -313,12 +386,19 @@ printf '%s\n' \
   > "${INSTALL_DIR}/shopify.app.toml"
 
 if [ -z "${SHOPIFY_API_KEY:-}" ]; then
-  info "A browser login URL will appear below — open it to authenticate."
+  info "A Shopify login link will be printed below — open it in any browser."
   warn "Choose 'Create new app' when prompted for the app."
   echo ""
 else
   info "Re-using existing credentials — redeploying extension to update."
-  info "If auth has expired, a new browser login URL will appear."
+  if [ "$HAS_TERMINAL" = true ]; then
+    info "If the login has expired, a new login link is printed; open it in any browser."
+  else
+    warn "ACTION REQUIRED if the Shopify login has expired: a line starting"
+    warn "'Open this link to start the auth process' and a verification code appear"
+    warn "below. Whoever supervises this run must open that link and sign in; the"
+    warn "installer waits until they do."
+  fi
   echo ""
 fi
 
@@ -387,12 +467,28 @@ fi
 
 # Single Docker run: handles auth (fresh or expired), deploys app + extension,
 # pulls credentials. Works identically on first run and re-runs.
+#
+# XDG_CONFIG_HOME: the CLI keeps its login in $XDG_CONFIG_HOME/shopify-cli-kit-
+# nodejs (default ~/.config/…), NOT in ~/.config/shopify where this volume used
+# to be mounted alone. The volume stayed empty, and every re-run demanded a
+# fresh browser login. Pointing the CLI's config root at the volume is what
+# makes "If the login has expired" the exception rather than the rule.
+#
+# CLOUD_SHELL: when the CLI needs a login it normally prints a verification
+# code, says "Press any key to open the login page on your browser", and does
+# not start waiting for the login until a key is pressed (cli-kit
+# device-authorization.ts). Inside a container the browser can never open; the
+# image's xdg-open stub only prints the URL. And an unattended run has nobody
+# to press the key, so it would hang there. The CLI treats CLOUD_SHELL as a
+# cloud IDE and prints the login link straight away instead, then polls.
 DOCKER_DEPLOY_ARGS=(
   docker run --rm -it
   --user root
   -e "SHOPIFY_APP_URL=${SHOPIFY_APP_URL}"
   -e "HOST_UID=${DEPLOY_OWNER_UID}"
   -e "HOST_GID=${DEPLOY_OWNER_GID}"
+  -e XDG_CONFIG_HOME=/root/.config/shopify
+  -e CLOUD_SHELL=1
   -v payram-shopify-cli-auth:/root/.config/shopify
   -v "${INSTALL_DIR}:/workspace"
   "$DOCKER_IMAGE"
@@ -407,7 +503,15 @@ elif [ "$PROMPT_FD" = 3 ]; then
 else
   command -v script >/dev/null 2>&1 || die "This installer needs a TTY for Shopify login. Install 'script' (util-linux) or run it from an interactive terminal."
   printf -v DOCKER_DEPLOY_CMD '%q ' "${DOCKER_DEPLOY_ARGS[@]}"
-  script -qec "$DOCKER_DEPLOY_CMD" /dev/null || die "App deploy failed. See output above."
+  # Two different programs answer to `script`. util-linux (Linux) takes the
+  # command via -c and runs it with $SHELL; BSD/macOS takes it positionally
+  # after the file and rejects -c outright. Only util-linux knows --version.
+  # The command is %q-quoted for bash, so it must run under bash either way.
+  if script --version >/dev/null 2>&1; then
+    SHELL="$BASH" script -qec "$DOCKER_DEPLOY_CMD" /dev/null || die "App deploy failed. See output above."
+  else
+    script -qe /dev/null "$BASH" -c "$DOCKER_DEPLOY_CMD" || die "App deploy failed. See output above."
+  fi
 fi
 
 rm -f "$DEPLOY_SCRIPT"
@@ -438,6 +542,8 @@ step "Shopify store"
 _normalize_store_domain() {
   local d="$1"
   d="${d// /}"
+  # Shop domains are lower-case; the value goes into the install URL as typed.
+  d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
   d="${d#https://}"
   d="${d#http://}"
   d="${d%/}"
@@ -448,47 +554,14 @@ _normalize_store_domain() {
 }
 
 if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
-  # Try to list available stores via the authenticated CLI session
-  info "Fetching your Shopify stores ..."
-  STORES_RAW=$(docker run --rm \
-    --user root \
-    -v payram-shopify-cli-auth:/root/.config/shopify \
-    "$DOCKER_IMAGE" \
-    sh -c 'timeout 20 npx shopify store list 2>/dev/null || true' 2>/dev/null || true)
-
-  # Extract .myshopify.com domains from CLI table output.
-  # (A read loop rather than mapfile: mapfile is bash 4, macOS ships 3.2.)
-  STORES_ARRAY=()
-  while IFS= read -r store_line; do
-    STORES_ARRAY+=("$store_line")
-  done < <(echo "$STORES_RAW" | grep -oE '[a-zA-Z0-9-]+\.myshopify\.com' | sort -u)
-
-  store_domain_input=""
-
-  if [ "${#STORES_ARRAY[@]}" -gt 0 ]; then
-    echo ""
-    echo -e "  ${BOLD}Your Shopify stores:${RESET}"
-    for i in "${!STORES_ARRAY[@]}"; do
-      echo -e "    ${CYAN}$((i+1))${RESET}) ${STORES_ARRAY[$i]}"
-    done
-    echo ""
-    read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Select store number (or type domain manually):${RESET} ")" store_choice
-    if [[ "$store_choice" =~ ^[0-9]+$ ]] && \
-       [ "$store_choice" -ge 1 ] && \
-       [ "$store_choice" -le "${#STORES_ARRAY[@]}" ]; then
-      store_domain_input="${STORES_ARRAY[$((store_choice-1))]}"
-    else
-      store_domain_input="$store_choice"
-    fi
-  else
-    warn "Could not fetch store list — enter domain manually."
-    read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}Shopify store domain${RESET} (e.g. your-store.myshopify.com): ")" store_domain_input
-  fi
-
-  store_domain_input=$(_normalize_store_domain "$store_domain_input")
-  [ -z "$store_domain_input" ] && die "Store domain cannot be empty."
-  set_env SHOPIFY_STORE_DOMAIN "$store_domain_input"
-  info "Store domain: ${store_domain_input}"
+  # Asked, not discovered. This used to run `shopify store list` in a container
+  # first — a command the CLI does not have — so every install sat through a
+  # 20-second timeout and then "Could not fetch store list" before asking anyway.
+  ask SHOPIFY_STORE_DOMAIN "${BOLD}Shopify store domain${RESET} (e.g. your-store.myshopify.com):"
+  SHOPIFY_STORE_DOMAIN=$(_normalize_store_domain "$SHOPIFY_STORE_DOMAIN")
+  [ -z "$SHOPIFY_STORE_DOMAIN" ] && die "Store domain cannot be empty."
+  set_env SHOPIFY_STORE_DOMAIN "$SHOPIFY_STORE_DOMAIN"
+  info "Store domain: ${SHOPIFY_STORE_DOMAIN}"
 else
   info "SHOPIFY_STORE_DOMAIN already set (${SHOPIFY_STORE_DOMAIN})"
 fi
@@ -498,19 +571,21 @@ fi
 # =============================================================================
 step "Database"
 
-warn "Default is SQLite — fine for small stores. For production use Postgres:"
-warn "  postgresql://user:password@host:5432/dbname"
-echo ""
-
+# The image's Prisma client is generated for SQLite only (prisma/schema.prisma:
+# provider = "sqlite"). This step used to recommend "postgresql://… for
+# production"; a merchant who took that advice got a container that crash-
+# looped at `prisma migrate deploy` with "the URL must start with the protocol
+# file:", and nothing here said why. The database lives in the
+# payram-shopify-data volume — back that volume up along with .env.
 if [ -z "${DATABASE_URL:-}" ]; then
-  read -u "$PROMPT_FD" -rp "$(echo -e "${BOLD}DATABASE_URL${RESET} [Enter for SQLite default]: ")" db_input
-  if [ -z "$db_input" ]; then
-    db_input="file:/data/prod.sqlite"
-    info "Using SQLite at /data/prod.sqlite (mounted into the container)"
-  fi
-  set_env DATABASE_URL "$db_input"
+  set_env DATABASE_URL "file:/data/prod.sqlite"
+  info "SQLite at /data/prod.sqlite, in the payram-shopify-data volume."
+elif [[ "$DATABASE_URL" != file:* ]]; then
+  die "DATABASE_URL uses ${DATABASE_URL%%:*}:… but this image supports SQLite only (file:…).
+  The container would fail at startup while running its migrations. Set
+  DATABASE_URL=file:/data/prod.sqlite in ${ENV_FILE} (or delete the line) and re-run."
 else
-  info "DATABASE_URL already set"
+  info "DATABASE_URL already set (SQLite)"
 fi
 
 # =============================================================================
@@ -837,6 +912,10 @@ fi
 echo ""
 echo -e "  ${CYAN}1.${RESET} Install the app on your Shopify store:"
 echo -e "       ${BOLD}${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/auth?shop=${SHOPIFY_STORE_DOMAIN:-your-store.myshopify.com}${RESET}"
+echo -e "       ${YELLOW}Live store rather than a development store? First open the Partner${RESET}"
+echo -e "       ${YELLOW}Dashboard → Apps → payram-checkout-plugin → Distribution, choose${RESET}"
+echo -e "       ${YELLOW}Custom distribution and enter ${SHOPIFY_STORE_DOMAIN:-your store domain}.${RESET}"
+echo -e "       ${YELLOW}Shopify refuses to install an undistributed app on a live store.${RESET}"
 echo ""
 echo -e "  ${CYAN}2.${RESET} ${BOLD}In your Payram dashboard → project → Webhooks, add:${RESET}"
 echo -e "       ${BOLD}${SHOPIFY_APP_URL:-https://YOUR_DOMAIN}/api/payram/webhook${RESET}"

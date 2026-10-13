@@ -1,3 +1,19 @@
 #!/usr/bin/env bash
-# emulate: script -qec CMD /dev/null
-eval "$2"
+# Emulates both programs that answer to `script`. The default behaves like
+# util-linux (Linux): knows --version, takes the command via -c. With
+# FAKE_SCRIPT_FLAVOR=bsd it behaves like macOS: no --version, rejects -c, and
+# the command comes positionally after the file.
+echo "script $*" >> "$FAKE_LOG"
+case "${FAKE_SCRIPT_FLAVOR:-util-linux}" in
+  bsd)
+    case "$1" in
+      -qe) shift 2; exec "$@" ;;
+      *)   echo "script: illegal option -- ${1#-}" >&2; exit 1 ;;
+    esac ;;
+  *)
+    case "$1" in
+      --version) echo "script from util-linux 2.39"; exit 0 ;;
+      -qec)      eval "$2" ;;
+      *)         echo "script: unexpected arguments: $*" >&2; exit 1 ;;
+    esac ;;
+esac

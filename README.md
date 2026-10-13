@@ -96,13 +96,32 @@ The script will:
 1. Check that Docker is installed and running. It does **not** install Docker for you.
 2. Ask for an install directory (default: `~/payram-shopify-connector`).
 3. Ask for your server's public HTTPS URL.
-4. Show a **Shopify login link** — open it in a browser. The installer then creates (or reuses)
-   the Shopify app under your Partner account and saves its credentials itself. You never copy an
-   API key or secret by hand.
-5. Ask for your store domain and, optionally, a database connection string.
-6. Generate an encryption key with `openssl` (kept on re-runs — back it up).
+4. Print a **Shopify login link** and a verification code — open the link in any browser. The
+   installer then creates (or reuses) the Shopify app under your Partner account and saves its
+   credentials itself. You never copy an API key or secret by hand. The login is kept in a Docker
+   volume, so a re-run does not ask again until it expires.
+5. Ask for your store domain.
+6. Generate an encryption key and a payment-link secret with `openssl` (kept on re-runs — back
+   them up). The database is SQLite in the `payram-shopify-data` volume; back that up too.
 7. Pull `payramapp/payram-shopify:latest`, deploy the checkout block with your server URL built in,
-   and start the container.
+   and start the container, published on `127.0.0.1:2798` only.
+
+#### Running it unattended (CI, an AI agent)
+
+Every question has an environment override — `PAYRAM_INSTALL_DIR`, `SHOPIFY_APP_URL`,
+`SHOPIFY_STORE_DOMAIN` — and a question with nobody to answer it takes its default or stops with
+the name of the variable to set. Colours are off when the output is not a terminal. Two things
+cannot be automated away:
+
+- **A first install needs either a terminal or a Client ID.** The Shopify CLI asks which
+  organisation to use and whether to create the app, and nothing can answer that for you. Either
+  run the first install from a terminal, or create the app in the Partner Dashboard yourself and
+  pass its Client ID as `SHOPIFY_API_KEY`; the installer then fetches the secret itself.
+- **The Shopify login is done by a person.** When it is needed, the output contains
+  `Open this link to start the auth process:` followed by the link and a verification code. Whoever
+  supervises the run opens it; the installer waits.
+
+On a re-run, values already in `.env` win over the environment — edit `.env` to change them.
 
 ---
 
@@ -140,6 +159,11 @@ https://YOUR_DOMAIN/auth?shop=YOUR_STORE.myshopify.com
 ```
 
 Approve the permission request. This installs the app on your store and creates a session.
+
+> **Live store?** A development store installs straight away. For a live store, first open the
+> Partner Dashboard → Apps → *payram-checkout-plugin* → **Distribution**, choose **Custom
+> distribution** and enter your store's `.myshopify.com` domain. Shopify refuses to install an
+> app with no distribution on a live store, and the error it shows does not say why.
 
 ---
 
@@ -237,7 +261,7 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `SHOPIFY_API_KEY` | ✅ | Shopify app Client ID |
 | `SHOPIFY_API_SECRET` | ✅ | Shopify app Client secret. Also the fallback signer for payment links |
 | `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server. Used to build absolute redirects for App Proxy requests |
-| `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
+| `DATABASE_URL` | ✅ | SQLite only: `file:/data/prod.sqlite` in Docker (the installer sets it). The image's Prisma client is built for SQLite; a Postgres URL fails at startup |
 | `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM) |
 | `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards` (do not change) |
 | `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. The installer generates it; set it yourself on a manual install — see the warning below |
