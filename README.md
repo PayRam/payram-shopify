@@ -45,6 +45,7 @@ refund an overpayment as a gift card.
 | Install / configure a store | [Self-Hosted Installation](#self-hosted-installation), [Configuration Reference](#configuration-reference) |
 | Understand what a buyer sees | [The Buyer's Journey](#the-buyers-journey) |
 | Work out why an order looks wrong | [Diagnostics](#diagnostics) |
+| Nothing responds — 404 on every URL | `curl https://YOUR_DOMAIN/healthz` **first**. A 404 there means the hostname is not reaching this container at all, so no amount of app config will help — see [Diagnostics](#symptom--cause--fix) |
 | Update an existing install | [Updating](#updating) |
 | Understand money handling | [Currency Handling](#currency-handling), [Partial and Overpayments](#partial-and-overpayments) |
 | Change settlement behaviour | `app/utils/settlement.server.ts` |
@@ -92,16 +93,52 @@ On your server (Linux or macOS), run:
 
 The script will:
 
-1. Check that Docker is installed and running. It does **not** install Docker for you.
+1. Check that Docker is installed, running, and usable by you. It does **not** install Docker for
+   you. On Linux, a user outside the `docker` group is told so (and how to fix it) rather than
+   told that Docker is down.
 2. Ask for an install directory (default: `~/payram-shopify-connector`).
 3. Ask for your server's public HTTPS URL.
-4. Show a **Shopify login link** — open it in a browser. The installer then creates (or reuses)
-   the Shopify app under your Partner account and saves its credentials itself. You never copy an
-   API key or secret by hand.
-5. Ask for your store domain and, optionally, a database connection string.
-6. Generate an encryption key with `openssl` (kept on re-runs — back it up).
-7. Pull `payramapp/payram-shopify:latest`, deploy the checkout block with your server URL built in,
-   and start the container.
+4. Print a **Shopify login link** and a verification code — open the link in any browser. The
+   installer then creates (or reuses) the Shopify app under your Partner account and saves its
+   credentials itself. You never copy an API key or secret by hand. The login is kept in a Docker
+   volume, so a re-run does not ask again until it expires.
+5. Ask for your store domain.
+6. Generate an encryption key and a payment-link secret with `openssl` (kept on re-runs — back
+   them up). The database is SQLite in the `payram-shopify-data` volume; back that up too.
+7. Pull `payramapp/payram-shopify:latest` and print the connector version it contains, deploy the
+   checkout block with your server URL built in, show a summary of what is about to run, and start
+   the container, published on `127.0.0.1:2798` only.
+
+Paste what you have: the store question accepts the admin URL (`admin.shopify.com/store/<handle>`)
+or the storefront URL and works out the `.myshopify.com` address; a custom domain is refused,
+because Shopify's install flow only accepts the permanent address. The URL question refuses a path
+(the connector owns a whole hostname). `--help` lists the flags and every environment override.
+
+#### Running it unattended (CI, an AI agent)
+
+Every question has an environment override — `PAYRAM_INSTALL_DIR`, `SHOPIFY_APP_URL`,
+`SHOPIFY_STORE_DOMAIN` — and a question with nobody to answer it takes its default or stops with
+the name of the variable to set. Colours are off when the output is not a terminal. Two things
+cannot be automated away:
+
+- **A first install needs either a terminal or a Client ID.** The Shopify CLI asks which
+  organisation to use and whether to create the app, and nothing can answer that for you. Either
+  run the first install from a terminal, or create the app in the Partner Dashboard yourself and
+  pass its Client ID as `SHOPIFY_API_KEY`; the installer then fetches the secret itself.
+- **The Shopify login is done by a person.** When it is needed, the output contains
+  `Open this link to start the auth process:` followed by the link and a verification code. Whoever
+  supervises the run opens it; the installer waits.
+
+On a re-run, values already in `.env` win over the environment — edit `.env` to change them. A
+hand-edited `.env` with Windows line endings or quoted values is normalised first and the run says
+so: Docker's `--env-file` would otherwise pass the `\r` or the quotes into the container as part of
+the value.
+
+Three settings are never asked and live only in `.env`: `CONNECTOR_IMAGE` pins the image to a tag or
+`@sha256` digest instead of following `:latest` (set it in the environment on the first run and it
+is written to `.env`; delete the line to follow `:latest` again), `CONNECTOR_BIND_ADDRESS` chooses
+where port 2798 is published, and `PORT` changes the port itself (read from `.env` only — a `PORT`
+exported by a CI runner is ignored).
 
 ---
 
@@ -139,6 +176,11 @@ https://YOUR_DOMAIN/auth?shop=YOUR_STORE.myshopify.com
 ```
 
 Approve the permission request. This installs the app on your store and creates a session.
+
+> **Live store?** A development store installs straight away. For a live store, first open the
+> Partner Dashboard → Apps → *payram-checkout-plugin* → **Distribution**, choose **Custom
+> distribution** and enter your store's `.myshopify.com` domain. Shopify refuses to install an
+> app with no distribution on a live store, and the error it shows does not say why.
 
 ---
 
@@ -236,17 +278,21 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `SHOPIFY_API_KEY` | ✅ | Shopify app Client ID |
 | `SHOPIFY_API_SECRET` | ✅ | Shopify app Client secret. Also the fallback signer for payment links |
 | `SHOPIFY_APP_URL` | ✅ | Public HTTPS URL of this server. Used to build absolute redirects for App Proxy requests |
-| `DATABASE_URL` | ✅ | SQLite (`file:prod.sqlite`) or Postgres connection string |
-| `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM) |
+| `DATABASE_URL` | ✅ | SQLite only: `file:/data/prod.sqlite` in Docker (the installer sets it). The image's Prisma client is built for SQLite; a Postgres URL fails at startup |
+| `ENCRYPTION_KEY` | ✅ | 64-char hex key encrypting stored Payram API keys (AES-256-GCM). The installer generates it and refuses to start a container whose `.env` holds anything else — the app would only fail at the first Settings save |
 | `SCOPES` | ✅ | `read_orders,write_orders,read_customers,write_customers,write_app_proxy,write_gift_cards` (do not change) |
-| `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. Falls back to `SHOPIFY_API_SECRET` — see the warning below |
-| `PORT` | — | Server port (default `2798`) |
+| `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. The installer generates it; set it yourself on a manual install — see the warning below |
+| `PORT` | — | Server port (default `2798`). The installer publishes and probes the same number; it reads this from `.env` only |
+| `CONNECTOR_BIND_ADDRESS` | — | Installer only. How the port is published: an address (`127.0.0.1` on new installs), `all` (every interface, IPv4+IPv6) or `none` (Docker networks only). A re-run keeps whatever the existing container had |
+| `CONNECTOR_IMAGE` | — | Installer only. Image to run instead of `payramapp/payram-shopify:latest` — a `sha-<commit>` tag or an `@sha256` digest. Set in the environment on a first run it is written here; remove the line to follow `:latest` again |
 | `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
 | `ALLOW_INSECURE_PAYRAM_URL` | — | Dev only. Disables SSRF protection on the Payram URL. **Never set in production** |
 
 > **Set `PAYMENT_LINK_SECRET` explicitly in production.** Without it, links are signed with
 > `SHOPIFY_API_SECRET`, so rotating your Shopify credentials invalidates *every outstanding
-> payment link* — including links held by buyers who have already part-paid.
+> payment link* — including links held by buyers who have already part-paid. The installer
+> does this for you: a fresh install gets a random secret, and an upgrade of an install that
+> never had one pins it to the Shopify secret the outstanding links were already signed with.
 
 The installer (`setup_payram_shopify.sh`) **rewrites `SCOPES` on every run**. If you add a
 scope, change it there too or it will be silently reverted on the next install.
@@ -298,9 +344,12 @@ Shopify has nothing to push. Every merge to `main` publishes a new image automat
 - Accept your existing values when asked. If a Shopify login link appears, open it.
 - **Never pass `--reset`** — that deletes the container, data volume and configuration.
 
-It pulls the latest image, redeploys the checkout block and app permissions, and replaces the
-container. Settings, the saved API key and payment history live in the `payram-shopify-data`
-volume and carry over; database migrations run on start.
+It pulls the latest image (or the one pinned by `CONNECTOR_IMAGE` in `.env`), redeploys the
+checkout block and app permissions, and replaces the container. The old container is kept until
+the new one has been created: if Docker refuses the new one — the port taken, a bad line in
+`.env` — the old one is put back and started, and the run says why. Settings, the saved API key
+and payment history live in the `payram-shopify-data` volume and carry over; database migrations
+run on start.
 
 Afterwards, open the app in Shopify Admin and approve any new permissions.
 
@@ -313,15 +362,23 @@ For releases that change only server code:
 
 ```bash
 docker pull payramapp/payram-shopify:latest
+docker port payram-shopify-connector 2798     # note the address — reuse it in -p below
 docker stop payram-shopify-connector && docker rm payram-shopify-connector
 docker run -d \
   --name payram-shopify-connector \
   --env-file ~/payram-shopify-connector/.env \
-  -p 2798:2798 \
+  -p 127.0.0.1:2798:2798 \
   -v payram-shopify-data:/data \
   --restart unless-stopped \
   payramapp/payram-shopify:latest
 ```
+
+**Keep the binding your container already has.** New installs use `127.0.0.1` so only the
+reverse proxy or tunnel on this host can reach the connector. If `docker port` showed
+`0.0.0.0`, use a bare `-p 2798:2798` (an explicit `0.0.0.0` would drop IPv6). If it showed
+nothing, the connector is reached over a Docker network: omit `-p` and re-run
+`docker network connect <network> payram-shopify-connector` afterwards. Re-running the
+installer does all of this for you and records the result as `CONNECTOR_BIND_ADDRESS` in `.env`.
 
 ### Check which version you're running
 
@@ -330,8 +387,10 @@ docker inspect payram-shopify-connector \
   --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
 ```
 
-This prints the commit the running image was built from. Every image is also published with an
-immutable `sha-<commit>` tag you can pin to instead of `latest`.
+This prints the commit the running image was built from. The installer prints the connector
+version and image digest right after the pull, and the app's Settings page shows the running
+version. Every image is also published with an immutable `sha-<commit>` tag; to stay on one,
+put `CONNECTOR_IMAGE=payramapp/payram-shopify:sha-<commit>` in `.env` and re-run the installer.
 
 > **Installed before May 11, 2026?** Early installers pulled `mason0816/payram-shopify-test`.
 > Re-running the installer moves you to `payramapp/payram-shopify`.
@@ -429,6 +488,7 @@ so in local dev you fill it in yourself: replace `__PAYRAM_REDIRECT_BASE_URL__` 
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/healthz` | Liveness + identity. Returns `{"app":"payram-shopify-connector","ok":true}`. No auth, no database, no version — use it to prove a hostname reaches *this* container |
 | `GET` | `/pay/{token}` | **The buyer-facing payment page.** Status, first payment, top-up, receipt |
 | `POST` | `/api/payram/session` | Quote / create-checkout, called by the payment page |
 | `GET` | `/api/payram/redirect-to-payment` | Entry point from the Thank You block; mints a token and redirects to `/pay/{token}` |
@@ -731,6 +791,71 @@ never silently swallows a discrepancy.
 
 ---
 
+## Where the connector sits on your server
+
+The connector is a separate container listening on **2798**, published on `127.0.0.1` only,
+so the proxy or tunnel is the only way in. Something must terminate HTTPS for its hostname
+and forward to it. That is not optional and the installer does not do it — it is the one
+piece that depends on how your server is already arranged.
+
+**The one rule:** exactly one process owns ports 80 and 443 and routes by hostname.
+
+```
+            Internet
+                │
+        :80 / :443  ──────────────  ONE front door (routes by Host header)
+                │                   terminates TLS for BOTH hostnames
+       ┌────────┴────────┐
+       │                 │
+  pay.example.com   shopify.example.com
+       │                 │
+  Payram container   Connector container
+  (loopback only)    127.0.0.1:2798
+```
+
+### If Payram runs on the same server
+
+Payram's container publishes 80/443 and its bundled nginx is a **catch-all** —
+`listen ... default_server` with `server_name _`, and no `conf.d` include. It answers for
+any hostname you point at the server, which is why a new subdomain silently serves the
+Payram dashboard instead of the connector.
+
+Two consequences:
+
+- **There is no supported place inside that container to add a virtual host.** Its config is
+  baked into the image and replaced on every Payram upgrade.
+- **A host-level nginx block will not help on its own** — port 443 is already taken, and on
+  many installs there is no nginx on the host at all.
+
+Workable topologies, in rough order of robustness:
+
+| Approach | Payram container restart? | Survives a Payram upgrade | Notes |
+|---|---|---|---|
+| **Containerised proxy** (Caddy / nginx / Traefik on 80/443, both apps on a shared Docker network, no published ports) | Yes — re-created without `-p 80`/`-p 443` | Yes, routing is in your own config | Most robust. Caddy also handles certificates for both hostnames. The connector's port is loopback-only on the host, so attach it to the proxy's network (`docker network connect <net> payram-shopify-connector`) and proxy to `http://payram-shopify-connector:2798` |
+| **Host proxy** (Caddy or nginx + certbot on 80/443) | Yes — same reason | Yes | Familiar; Caddy needs the least certificate work |
+| **Tunnel for the connector only** (e.g. Cloudflare Tunnel → `http://localhost:2798`) | **No** | Yes | Leaves Payram untouched and needs no host ports, but your DNS must be on that provider |
+
+Two things that look like solutions and are not:
+
+- **Editing nginx inside the Payram container** — lost on the next upgrade.
+- **Path-prefix routing** (serving the connector under `/shopify/`) — the connector serves
+  absolute paths (`/app`, `/pay/...`, `/auth`, `/api/payram/...`) and has no base-path
+  setting, so it breaks.
+
+Note that Payram's apex sends `Strict-Transport-Security` with `includeSubDomains`, so
+browsers force HTTPS on every subdomain. An HTTP-only connector hostname cannot work, even
+temporarily.
+
+### Working it out on a server you did not set up
+
+[`docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md`](docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md) is a
+prompt to paste into any AI assistant. It is deliberately **discovery-first**: it runs a
+read-only inventory of ports, containers, certificates and DNS, prints what it actually
+found, and is instructed not to suggest a change until that inventory is confirmed. It also
+captures the Payram container's configuration before anything is restarted.
+
+---
+
 ## Diagnostics
 
 Every failure the connector can see is written somewhere observable. Nothing is swallowed.
@@ -768,6 +893,9 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 
 | Symptom | Signal | Cause | Fix |
 |---|---|---|---|
+| **Every connector URL 404s** — the install link, `/pay/...`, the webhook | `curl https://YOUR_DOMAIN/healthz` returns someone else's page, while `curl http://127.0.0.1:2798/healthz` on the server works | **The hostname never reaches the container.** Whatever owns port 443 is answering for it. If Payram runs on the same server, that is Payram's bundled nginx — a deliberate catch-all (`server_name _`) that answers for *every* hostname, so buyers get the dashboard's 404, not the connector's | You need one front door that routes by hostname — see [Where the connector sits on your server](#where-the-connector-sits-on-your-server). Re-running the installer detects which case you are in and prints the right fix. A **502** instead means routing is right and the container is down |
+| Installer says *"Docker is running, but this user is not allowed to use it"* | `docker info` → `permission denied … docker.sock` | Linux default: only root and the `docker` group may use the socket | `sudo usermod -aG docker $USER`, log out and in, re-run. Or run the installer with `sudo` every time — then the install directory is root's |
+| Shopify shows an error page when opening the install link | the link ends in `?shop=<your custom domain>` | `SHOPIFY_STORE_DOMAIN` is a storefront domain; Shopify's install flow accepts only `<handle>.myshopify.com` | Re-run the installer — it now refuses the stored value and asks again; paste your admin URL |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
@@ -784,10 +912,18 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 ### Health checks
 
 ```bash
-npm test          # 99 tests: conversion, settlement, top-ups, tolerance, tokens
+# Is the hostname Shopify calls actually reaching this container?
+curl https://YOUR_DOMAIN/healthz      # => {"app":"payram-shopify-connector","ok":true}
+curl http://127.0.0.1:2798/healthz    # same, run on the server itself
+
+npm test          # unit tests: conversion, settlement, top-ups, tolerance, tokens
 npm run build     # Remix build
 npx prisma migrate deploy   # applies pending migrations (also run by scripts/start.sh)
 ```
+
+If the second command answers and the first does not, the container is healthy and the
+problem is your reverse proxy — not the connector. Anything other than that exact JSON
+from the public URL means the request is being served by a different application.
 
 The app's Settings page has **Test Payram Server** and **Create Test Payment Link** buttons
 that exercise connectivity and the payment API with the saved credentials.
