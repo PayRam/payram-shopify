@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+echo "curl $*" >> "$FAKE_LOG"
+url="${*: -1}"
+if [[ "$url" == http://127.0.0.1:*/* ]]; then echo '{"app":"payram-shopify-connector","ok":true}'; exit 0; fi
+if [ -n "${FAKE_URL_UNREACHABLE:-}" ]; then echo '<html>404</html>'; exit 22; fi
+echo '{"app":"payram-shopify-connector","ok":true}'
