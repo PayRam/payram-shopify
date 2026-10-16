@@ -8,6 +8,7 @@
 # Usage:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)"
 #   … --reset            remove the container, volumes and generated files
+#   … --help             usage and every environment override
 #
 # Unattended runs (CI, an agent): every question has an environment override —
 # PAYRAM_INSTALL_DIR, SHOPIFY_APP_URL, SHOPIFY_STORE_DOMAIN — and a question
@@ -16,6 +17,11 @@
 # of an app created in the Partner Dashboard) or a terminal; the Shopify login
 # itself always needs a person to open the printed link. Values already in .env
 # win over the environment on a re-run — edit .env to change them.
+#
+# Settings that live in .env and are never asked: CONNECTOR_IMAGE (pin a tag or
+# @sha256 digest instead of following :latest), CONNECTOR_BIND_ADDRESS (where
+# the port is published — see "Where the container listens"), PORT (the port
+# the connector listens on; published and probed under the same number).
 #
 # =============================================================================
 set -euo pipefail
@@ -26,9 +32,17 @@ set -euo pipefail
 # and chmod-ing it afterwards leaves a window in which it is world-readable.
 umask 077
 
-DOCKER_IMAGE="payramapp/payram-shopify:latest"
+# Service managers, cron and some CI runners start jobs without HOME; under
+# `set -u` the default install directory below would abort the run before the
+# first message. Ask the account database, else fall back to the current dir.
+if [ -z "${HOME:-}" ]; then
+  HOME="$(cd ~ 2>/dev/null || true; pwd)"
+  export HOME
+fi
+
+DEFAULT_DOCKER_IMAGE="payramapp/payram-shopify:latest"
 DEFAULT_INSTALL_DIR="$HOME/payram-shopify-connector"
-CONTAINER_PORT=2798
+DEFAULT_CONTAINER_PORT=2798
 # Only the reverse proxy or tunnel should be able to reach the connector; the
 # public entry point is always HTTPS on 443. See "Where the container listens".
 DEFAULT_BIND_ADDRESS="127.0.0.1"
@@ -59,9 +73,33 @@ if [[ "${0:-}" == --* ]]; then
   INSTALLER_ARGS=("$0" ${INSTALLER_ARGS[@]+"${INSTALLER_ARGS[@]}"})
 fi
 
+usage() {
+  cat <<USAGE
+Payram Shopify Connector installer
+
+  /bin/bash -c "\$(curl -fsSL https://raw.githubusercontent.com/PayRam/payram-shopify/main/setup_payram_shopify.sh)" [--reset]
+
+  (no flag)   install, or upgrade an existing install in place (re-run the same command)
+  --reset     stop the connector, delete its volumes and generated files
+  --help      this text
+
+Environment overrides, for unattended runs (values already in .env win on a re-run):
+  PAYRAM_INSTALL_DIR     install directory        (default ~/payram-shopify-connector)
+  SHOPIFY_APP_URL        public https:// URL of the connector
+  SHOPIFY_STORE_DOMAIN   <store>.myshopify.com
+  SHOPIFY_API_KEY        Client ID of an app created in the Partner Dashboard (first install only)
+  CONNECTOR_IMAGE        image to run              (default payramapp/payram-shopify:latest)
+  NO_COLOR               plain output
+USAGE
+}
+
 for arg in ${INSTALLER_ARGS[@]+"${INSTALLER_ARGS[@]}"}; do
   case "$arg" in
     --reset) RESET_MODE=true ;;
+    --help|-h) usage; exit 0 ;;
+    # An unrecognised flag is almost always a typo of --reset; installing
+    # instead would be the one thing the person did not ask for.
+    -*) echo "Unknown option: ${arg}" >&2; echo "" >&2; usage >&2; exit 2 ;;
   esac
 done
 
@@ -195,7 +233,30 @@ command -v docker >/dev/null 2>&1 || die "Docker is required but not installed.
 command -v curl    >/dev/null 2>&1 || die "curl is required but not installed."
 command -v openssl >/dev/null 2>&1 || die "openssl is required but not installed."
 
-docker info >/dev/null 2>&1 || die "Docker is installed but not running. Start Docker and try again."
+# `docker info` fails for two unrelated reasons that used to get one message:
+# the daemon is down, or (the Linux default) this user may not open its socket.
+# Telling someone whose Docker is running fine to "start Docker" sends them
+# the wrong way; the usual next move is to retry under sudo, which then puts
+# the install directory in /root and ties every future re-run to sudo too.
+if ! docker_error="$(docker info 2>&1 >/dev/null)"; then
+  docker_error="${docker_error%%$'\n'*}"
+  case "$docker_error" in
+    *ermission\ denied*)
+      die "Docker is running, but this user is not allowed to use it:
+  ${docker_error}
+  Add yourself to the docker group, then log out and back in:
+      sudo usermod -aG docker ${SUDO_USER:-$(id -un)}
+  (or run this installer with sudo every time — the install directory and .env
+  are then owned by root)." ;;
+    *)
+      die "Docker is installed but not running. Start Docker and try again.
+  (docker info said: ${docker_error})" ;;
+  esac
+fi
+if [ -n "${SUDO_USER:-}" ]; then
+  warn "Running under sudo: the files go to ${DEFAULT_INSTALL_DIR} owned by root,"
+  warn "and every re-run needs sudo as well."
+fi
 
 info "docker $(docker --version | awk '{print $3}' | tr -d ',')"
 
@@ -228,11 +289,30 @@ ENV_FILE="${INSTALL_DIR}/.env"
 [ -f "$ENV_FILE" ] || : > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
+# Docker's --env-file hands each line to the container verbatim. Two things a
+# hand edit commonly introduces therefore end up INSIDE the variable: a \r from
+# a Windows editor, and quotes around the value (the dotenv habit). The app then
+# fails on an app URL that ends in a carriage return or starts with a quote,
+# and nothing in its log says why. Read the file the way the container will
+# see it, remember what needs fixing, and rewrite those lines after loading.
+ENV_HAS_CR=false
+ENV_QUOTED_KEYS=""
 load_env() {
-  while IFS='=' read -r key value; do
-    [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-    value="${value%\"}"
-    value="${value#\"}"
+  local line key value
+  # `|| [ -n "$line" ]`: a last line without a newline is still a line.
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" != "${line%$'\r'}" ]; then
+      line="${line%$'\r'}"
+      ENV_HAS_CR=true
+    fi
+    case "$line" in ''|\#*) continue ;; esac
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ "$value" == \"*\" || "$value" == \'*\' ]] && [ "${#value}" -ge 2 ]; then
+      value="${value:1:${#value}-2}"
+      ENV_QUOTED_KEYS="${ENV_QUOTED_KEYS} ${key}"
+    fi
     export "$key=$value" 2>/dev/null || true
   done < "$ENV_FILE"
 }
@@ -255,6 +335,39 @@ set_env() {
 
 load_env
 
+if [ "$ENV_HAS_CR" = true ] || [ -n "$ENV_QUOTED_KEYS" ]; then
+  warn "Normalising ${ENV_FILE}:${ENV_HAS_CR:+ Windows line endings}${ENV_QUOTED_KEYS:+ quoted values (${ENV_QUOTED_KEYS# })}"
+  warn "— Docker would pass both into the container as part of the value."
+  if [ "$ENV_HAS_CR" = true ]; then
+    env_tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+    tr -d '\r' < "$ENV_FILE" > "$env_tmp"
+    chmod 600 "$env_tmp"
+    mv -f "$env_tmp" "$ENV_FILE"
+  fi
+  for key in $ENV_QUOTED_KEYS; do
+    set_env "$key" "${!key}"
+  done
+fi
+
+# CONNECTOR_IMAGE pins the image — a version tag or an @sha256 digest — instead
+# of following :latest. From the environment on a first run it is written to
+# .env, so the pin holds on every re-run until the line is removed. Hosts that
+# must not move until someone decides so get a pin; everyone else gets :latest.
+DOCKER_IMAGE="${CONNECTOR_IMAGE:-$DEFAULT_DOCKER_IMAGE}"
+if [ -n "${CONNECTOR_IMAGE:-}" ]; then
+  grep -q '^CONNECTOR_IMAGE=' "$ENV_FILE" || set_env CONNECTOR_IMAGE "$CONNECTOR_IMAGE"
+  info "Image pinned by CONNECTOR_IMAGE: ${DOCKER_IMAGE} (remove the line from .env to follow :latest)"
+fi
+
+# PORT is read from .env only, never from the caller's environment: CI runners
+# and PaaS shells commonly export an unrelated PORT. Inside the container the
+# entrypoint listens on it, so publish and probe the same number on the host.
+env_port="$(grep '^PORT=' "$ENV_FILE" | cut -d= -f2- || true)"
+CONTAINER_PORT="${env_port:-$DEFAULT_CONTAINER_PORT}"
+if ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] || [ "$CONTAINER_PORT" -lt 1 ] || [ "$CONTAINER_PORT" -gt 65535 ]; then
+  die "PORT in ${ENV_FILE} is '${CONTAINER_PORT}', which is not a port number."
+fi
+
 # A Shopify secret already on disk means this is a re-run of an existing
 # install. Step 8 uses that to keep outstanding payment links valid.
 PREVIOUS_API_SECRET="${SHOPIFY_API_SECRET:-}"
@@ -274,21 +387,36 @@ echo ""
 # ask() writes the question to stdout too, and on a fresh install the variable
 # is SHOPIFY_APP_URL itself, so an unattended run that stops here is told to
 # pre-set the name it actually needs.
+# _app_url_problem URL — prints why URL cannot be the app URL; nothing if it can.
+# The connector owns a whole hostname: Shopify calls /auth, /webhooks and
+# /api/payram/… directly under it and the app proxy adds no prefix, so a URL
+# with a path would "work" in the browser and 404 for every Shopify callback.
+_app_url_problem() {
+  local url="$1" host="${1#https://}"
+  if [ -z "$url" ]; then
+    echo "URL cannot be empty. Enter the full https:// address."
+  elif [[ "$url" != https://* ]]; then
+    echo "URL must start with https:// — got: ${url}"
+  elif [[ "$host" == */* || "$host" == *\?* || "$host" == *\#* ]]; then
+    echo "The connector must be served at the root of its hostname — no path. Got: ${url}
+  Use https://${host%%[/?#]*} and route that whole hostname to the connector."
+  elif [[ "$host" != *.* || "$host" == localhost* || "$host" == 127.* ]]; then
+    echo "Shopify and your buyers must reach this URL from the internet — got: ${url}"
+  fi
+}
+
 _read_app_url() {
-  local var="$1"
+  local var="$1" problem
   while true; do
     ask "$var" "${BOLD}Public HTTPS App URL (no trailing slash):${RESET}"
+    printf -v "$var" '%s' "${!var//[[:space:]]/}"
     printf -v "$var" '%s' "${!var%/}"
-    if [ -z "${!var}" ]; then
-      warn "URL cannot be empty. Enter the full https:// address."
-    elif [[ "${!var}" != https://* ]]; then
-      warn "URL must start with https:// — got: ${!var}"
-      # '%s' with an empty argument, not an empty format: on bash 3.2 the
-      # latter is a no-op and the rejected answer would be asked again forever.
-      printf -v "$var" '%s' ''
-    else
-      return 0
-    fi
+    problem="$(_app_url_problem "${!var}")"
+    [ -z "$problem" ] && return 0
+    warn "$problem"
+    # '%s' with an empty argument, not an empty format: on bash 3.2 the
+    # latter is a no-op and the rejected answer would be asked again forever.
+    printf -v "$var" '%s' ''
   done
 }
 
@@ -299,10 +427,12 @@ else
   echo -e "  Current App URL: ${CYAN}${SHOPIFY_APP_URL}${RESET}"
   app_url_update=""
   ask app_url_update "${BOLD}Press Enter to keep it, or type a new URL:${RESET}" may-be-empty
+  app_url_update="${app_url_update//[[:space:]]/}"
   app_url_update="${app_url_update%/}"
   if [ -n "$app_url_update" ]; then
-    if [[ "$app_url_update" != https://* ]]; then
-      warn "URL must start with https:// — got: ${app_url_update}"
+    problem="$(_app_url_problem "$app_url_update")"
+    if [ -n "$problem" ]; then
+      warn "$problem"
       app_url_update=""
       _read_app_url app_url_update
     fi
@@ -332,7 +462,15 @@ fi
 # =============================================================================
 step "Pulling Docker image"
 info "Pulling ${DOCKER_IMAGE} ..."
-docker pull "$DOCKER_IMAGE"
+docker pull "$DOCKER_IMAGE" || die "Could not pull ${DOCKER_IMAGE}.
+  Check this machine's network access (and Docker Hub's pull rate limit), then re-run."
+# Say which build this is. The image bakes its version into the environment
+# (PAYRAM_VERSION) and the registry digest pins the exact bytes — the two things
+# support asks for first, and the only way to tell two ":latest" pulls apart.
+IMAGE_VERSION="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DOCKER_IMAGE" 2>/dev/null | sed -n 's/^PAYRAM_VERSION=//p')"
+IMAGE_DIGEST="$(docker image inspect -f '{{index .RepoDigests 0}}' "$DOCKER_IMAGE" 2>/dev/null || true)"
+IMAGE_DIGEST="${IMAGE_DIGEST##*@sha256:}"
+info "Connector ${IMAGE_VERSION:-(version not recorded in image)}${IMAGE_DIGEST:+ — image sha256:${IMAGE_DIGEST:0:12}}"
 
 # =============================================================================
 # STEP 5 — Shopify app credentials (via CLI)
@@ -422,26 +560,29 @@ fi
 
 sed -i "s|__PAYRAM_REDIRECT_BASE_URL__|${APP_URL}|g" /app/extensions/thank-you-block/src/Checkout.tsx
 cp /workspace/shopify.app.toml /app/shopify.app.toml
+CLIENT_ID_BEFORE=$(grep '^client_id' /app/shopify.app.toml | sed 's/.*= *//' | tr -d '"' | tr -d "'")
 # Save our desired toml (with app_proxy) before the link step overwrites it.
-# shopify app deploy internally runs 'app config link' on first run, which
-# pulls the remote config (no proxy) and overwrites the toml.
+# With an empty client_id the CLI treats the config as unlinked, runs 'app
+# config link' inside deploy, and that pulls the remote config (no proxy)
+# over the toml. A non-empty client_id is all it checks for "linked" (cli
+# 3.94, active-config.ts), so on a re-run the toml is never touched.
 cp /app/shopify.app.toml /app/shopify.app.desired.toml
-# First deploy: handles interactive auth + link (may overwrite toml) + extension deploy
+# Deploy: login if needed, link on a first run, then app config + extension.
 npx shopify app deploy --allow-updates
-# Extract the client_id that was written to the toml during linking.
-LINKED_CLIENT_ID=$(grep '^client_id' /app/shopify.app.toml | sed 's/.*= *//' | tr -d '"' | tr -d "'")
-# Restore our desired toml with the proxy section, and inject the real client_id
-# so the second deploy is fully non-interactive.
-cp /app/shopify.app.desired.toml /app/shopify.app.toml
-if [ -n "$LINKED_CLIENT_ID" ]; then
-  sed -i "s/^client_id = .*/client_id = \"${LINKED_CLIENT_ID}\"/" /app/shopify.app.toml
+if [ -z "$CLIENT_ID_BEFORE" ]; then
+  # First run only: put our toml back with the client_id the link produced
+  # and deploy once more so Shopify holds the app_proxy section. On a re-run
+  # the deploy above already carried it, and a second one would only add a
+  # duplicate app version — and a minute — to every upgrade.
+  LINKED_CLIENT_ID=$(grep '^client_id' /app/shopify.app.toml | sed 's/.*= *//' | tr -d '"' | tr -d "'")
+  cp /app/shopify.app.desired.toml /app/shopify.app.toml
+  if [ -n "$LINKED_CLIENT_ID" ]; then
+    sed -i "s/^client_id = .*/client_id = \"${LINKED_CLIENT_ID}\"/" /app/shopify.app.toml
+  fi
+  echo '[payram-deploy] Second deploy app_proxy section:'
+  grep -A3 '^\[app_proxy\]' /app/shopify.app.toml || true
+  npx shopify app deploy --allow-updates
 fi
-# Second deploy: non-interactive (auth cached, client_id set).
-# Print the exact proxy config we are about to deploy so the installer output
-# shows whether the correct app_proxy block is present before Shopify sees it.
-echo '[payram-deploy] Second deploy app_proxy section:'
-grep -A3 '^\[app_proxy\]' /app/shopify.app.toml || true
-npx shopify app deploy --allow-updates
 npx shopify app env pull
 # This container runs as root; the merchant's shell does not. Hand the files
 # back owned by the invoking user so they can be read with mode 600 — the
@@ -481,6 +622,24 @@ fi
 # image's xdg-open stub only prints the URL. And an unattended run has nobody
 # to press the key, so it would hang there. The CLI treats CLOUD_SHELL as a
 # cloud IDE and prints the login link straight away instead, then polls.
+# The install directory is bind-mounted into the deploy container. Two hosts
+# refuse that silently: SELinux in enforcing mode (Fedora, RHEL, Rocky) labels
+# the directory so the container gets "permission denied" on its own script —
+# `:z` asks Docker to relabel it as shared — and Docker Desktop on macOS only
+# shares a few top-level directories, failing the mount for anything else.
+WORKSPACE_MOUNT="${INSTALL_DIR}:/workspace"
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+  WORKSPACE_MOUNT="${WORKSPACE_MOUNT}:z"
+fi
+if [ "$(uname -s)" = Darwin ]; then
+  case "$INSTALL_DIR" in
+    /Users/*|/Volumes/*|/private/*|/tmp/*|/var/folders/*) ;;
+    *) warn "Docker Desktop shares only /Users, /Volumes, /private and /tmp by default."
+       warn "If the next step fails to mount ${INSTALL_DIR}, add it under"
+       warn "Docker Desktop → Settings → Resources → File sharing, and re-run." ;;
+  esac
+fi
+
 DOCKER_DEPLOY_ARGS=(
   docker run --rm -it
   --user root
@@ -490,7 +649,7 @@ DOCKER_DEPLOY_ARGS=(
   -e XDG_CONFIG_HOME=/root/.config/shopify
   -e CLOUD_SHELL=1
   -v payram-shopify-cli-auth:/root/.config/shopify
-  -v "${INSTALL_DIR}:/workspace"
+  -v "$WORKSPACE_MOUNT"
   "$DOCKER_IMAGE"
   sh /workspace/.payram-deploy.sh
 )
@@ -539,27 +698,44 @@ set_env SCOPES "read_orders,write_orders,read_customers,write_customers,write_ap
 # =============================================================================
 step "Shopify store"
 
+# Shopify's install flow (/auth?shop=…) accepts only the store's permanent
+# <handle>.myshopify.com address, never the custom storefront domain. Accept
+# what people actually paste — the admin URL (admin.shopify.com/store/<handle>),
+# a storefront URL with a path, upper case, or just the handle — and reduce it.
 _normalize_store_domain() {
   local d="$1"
-  d="${d// /}"
-  # Shop domains are lower-case; the value goes into the install URL as typed.
+  d="${d//[[:space:]]/}"
   d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
   d="${d#https://}"
   d="${d#http://}"
-  d="${d%/}"
-  if [[ "$d" != *.* ]]; then
+  d="${d#admin.shopify.com/store/}"
+  d="${d%%/*}"
+  if [ -n "$d" ] && [[ "$d" != *.* ]]; then
     d="${d}.myshopify.com"
   fi
   echo "$d"
 }
+_is_store_domain() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*\.myshopify\.com$ ]]; }
 
+if [ -n "${SHOPIFY_STORE_DOMAIN:-}" ] && ! _is_store_domain "$SHOPIFY_STORE_DOMAIN"; then
+  # Older installers stored whatever was typed, custom domains included; the
+  # install URL built from that is refused by Shopify with no useful message.
+  warn "SHOPIFY_STORE_DOMAIN in .env is ${SHOPIFY_STORE_DOMAIN}, which Shopify will not accept in the install URL."
+  SHOPIFY_STORE_DOMAIN=""
+fi
 if [ -z "${SHOPIFY_STORE_DOMAIN:-}" ]; then
   # Asked, not discovered. This used to run `shopify store list` in a container
   # first — a command the CLI does not have — so every install sat through a
   # 20-second timeout and then "Could not fetch store list" before asking anyway.
-  ask SHOPIFY_STORE_DOMAIN "${BOLD}Shopify store domain${RESET} (e.g. your-store.myshopify.com):"
-  SHOPIFY_STORE_DOMAIN=$(_normalize_store_domain "$SHOPIFY_STORE_DOMAIN")
-  [ -z "$SHOPIFY_STORE_DOMAIN" ] && die "Store domain cannot be empty."
+  while true; do
+    ask SHOPIFY_STORE_DOMAIN "${BOLD}Shopify store domain${RESET} (e.g. your-store.myshopify.com):"
+    SHOPIFY_STORE_DOMAIN=$(_normalize_store_domain "$SHOPIFY_STORE_DOMAIN")
+    _is_store_domain "$SHOPIFY_STORE_DOMAIN" && break
+    warn "Shopify needs the store's .myshopify.com address${SHOPIFY_STORE_DOMAIN:+ — got: ${SHOPIFY_STORE_DOMAIN}}."
+    warn "Find it in Shopify Admin → Settings → Domains, or paste your admin URL"
+    warn "(admin.shopify.com/store/<handle>) and the address is worked out from it."
+    SHOPIFY_STORE_DOMAIN=""
+  done
   set_env SHOPIFY_STORE_DOMAIN "$SHOPIFY_STORE_DOMAIN"
   info "Store domain: ${SHOPIFY_STORE_DOMAIN}"
 else
@@ -597,8 +773,16 @@ if [ -z "${ENCRYPTION_KEY:-}" ]; then
   set_env ENCRYPTION_KEY "$(openssl rand -hex 32)"
   warn "Auto-generated ENCRYPTION_KEY written to .env"
   warn "Back this up — losing it makes stored merchant API keys unrecoverable."
-else
+elif [[ "$ENCRYPTION_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
   info "ENCRYPTION_KEY already set"
+else
+  # The app wants exactly 32 bytes as hex and throws on anything else — at the
+  # first Settings save, not at startup, so the container looks healthy and the
+  # merchant finds out when they try to enter their Payram API key.
+  die "ENCRYPTION_KEY in ${ENV_FILE} is not a 64-character hex string (it has ${#ENCRYPTION_KEY} characters).
+  The connector cannot encrypt or decrypt Payram API keys with it. Generate one with
+      openssl rand -hex 32
+  and put it in .env. Any API key saved under the old value must be re-entered in the app's Settings."
 fi
 
 # Payment links (/pay/{token}) are signed with PAYMENT_LINK_SECRET and, when it
@@ -696,20 +880,65 @@ EXTRA_NETWORKS=$(docker inspect \
   -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' \
   payram-shopify-connector 2>/dev/null | grep -vx -e bridge -e host -e none || true)
 
-# Stop + remove any existing container with the same name
+case "$CONNECTOR_BIND_ADDRESS" in
+  none) BIND_DESCRIPTION="not published — Docker networks only" ;;
+  all)  BIND_DESCRIPTION="every interface, IPv4 and IPv6" ;;
+  *)    BIND_DESCRIPTION="${CONNECTOR_BIND_ADDRESS} only" ;;
+esac
+# One screen that shows what is about to run. It is where a typo in the URL
+# or the wrong store gets caught, and in an unattended log it is the record.
+echo ""
+echo -e "  ${BOLD}Starting with:${RESET}"
+echo -e "    Install directory   ${INSTALL_DIR}"
+echo -e "    App URL             ${SHOPIFY_APP_URL}"
+echo -e "    Store               ${SHOPIFY_STORE_DOMAIN}"
+echo -e "    Image               ${DOCKER_IMAGE}${IMAGE_VERSION:+  (connector ${IMAGE_VERSION})}"
+echo -e "    Port ${CONTAINER_PORT}           ${BIND_DESCRIPTION}"
+echo -e "    Database            SQLite, volume payram-shopify-data"
+echo ""
+
+# Replace the existing container, but keep it until the new one exists. If
+# `docker run` is refused — the port taken by something else, a bad line in
+# .env — the old container goes back under its name and is started again, so
+# a failed upgrade leaves the merchant where they were rather than with nothing.
+REPLACED_CONTAINER=""
 if docker ps -a --format '{{.Names}}' | grep -q '^payram-shopify-connector$'; then
   warn "Existing container found — stopping and replacing it ..."
   docker stop payram-shopify-connector >/dev/null
-  docker rm payram-shopify-connector >/dev/null
+  # A leftover from a run whose restore failed would make this rename refuse.
+  docker rm -f payram-shopify-connector-replaced >/dev/null 2>&1 || true
+  docker rename payram-shopify-connector payram-shopify-connector-replaced >/dev/null
+  REPLACED_CONTAINER=payram-shopify-connector-replaced
 fi
 
-docker run -d \
-  --name payram-shopify-connector \
-  --env-file "${ENV_FILE}" \
-  ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
-  -v payram-shopify-data:/data \
-  --restart unless-stopped \
-  "$DOCKER_IMAGE"
+if ! run_error="$(docker run -d \
+    --name payram-shopify-connector \
+    --env-file "${ENV_FILE}" \
+    ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
+    -v payram-shopify-data:/data \
+    --restart unless-stopped \
+    "$DOCKER_IMAGE" 2>&1 >/dev/null)"; then
+  warn "Docker refused to start the connector:"
+  warn "  ${run_error}"
+  if [ -n "$REPLACED_CONTAINER" ]; then
+    docker rm -f payram-shopify-connector >/dev/null 2>&1 || true
+    if docker rename "$REPLACED_CONTAINER" payram-shopify-connector >/dev/null 2>&1 \
+       && docker start payram-shopify-connector >/dev/null 2>&1; then
+      warn "Your previous container is back and running — nothing has changed for buyers."
+    else
+      warn "Could not restore the previous container; it is still there as ${REPLACED_CONTAINER}."
+    fi
+  fi
+  case "$run_error" in
+    *"port is already allocated"*|*"address already in use"*)
+      die "Port ${CONTAINER_PORT} (${BIND_DESCRIPTION}) is in use by something else.
+  Find it with:  sudo lsof -iTCP:${CONTAINER_PORT} -sTCP:LISTEN    (or: docker ps)
+  Stop it, or set CONNECTOR_BIND_ADDRESS in ${ENV_FILE} to another address, and re-run." ;;
+    *)
+      die "Fix the error above and re-run this installer." ;;
+  esac
+fi
+[ -z "$REPLACED_CONTAINER" ] || docker rm "$REPLACED_CONTAINER" >/dev/null 2>&1 || true
 
 for net in $EXTRA_NETWORKS; do
   if docker network connect "$net" payram-shopify-connector >/dev/null 2>&1; then
@@ -812,7 +1041,7 @@ else
       echo -e "  ${CYAN}What you need${RESET} is one front door that routes by hostname:"
       echo ""
       echo -e "      :443  ──  front door  ──┬──  ${FRONT_DOOR} container      (PayRam dashboard)"
-      echo -e "                              └──  127.0.0.1:2798           (this connector)"
+      echo -e "                              └──  127.0.0.1:${CONTAINER_PORT}           (this connector)"
       echo ""
       echo -e "  ${CYAN}Three ways to get there${RESET} — pick based on your tolerance for restarting"
       echo -e "  the gateway:"
@@ -829,7 +1058,7 @@ else
       echo -e "    ${BOLD}2. Host proxy${RESET} (Caddy is simplest — it gets certificates for both"
       echo -e "       hostnames automatically). Same requirement: free up 80/443 first."
       echo -e "    ${BOLD}3. Cloudflare Tunnel${RESET} for ${APP_HOST} only, pointed at"
-      echo -e "       http://localhost:2798. Needs no host ports and leaves the ${FRONT_DOOR}"
+      echo -e "       http://localhost:${CONTAINER_PORT}. Needs no host ports and leaves the ${FRONT_DOOR}"
       echo -e "       container untouched — but your DNS must be on Cloudflare."
       echo ""
       echo -e "  ${YELLOW}Before re-creating the ${FRONT_DOOR} container, save its current${RESET}"
@@ -852,7 +1081,7 @@ else
         server_name ${APP_HOST};
 
         location / {
-            proxy_pass         http://127.0.0.1:2798;
+            proxy_pass         http://127.0.0.1:${CONTAINER_PORT};
             proxy_http_version 1.1;
             proxy_set_header   Host              \$host;
             proxy_set_header   X-Real-IP         \$remote_addr;
@@ -869,12 +1098,12 @@ NGINX
       echo -e "    nginx -t && systemctl reload nginx"
       echo -e "    certbot --nginx -d ${APP_HOST}        ${YELLOW}# adds HTTPS${RESET}"
     else
-      warn "Cause: nothing on this server is routing ${BOLD}${APP_HOST}${RESET} to port 2798."
+      warn "Cause: nothing on this server is routing ${BOLD}${APP_HOST}${RESET} to port ${CONTAINER_PORT}."
       echo ""
       echo -e "  No reverse proxy was found on the host. You need something that"
-      echo -e "  terminates HTTPS for ${APP_HOST} and forwards to ${BOLD}127.0.0.1:2798${RESET} —"
+      echo -e "  terminates HTTPS for ${APP_HOST} and forwards to ${BOLD}127.0.0.1:${CONTAINER_PORT}${RESET} —"
       echo -e "  Caddy (gets certificates automatically), nginx + certbot, or a"
-      echo -e "  Cloudflare Tunnel pointed at http://localhost:2798."
+      echo -e "  Cloudflare Tunnel pointed at http://localhost:${CONTAINER_PORT}."
       echo ""
       echo -e "  ${CYAN}Full step-by-step diagnostic${RESET} (paste into any AI assistant):"
       echo -e "      ${BOLD}docs/REVERSE-PROXY-DIAGNOSTIC-PROMPT.md${RESET} in the connector repo"
@@ -884,7 +1113,7 @@ NGINX
     echo -e "  ${CYAN}Verify once routing is in place:${RESET} curl ${APP_URL}/healthz"
     echo -e "    Expected: ${BOLD}{\"app\":\"payram-shopify-connector\",\"ok\":true}${RESET}"
     echo ""
-    warn "Using a Cloudflare Tunnel already? Check it points at http://localhost:2798"
+    warn "Using a Cloudflare Tunnel already? Check it points at http://localhost:${CONTAINER_PORT}"
     warn "and is running. If the tunnel blocks this server from calling its own"
     warn "public hostname, the check above can fail even though buyers can reach"
     warn "it — confirm with the curl from your laptop before changing anything."
@@ -938,4 +1167,6 @@ echo -e "  ${CYAN}Manage container:${RESET}"
 echo -e "       docker logs payram-shopify-connector"
 echo -e "       docker stop payram-shopify-connector"
 echo -e "       docker start payram-shopify-connector"
+echo -e "       Upgrade:  re-run the install command — everything in .env is kept."
+echo -e "       Back up:  ${ENV_FILE} and the payram-shopify-data volume."
 echo ""
