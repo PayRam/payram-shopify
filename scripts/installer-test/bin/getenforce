@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# SELinux mode: Permissive unless a scenario sets FAKE_SELINUX=Enforcing
+echo "getenforce" >> "$FAKE_LOG"
+echo "${FAKE_SELINUX:-Permissive}"
