@@ -20,8 +20,16 @@ FROM node:26.12.1-alpine3.24 AS builder
 
 WORKDIR /app
 
-# Install OS deps needed by some npm packages (e.g. native crypto bindings)
-RUN apk add --no-cache python3 make g++
+# Install OS deps needed by some npm packages (e.g. native crypto bindings).
+#
+# openssl is here for `prisma generate`, not for the build. Prisma picks the
+# "native" engine by running `openssl version`. Without the binary it guesses
+# OpenSSL 1.1, while the runner stage below has OpenSSL 3. On amd64 the explicit
+# linux-musl-openssl-3.0.x target in schema.prisma covered the gap. On arm64
+# nothing did: the image shipped only an openssl-1.1.x engine, and the app failed
+# at startup with "Prisma session table does not exist". /healthz never touches
+# the database, so it stayed green.
+RUN apk add --no-cache python3 make g++ openssl
 
 # Copy manifests first for better layer caching
 COPY package.json package-lock.json ./
