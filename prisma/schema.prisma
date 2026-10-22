@@ -56,6 +56,13 @@ model MerchantConfig {
   // update exists matters, but it is the merchant's call to make, so the
   // dashboard offers it explicitly instead of assuming consent.
   updateChecksEnabled          Boolean  @default(false)
+  // When this shop first received a Payram webhook correctly signed with the
+  // saved API key (X-Payram-Signature, sent by payram-core 3.9.0 and later).
+  // From then on an unsigned or wrongly signed webhook is refused before
+  // anything is recorded. Null until then — an older Payram does not sign, so
+  // its webhooks are accepted and confirmed with Payram like any other.
+  // Cleared when the Payram URL or API key is changed in settings.
+  signedWebhooksSince          DateTime?
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }
@@ -141,6 +148,17 @@ model PayramPayment {
   // USD actually received against this reference.
   filledAmountInUsd String?
   txHash            String?
+  // When Payram itself confirmed these figures belong to this order (the
+  // reference exists and its customerId is this order's). Only confirmed rows
+  // count as money received. Null for rows written before the connector
+  // checked, which may carry amounts from a forged webhook: they count once
+  // Payram confirms them, never before.
+  verifiedAt        DateTime?
+  // When Payram answered that this reference is not this order's — it does
+  // not exist, or belongs to another order. A rejected row never counts and is
+  // only looked up again when the merchant presses Re-check payment. Its
+  // state and amount are kept as the record of what was claimed.
+  rejectedAt        DateTime?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
