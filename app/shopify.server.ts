@@ -40,10 +40,22 @@ const domainTransformations = customShopDomainTransformations(
   process.env.SHOP_CUSTOM_DOMAIN,
 );
 
+/**
+ * The Admin API version for every call the app makes — the library's own and
+ * the direct GraphQL calls in utils/shopify-admin.server.ts, which import this.
+ *
+ * 2026-10 is the latest stable version, supported until 2027-10-16. Shopify
+ * serves a retired version as the oldest supported one instead, so leaving this
+ * behind does not fail loudly: it silently changes which schema answers.
+ * Move it forward each year, after checking the release notes for the calls in
+ * shopify-admin.server.ts. https://shopify.dev/docs/api/usage/versioning
+ */
+export const apiVersion = ApiVersion.October26;
+
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,
   apiSecretKey: process.env.SHOPIFY_API_SECRET || "",
-  apiVersion: ApiVersion.January25,
+  apiVersion,
   scopes: process.env.SCOPES?.split(","),
   appUrl: process.env.SHOPIFY_APP_URL || process.env.APP_URL || process.env.HOST || "",
   authPathPrefix: "/auth",
@@ -53,7 +65,6 @@ const shopify = shopifyApp({
 });
 
 export default shopify;
-export const apiVersion = ApiVersion.January25;
 export const addDocumentResponseHeaders = shopify.addDocumentResponseHeaders;
 export const authenticate = shopify.authenticate;
 export const unauthenticated = shopify.unauthenticated;

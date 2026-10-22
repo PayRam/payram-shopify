@@ -25,9 +25,18 @@ vi.mock("~/db.server", () => ({
 }));
 
 let customShopDomainTransformations: typeof import("./shopify.server").customShopDomainTransformations;
+let apiVersion: typeof import("./shopify.server").apiVersion;
 
 beforeAll(async () => {
-  ({ customShopDomainTransformations } = await import("./shopify.server"));
+  ({ customShopDomainTransformations, apiVersion } = await import("./shopify.server"));
+});
+
+describe("Admin API version", () => {
+  it("is 2026-10, the latest stable version (supported until 2027-10-16)", () => {
+    // Bumping this is a deliberate act: check the release notes for every call
+    // in utils/shopify-admin.server.ts first, then change this test with it.
+    expect(apiVersion).toBe("2026-10");
+  });
 });
 
 function validatorsFor(domain: string | undefined) {

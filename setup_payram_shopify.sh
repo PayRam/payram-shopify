@@ -508,7 +508,7 @@ printf '%s\n' \
   ']' \
   '' \
   '[webhooks]' \
-  'api_version = "2026-01"' \
+  'api_version = "2026-10"' \
   '' \
   '  [[webhooks.subscriptions]]' \
   '  topics = ["app/uninstalled"]' \
