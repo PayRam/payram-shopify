@@ -8,6 +8,8 @@
  *  - A short payment must never be treated as settled.
  *  - A top-up arrives under a NEW Payram reference; its funds must still count
  *    towards the original order, and a retried webhook must not double-count.
+ *  - Only figures Payram confirmed count (MF-012). An unverified payment is
+ *    refused outright, and a row nobody confirmed never joins the total.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
@@ -86,6 +88,11 @@ vi.mock("~/db.server", () => ({
 vi.mock("~/utils/shopify-admin.server", () => admin);
 vi.mock("~/utils/fx.server", () => fx);
 
+// Settlement asks Payram about the order's still-unconfirmed payments. These
+// tests never contact a real Payram: by default it cannot be reached.
+const payram = vi.hoisted(() => ({ fetchPayramPayment: vi.fn() }));
+vi.mock("~/utils/payram.server", () => payram);
+
 import {
   effectiveTolerance,
   normalizePayramState,
@@ -142,6 +149,10 @@ beforeEach(() => {
   };
 
   vi.clearAllMocks();
+  payram.fetchPayramPayment.mockResolvedValue({
+    status: "unavailable",
+    reason: "Payram could not be reached",
+  });
   admin.fetchOrderSettlementContext.mockResolvedValue({
     orderName: "#1001",
     note: null,
@@ -436,26 +447,131 @@ describe("settleOrder — degraded cases", () => {
 });
 
 describe("settleOrder — unverified webhooks never mint value", () => {
+  // These two used to assert the hole itself: an unverified OVER_FILLED was
+  // reported settled, and an unverified FILLED was recorded and tagged paid.
+  // Recording it is what let a forged $150 join a real $1 and get the order
+  // marked paid with a $51 gift card (MF-012), so both now assert refusal.
   it("refuses to issue a gift card when Payram could not confirm the payment", async () => {
     seedMapping();
 
     const out = await settle("ref-1", "OVER_FILLED" as never, "60.00", false);
 
-    expect(out.settled).toBe(true);
+    expect(out.settled).toBe(false);
     expect(out.giftCardIssued).toBe(false);
     expect(admin.createGiftCard).not.toHaveBeenCalled();
-    expect(out.warnings.join(" ")).toMatch(/could not be verified/i);
+    expect(out.warnings.join(" ")).toMatch(/could not be confirmed with Payram/i);
   });
 
-  it("still records and tags an unverified payment", async () => {
+  it("records nothing and touches nothing on Shopify for an unverified payment", async () => {
     seedMapping();
 
     const out = await settle("ref-1", "FILLED" as never, "54.22", false);
 
+    expect(out.settled).toBe(false);
+    expect(db.payments.size).toBe(0);
+    expect(db.updates).toHaveLength(0);
+    expect(admin.addOrderTags).not.toHaveBeenCalled();
+    expect(admin.appendOrderNote).not.toHaveBeenCalled();
+    expect(admin.markOrderPaid).not.toHaveBeenCalled();
+    expect(admin.fetchOrderSettlementContext).not.toHaveBeenCalled();
+  });
+
+  it("a later verified payment does not inherit the refused amount", async () => {
+    seedMapping();
+    await settle("ref-forged", "OVER_FILLED" as never, "150.00", false);
+
+    const real = await settle("ref-1", "PARTIALLY_FILLED" as never, "1.00");
+
+    expect(real.receivedUsd).toBe("1.00");
+    expect(real.settled).toBe(false);
+    expect(admin.markOrderPaid).not.toHaveBeenCalled();
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+  });
+});
+
+describe("settleOrder — only confirmed rows count (MF-012)", () => {
+  /** A row from before confirmation existed: no verifiedAt. */
+  function seedLegacyRow(ref: string, state: string, filled: string) {
+    db.payments.set(ref, {
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      payramReferenceId: ref,
+      state,
+      filledAmountInUsd: filled,
+    });
+  }
+
+  it("leaves an unconfirmed row out of the total and says so", async () => {
+    seedMapping();
+    seedLegacyRow("ref-old", "OVER_FILLED", "150.00");
+
+    const out = await settle("ref-1", "PARTIALLY_FILLED" as never, "1.00");
+
+    expect(out.receivedUsd).toBe("1.00");
+    expect(out.settled).toBe(false);
+    expect(admin.markOrderPaid).not.toHaveBeenCalled();
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    // It was looked up — Payram could not be reached — and the merchant is told.
+    expect(payram.fetchPayramPayment).toHaveBeenCalledWith(SHOP, "ref-old");
+    expect(out.warnings.join(" ")).toMatch(/could not be confirmed with Payram just now/i);
+  });
+
+  it("confirms the delivered reference itself, so its row counts from now on", async () => {
+    seedMapping();
+    await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(db.payments.get("ref-1")?.verifiedAt).toBeInstanceOf(Date);
+  });
+
+  it("does not take the repeat-delivery shortcut for a row nobody had confirmed", async () => {
+    // A legacy row already holds exactly Payram's figures. Settling it is NOT
+    // "nothing changed": it joins the total for the first time.
+    seedMapping({
+      paymentState: "FILLED",
+      filledAmountInUsd: "0.00",
+      shopifyFinancialStatus: TAG_PARTIAL,
+      syncError: null,
+    });
+    seedLegacyRow("ref-1", "FILLED", "54.22");
+
+    const out = await settle("ref-1", "FILLED" as never, "54.22");
+
     expect(out.settled).toBe(true);
-    expect(admin.addOrderTags).toHaveBeenCalledWith(SHOP, "token", ORDER, [
-      TAG_PAID,
-    ]);
+    expect(admin.addOrderTags).toHaveBeenCalledWith(SHOP, "token", ORDER, [TAG_PAID]);
+    expect(admin.markOrderPaid).toHaveBeenCalled();
+  });
+
+  it("acts again when the total moved without this reference changing", async () => {
+    seedMapping();
+    await settle("ref-1", "FILLED" as never, "54.22");
+    const calls = admin.addOrderTags.mock.calls.length;
+
+    // What settlement last acted on no longer matches the confirmed total —
+    // e.g. a forged row it once counted was excluded by the upgrade.
+    db.mapping = { ...db.mapping, filledAmountInUsd: "151.00" };
+    await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(admin.addOrderTags.mock.calls.length).toBe(calls + 1);
+    expect(db.mapping?.filledAmountInUsd).toBe("54.22");
+  });
+
+  it("moves a row a forged webhook filed under the wrong order to its confirmed owner", async () => {
+    seedMapping();
+    db.payments.set("ref-1", {
+      shop: SHOP,
+      shopifyOrderId: "999",
+      payramReferenceId: "ref-1",
+      state: "OVER_FILLED",
+      filledAmountInUsd: "500.00",
+    });
+
+    const out = await settle("ref-1", "FILLED" as never, "54.22");
+
+    expect(db.payments.get("ref-1")).toMatchObject({
+      shopifyOrderId: ORDER,
+      filledAmountInUsd: "54.22",
+    });
+    expect(out.receivedUsd).toBe("54.22");
   });
 });
 

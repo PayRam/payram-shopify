@@ -20,6 +20,15 @@
  * reused while the outstanding amount is unchanged, and only replaced when the
  * amount actually moves — at which point cancelling the stale link is correct.
  *
+ * WHAT HAS BEEN RECEIVED
+ * ----------------------
+ * Only payments Payram has confirmed for this order count — the same rule, and
+ * the same function, as settlement (`sumReceivedUsd`). A buyer is never told
+ * they owe nothing because of a payment nobody confirmed. Payments recorded
+ * before confirmation existed are confirmed with Payram here, a few per visit,
+ * so an honest buyer's earlier payment is credited on their next visit instead
+ * of being asked for twice (MF-012).
+ *
  * Rules: R-DB-TX, R-API-FOR-AGENTS, R-REUSE-FIRST.
  */
 import { Prisma } from "@prisma/client";
@@ -30,6 +39,11 @@ import {
   FxRateUnavailableError,
 } from "~/utils/fx.server";
 import { createPayramPayment } from "~/utils/payram.server";
+import {
+  applyPaymentConfirmations,
+  confirmPendingPayments,
+  sumReceivedUsd,
+} from "~/utils/settlement.server";
 import {
   fetchOrderTotal,
   findOfflineAccessToken,
@@ -80,30 +94,6 @@ export class PaymentSessionError extends Error {
     this.name = "PaymentSessionError";
     this.status = status;
   }
-}
-
-/**
- * Everything received for an order, ignoring cancelled requests.
- *
- * Exported because settlement sums the same rows: a second copy of this rule
- * could drift, and the two disagreeing about what an order has received is
- * exactly the class of bug this connector exists to remove.
- */
-export async function sumReceivedUsd(
-  tx: Prisma.TransactionClient | typeof prisma,
-  shop: string,
-  shopifyOrderId: string,
-): Promise<Prisma.Decimal> {
-  const rows = await tx.payramPayment.findMany({
-    where: { shop, shopifyOrderId },
-    select: { filledAmountInUsd: true, state: true },
-  });
-  return rows
-    .filter((r) => r.state !== "CANCELLED")
-    .reduce(
-      (sum, r) => sum.plus(new Prisma.Decimal(r.filledAmountInUsd ?? 0)),
-      new Prisma.Decimal(0),
-    );
 }
 
 /**
@@ -193,7 +183,22 @@ export async function quoteOrder(
     });
   }
 
-  const received = await sumReceivedUsd(prisma, shop, shopifyOrderId);
+  // Confirm any payments still waiting on Payram (network, outside the
+  // transaction), then record the answers and read the total together
+  // (R-DB-TX). A payment Payram does not answer for stays out of the total —
+  // and createCheckout cannot issue a link while Payram is unreachable anyway,
+  // so the buyer is never charged twice for it.
+  const pending = await confirmPendingPayments(shop, shopifyOrderId);
+  const received = await prisma.$transaction(async (tx) => {
+    const tally = await applyPaymentConfirmations(tx, shop, shopifyOrderId, pending);
+    if (tally.uncounted.length) {
+      console.warn("[payram-session] earlier payments not confirmed yet", {
+        shopifyOrderId,
+        references: tally.uncounted,
+      });
+    }
+    return sumReceivedUsd(tx, shop, shopifyOrderId);
+  });
 
   // Shopify says nothing is outstanding — a gift card covered it, or the
   // merchant marked it paid. Whatever our own ledger says, do not ask the buyer

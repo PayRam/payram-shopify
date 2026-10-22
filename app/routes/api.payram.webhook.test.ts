@@ -24,7 +24,15 @@ const { prisma, settlement } = vi.hoisted(() => ({
 
 vi.mock("~/db.server", () => ({ default: prisma }));
 vi.mock("~/utils/shopify-admin.server", () => ({ findOfflineAccessToken: vi.fn() }));
-vi.mock("~/utils/payram.server", () => ({ fetchPayramPayment: vi.fn() }));
+vi.mock("~/utils/payram.server", () => ({
+  fetchPayramPayment: vi.fn(),
+  // An unsigned webhook from a shop whose Payram has never signed one: accepted
+  // for confirmation, as before signatures existed (MF-013).
+  authenticateWebhook: vi.fn(async () => ({
+    outcome: "unauthenticated",
+    signatureMismatch: false,
+  })),
+}));
 vi.mock("~/utils/settlement.server", async (importOriginal) => ({
   // The real state normaliser: the contract depends on which statuses it knows.
   normalizePayramState: (await importOriginal<typeof import("~/utils/settlement.server")>())
