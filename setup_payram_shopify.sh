@@ -569,7 +569,9 @@ CLIENT_ID_BEFORE=$(grep '^client_id' /app/shopify.app.toml | sed 's/.*= *//' | t
 # With an empty client_id the CLI treats the config as unlinked, runs 'app
 # config link' inside deploy, and that pulls the remote config (no proxy)
 # over the toml. A non-empty client_id is all it checks for "linked" (cli
-# 3.94, active-config.ts), so on a re-run the toml is never touched.
+# 3.94 and 4.9, models/project/active-config.ts), so on a re-run the toml is
+# never touched. Deploy hands link the active file's name (app-context.ts), so
+# the link writes shopify.app.toml itself and asks no file-name question.
 cp /app/shopify.app.toml /app/shopify.app.desired.toml
 # Deploy: login if needed, link on a first run, then app config + extension.
 npx shopify app deploy --allow-updates
@@ -619,13 +621,14 @@ fi
 # fresh browser login. Pointing the CLI's config root at the volume is what
 # makes "If the login has expired" the exception rather than the rule.
 #
-# CLOUD_SHELL: when the CLI needs a login it normally prints a verification
-# code, says "Press any key to open the login page on your browser", and does
-# not start waiting for the login until a key is pressed (cli-kit
-# device-authorization.ts). Inside a container the browser can never open; the
-# image's xdg-open stub only prints the URL. And an unattended run has nobody
-# to press the key, so it would hang there. The CLI treats CLOUD_SHELL as a
-# cloud IDE and prints the login link straight away instead, then polls.
+# CLOUD_SHELL: makes the CLI treat this as a cloud IDE, where no browser can be
+# opened. In Shopify CLI 4 its login (cli-kit device-authorization.ts) prints the
+# verification code and then tries to open a browser; under CLOUD_SHELL
+# openURL() declines at once, so the CLI prints "Open this link to start the
+# auth process: <link>" — the exact line the messages above point people to —
+# and polls until someone signs in. Without it the CLI would report "Opened
+# link…" after handing the URL to the image's xdg-open stub. (CLI 3.x also
+# waited for a keypress first; CLOUD_SHELL was what skipped that.)
 # The install directory is bind-mounted into the deploy container. Two hosts
 # refuse that silently: SELinux in enforcing mode (Fedora, RHEL, Rocky) labels
 # the directory so the container gets "permission denied" on its own script —
