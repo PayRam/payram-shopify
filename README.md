@@ -24,7 +24,8 @@ the whole flow works for **guest checkout**.
 
 Read this section first if you are configuring, extending or debugging this connector.
 
-**What this is.** A [Remix](https://remix.run) app (Node ≥ 26.12.1, Prisma + SQLite) sitting
+**What this is.** A [React Router](https://reactrouter.com) 7 app on Shopify's
+`@shopify/shopify-app-react-router` (Node ≥ 26.12.1, Prisma + SQLite, Admin API 2026-10) sitting
 between a Shopify store and a self-hosted Payram instance. It holds no funds and never sees
 a private key. It decides *how much to charge*, *in what currency*, and *what an arriving
 payment means for the Shopify order*.
@@ -441,7 +442,7 @@ npx prisma migrate dev --name init
 shopify app dev
 ```
 
-This starts the Remix server, creates a Cloudflare tunnel, and streams logs.
+This starts the React Router dev server, creates a Cloudflare tunnel, and streams logs.
 
 ### 5. Configure Payram credentials in the app
 
@@ -917,7 +918,7 @@ curl https://YOUR_DOMAIN/healthz      # => {"app":"payram-shopify-connector","ok
 curl http://127.0.0.1:2798/healthz    # same, run on the server itself
 
 npm test          # unit tests: conversion, settlement, top-ups, tolerance, tokens
-npm run build     # Remix build
+npm run build     # React Router build
 npx prisma migrate deploy   # applies pending migrations (also run by scripts/start.sh)
 ```
 
@@ -993,7 +994,7 @@ transient, DB-backed so it survives restarts.
 |------|---------|
 | `extensions/thank-you-block/src/Checkout.tsx` | UI extension — Preact component for the Thank You block |
 | `extensions/thank-you-block/shopify.extension.toml` | Extension config — target only. The block has no merchant settings |
-| `extensions/thank-you-block/package.json` | `@shopify/ui-extensions@2026.1.3` + `preact` |
+| `extensions/thank-you-block/package.json` | `@shopify/ui-extensions@2026.10.2` + `preact` (checkout extension API 2026-10) |
 | `extensions/thank-you-block/tsconfig.json` | `jsxImportSource: preact`, `moduleResolution: Bundler` |
 
 ### How the extension reads order data
