@@ -4,10 +4,10 @@
   "private": true,
   "dependencies": {
     "@preact/signals": "^2.11.3",
-    "@shopify/ui-extensions": "2026.1.5",
+    "@shopify/ui-extensions": "2026.10.2",
     "preact": "^10.29.8"
   },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   }
 }
