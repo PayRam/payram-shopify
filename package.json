@@ -20,32 +20,32 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@prisma/client": "^5.20.0",
-    "@remix-run/node": "^2.13.1",
-    "@remix-run/react": "^2.13.1",
-    "@remix-run/serve": "^2.13.1",
-    "@shopify/app-bridge-react": "^4.1.6",
+    "@prisma/client": "^5.22.0",
+    "@remix-run/node": "^2.17.5",
+    "@remix-run/react": "^2.17.5",
+    "@remix-run/serve": "^2.17.5",
+    "@shopify/app-bridge-react": "^4.2.14",
     "@shopify/cli": "^3.94.3",
     "@shopify/polaris": "^13.9.5",
-    "@shopify/shopify-app-remix": "^3.5.0",
-    "@shopify/shopify-app-session-storage-prisma": "^5.1.4",
-    "dotenv": "^17.4.2",
-    "isbot": "^4.4.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "@shopify/shopify-app-remix": "^3.8.5",
+    "@shopify/shopify-app-session-storage-prisma": "^5.2.3",
+    "dotenv": "^18.0.8",
+    "isbot": "^5.2.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@remix-run/dev": "^2.13.1",
-    "@types/react": "^18.2.66",
-    "@types/react-dom": "^18.2.22",
-    "prisma": "^5.20.0",
-    "typescript": "^5.2.2",
-    "vite": "^5.1.6",
-    "vite-tsconfig-paths": "^5.0.1",
-    "vitest": "^4.1.11"
+    "@remix-run/dev": "^2.17.5",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "prisma": "^5.22.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "vite-tsconfig-paths": "^6.1.1",
+    "vitest": "^5.0.5"
   },
   "engines": {
-    "node": ">=18.20.0"
+    "node": ">=26.12.1"
   },
   "workspaces": [
     "extensions/*"

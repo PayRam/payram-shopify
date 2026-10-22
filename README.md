@@ -24,7 +24,7 @@ the whole flow works for **guest checkout**.
 
 Read this section first if you are configuring, extending or debugging this connector.
 
-**What this is.** A [Remix](https://remix.run) app (Node ≥ 18, Prisma + SQLite) sitting
+**What this is.** A [Remix](https://remix.run) app (Node ≥ 26.12.1, Prisma + SQLite) sitting
 between a Shopify store and a self-hosted Payram instance. It holds no funds and never sees
 a private key. It decides *how much to charge*, *in what currency*, and *what an arriving
 payment means for the Shopify order*.

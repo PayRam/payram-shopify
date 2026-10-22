@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 
 # ---- builder ---------------------------------------------------------------
-FROM node:20-alpine AS builder
+FROM node:26.12.1-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -54,7 +54,7 @@ RUN NODE_ENV=production npm run build
 RUN npm prune --omit=dev
 
 # ---- runner ----------------------------------------------------------------
-FROM node:20-alpine AS runner
+FROM node:26.12.1-alpine3.24 AS runner
 
 WORKDIR /app
 
