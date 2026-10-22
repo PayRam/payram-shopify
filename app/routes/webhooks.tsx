@@ -3,7 +3,7 @@ import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, session } = await authenticate.webhook(request);
+  const { topic, shop, session, payload } = await authenticate.webhook(request);
 
   switch (topic) {
     case "APP_UNINSTALLED":
@@ -11,6 +11,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await prisma.session.deleteMany({ where: { shop } });
       }
       break;
+
+    // The merchant approved (or revoked) access scopes in Shopify Admin.
+    //
+    // Under token exchange nothing else refreshes the stored scope: the offline
+    // token keeps working with the new grant, and the library never re-exchanges
+    // an active session. The settings page decides whether overpayment gift
+    // cards can be issued from `session.scope`, so without this it would keep
+    // saying "permission not granted" after the merchant had granted it. (The
+    // Remix auth-code flow re-ran OAuth on a scope change, which rewrote it.)
+    case "APP_SCOPES_UPDATE": {
+      const current = (payload as { current?: unknown } | undefined)?.current;
+      if (session && Array.isArray(current)) {
+        await prisma.session.update({
+          where: { id: session.id },
+          data: { scope: current.map(String).join(",") },
+        });
+      }
+      break;
+    }
 
     // GDPR mandatory webhooks — implement data handling before app store submission
     case "CUSTOMERS_DATA_REQUEST":

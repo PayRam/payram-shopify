@@ -20,6 +20,10 @@ api_version = "2026-01"
   topics = ["app/uninstalled"]
   uri = "/webhooks"
 
+  [[webhooks.subscriptions]]
+  topics = ["app/scopes_update"]
+  uri = "/webhooks"
+
 [pos]
 embedded = false
 

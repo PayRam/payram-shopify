@@ -514,6 +514,10 @@ printf '%s\n' \
   '  topics = ["app/uninstalled"]' \
   '  uri = "/webhooks"' \
   '' \
+  '  [[webhooks.subscriptions]]' \
+  '  topics = ["app/scopes_update"]' \
+  '  uri = "/webhooks"' \
+  '' \
   '[pos]' \
   'embedded = false' \
   '' \
