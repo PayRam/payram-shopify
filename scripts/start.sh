@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # Payram Shopify Connector — start production server
 #
-# Applies any pending DB migrations then starts the Remix server.
+# Applies any pending DB migrations then starts the React Router server.
 # Called by the Dockerfile CMD and can be run directly by merchants.
 #
 # Usage:
@@ -36,4 +36,4 @@ info "Running database migrations …"
 npx prisma migrate deploy
 
 info "Starting server on port ${PORT} …"
-exec node_modules/.bin/remix-serve ./build/server/index.js
+exec node_modules/.bin/react-router-serve ./build/server/index.js

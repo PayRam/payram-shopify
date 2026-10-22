@@ -1,4 +1,4 @@
-import { vitePlugin as remix } from "@remix-run/dev";
+import { reactRouter } from "@react-router/dev/vite";
 import { defineConfig } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
@@ -11,17 +11,9 @@ export default defineConfig({
     },
   },
   plugins: [
-    remix({
-      // Everything in app/routes is a build input, so a colocated test would be
-      // compiled as a route — and client builds strip server-only exports like
-      // `loader`, which breaks the build rather than the test run.
-      ignoredRouteFiles: ["**/.DS_Store", "**/*.test.ts", "**/*.test.tsx"],
-      future: {
-        v3_fetcherPersist: true,
-        v3_relativeSplatPath: true,
-        v3_throwAbortReason: true,
-      },
-    }),
+    // Route files (and the test files kept out of them) are declared in
+    // app/routes.ts. The Remix v3_* future flags are React Router 7 defaults.
+    reactRouter(),
     tsconfigPaths(),
   ],
   build: {

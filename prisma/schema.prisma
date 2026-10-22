@@ -25,6 +25,11 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  // Written on every save by session-storage-prisma 8+, which supports Shopify's
+  // expiring offline tokens. Null for the non-expiring tokens this app uses
+  // today, and for every session stored before the upgrade.
+  refreshToken        String?
+  refreshTokenExpires DateTime?
 }
 
 // Per-merchant Payram configuration.

@@ -1,20 +1,19 @@
 import { PassThrough } from "stream";
 import { renderToPipeableStream } from "react-dom/server";
-import { RemixServer } from "@remix-run/react";
-import {
-  createReadableStreamFromReadable,
-  type EntryContext,
-} from "@remix-run/node";
+import { ServerRouter, type EntryContext } from "react-router";
+import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 
-const ABORT_DELAY = 5_000;
+// How long a streamed response may wait on pending loader promises before
+// React Router rejects them. Replaces Remix's `abortDelay` prop on RemixServer.
+export const streamTimeout = 5_000;
 
 export default function handleRequest(
   request: Request,
   responseStatusCode: number,
   responseHeaders: Headers,
-  remixContext: EntryContext
+  routerContext: EntryContext
 ) {
   addDocumentResponseHeaders(request, responseHeaders);
   // Bypass ngrok browser-warning interstitial for all responses (harmless on production)
@@ -24,11 +23,7 @@ export default function handleRequest(
 
   return new Promise((resolve, reject) => {
     const { pipe, abort } = renderToPipeableStream(
-      <RemixServer
-        context={remixContext}
-        url={request.url}
-        abortDelay={ABORT_DELAY}
-      />,
+      <ServerRouter context={routerContext} url={request.url} />,
       {
         [callbackName]: () => {
           const body = new PassThrough();
@@ -51,7 +46,9 @@ export default function handleRequest(
         },
       }
     );
-    setTimeout(abort, ABORT_DELAY);
+    // Abort the render one second after streamTimeout, so React has time to
+    // flush the rejected boundaries down before the stream is cut.
+    setTimeout(abort, streamTimeout + 1_000);
   });
 }
 

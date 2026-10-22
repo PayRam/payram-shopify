@@ -2,7 +2,7 @@
 # Payram Shopify Connector
 #
 # Multi-stage build:
-#   builder  — installs all deps and compiles the Remix app
+#   builder  — installs all deps and compiles the React Router app
 #   runner   — production image with only runtime deps
 #
 # Build:
@@ -55,7 +55,7 @@ RUN if grep -q "{{ CLIENT_ID }}" shopify.app.toml 2>/dev/null; then \
 # Generate Prisma client
 RUN npx prisma generate
 
-# Build the Remix app
+# Build the React Router app
 RUN NODE_ENV=production npm run build
 
 # Prune dev dependencies
