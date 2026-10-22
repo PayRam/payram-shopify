@@ -30,7 +30,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       # write: v* builds also publish a GitHub Release, which is what the

@@ -1,0 +1,32 @@
+# Tests for every pull request, and the gate in front of publishing.
+#
+# Until this workflow, nothing ran the tests: release.yml built and pushed the
+# image from main, so a change to settlement, gift cards or the webhook could
+# reach merchants untested. release.yml calls this workflow and publishes only
+# when it passes.
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same Node.js release as the image (Dockerfile: node:26.12.1-alpine3.24).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.12.1
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run test:installer
