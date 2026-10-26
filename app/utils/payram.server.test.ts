@@ -181,4 +181,51 @@ describe("authenticateWebhook", () => {
     ).resolves.toEqual({ outcome: "signed" });
     expect(db.updateMany).not.toHaveBeenCalled();
   });
+
+  it("records a refused webhook signed with another key — the time only, at most once a minute", async () => {
+    db.config = { ...db.config, signedWebhooksSince: new Date("2026-10-01") };
+    const res = await authenticateWebhook(SHOP, bytes(BODY), headers(`sha256=${"0".repeat(64)}`));
+
+    expect(res.outcome).toBe("refused");
+    expect(db.updateMany).toHaveBeenCalledOnce();
+    expect(db.updateMany).toHaveBeenCalledWith({
+      where: {
+        shop: SHOP,
+        signedWebhooksSince: { not: null },
+        OR: [
+          { signedWebhookRefusedAt: null },
+          { signedWebhookRefusedAt: { lt: expect.any(Date) } },
+        ],
+      },
+      data: { signedWebhookRefusedAt: expect.any(Date) },
+    });
+  });
+
+  it("still refuses when the refusal cannot be recorded", async () => {
+    db.config = { ...db.config, signedWebhooksSince: new Date("2026-10-01") };
+    db.updateMany.mockRejectedValueOnce(new Error("database is locked"));
+    const res = await authenticateWebhook(SHOP, bytes(BODY), headers(`sha256=${"0".repeat(64)}`));
+    expect(res.outcome).toBe("refused");
+  });
+
+  it("does not record an unsigned refusal: saving a key would not fix it", async () => {
+    db.config = { ...db.config, signedWebhooksSince: new Date("2026-10-01") };
+    await authenticateWebhook(SHOP, bytes(BODY), headers());
+    expect(db.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("clears the refusal once a webhook verifies with the saved key again", async () => {
+    db.config = {
+      ...db.config,
+      signedWebhooksSince: new Date("2026-10-01"),
+      signedWebhookRefusedAt: new Date("2026-10-25"),
+    };
+    await expect(
+      authenticateWebhook(SHOP, bytes(BODY), headers(`sha256=${OPENSSL_HMAC}`)),
+    ).resolves.toEqual({ outcome: "signed" });
+    expect(db.updateMany).toHaveBeenCalledWith({
+      where: { shop: SHOP, signedWebhookRefusedAt: { not: null } },
+      data: { signedWebhookRefusedAt: null },
+    });
+  });
 });

@@ -14,7 +14,8 @@
  * Payram's genuine $1 to it, mark the order paid and refund a $51 gift card.
  */
 import { createHmac } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Build the database before anything below imports the Prisma client, so the
@@ -47,10 +48,17 @@ const admin = vi.hoisted(() => ({
   addOrderTags: vi.fn(),
   appendOrderNote: vi.fn(),
   createGiftCard: vi.fn(),
+  findGiftCardsByNote: vi.fn(),
   markOrderPaid: vi.fn(),
   tagShopifyOrderPaid: vi.fn(),
+  // Settlement tells an unclear failure from a refusal by this class.
+  GiftCardOutcomeUnknownError: class GiftCardOutcomeUnknownError extends Error {},
 }));
 vi.mock("~/utils/shopify-admin.server", () => admin);
+
+// The embedded admin's session check; the settings page itself is real.
+const shopifyAuth = vi.hoisted(() => ({ admin: vi.fn() }));
+vi.mock("~/shopify.server", () => ({ authenticate: shopifyAuth }));
 
 const SHOP = "acme.myshopify.com";
 const ORDER = "1001";
@@ -96,6 +104,7 @@ function payramHas(
 }
 
 import prisma from "~/db.server";
+import * as settings from "~/routes/app._index";
 import * as webhook from "~/routes/api.payram.webhook";
 import * as encryption from "~/utils/encryption.server";
 import * as session from "~/utils/payment-session.server";
@@ -118,6 +127,7 @@ beforeEach(async () => {
   payram.lookups = [];
 
   admin.findOfflineAccessToken.mockResolvedValue("shpat_test");
+  shopifyAuth.admin.mockResolvedValue({ session: { shop: SHOP, scope: "write_gift_cards" } });
   admin.fetchOrderTotal.mockResolvedValue({
     orderName: "#1001",
     amount: "100.00",
@@ -560,5 +570,383 @@ describe("webhook signatures (MF-013)", () => {
     expect(res.status).toBe(200);
     expect(await prisma.payramPayment.count()).toBe(0);
     expectShopifyUntouched();
+  });
+});
+
+describe("overpayments the merchant was told to refund by hand (audit F3)", () => {
+  // What releases up to 1.2.0 wrote when the gift card could not be created.
+  // On 1.1.0 that was every order with a customer: the invalid recipient field
+  // made Shopify reject the request, which read as an unclear failure.
+  const refundManuallyBy110 =
+    "Overpaid by 50.00 USD but the gift card could not be created: Gift card could not be " +
+    "created and it is unclear whether Shopify created one (Shopify rejected the create gift " +
+    "card request. If this persists, the merchant should reopen the Payram app in Shopify " +
+    "Admin to refresh its permissions.). Check Shopify Admin → Gift cards before refunding " +
+    "manually.. Refund manually.";
+
+  /** The upgrade: the migration that turns those words into a closed slot. */
+  async function upgrade() {
+    const sql = readFileSync(
+      join(
+        process.cwd(),
+        "prisma/migrations/20261026120000_manual_refund_gift_card_slot/migration.sql",
+      ),
+      "utf8",
+    );
+    await prisma.$executeRawUnsafe(sql);
+  }
+
+  /** The end state 1.1.0 left: paid in Shopify, $50 over, no card, told to refund by hand. */
+  async function settledBy110(syncError: string, order = ORDER) {
+    await prisma.paymentMapping.upsert({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: order } },
+      create: {
+        shop: SHOP,
+        shopifyOrderId: order,
+        payramReferenceId: order === ORDER ? "real-ref" : `ref-${order}`,
+        amountInUsd: "100.00",
+        orderCurrency: "USD",
+        fxRate: "1",
+      },
+      update: {},
+    });
+    await prisma.paymentMapping.update({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: order } },
+      data: {
+        paymentState: "OVER_FILLED",
+        filledAmountInUsd: "150.00",
+        balanceUsd: "50.00",
+        shopifyFinancialStatus: "payram_paid",
+        shopifyMarkedPaidAt: new Date("2026-10-20T10:00:00Z"),
+        giftCardId: null,
+        syncError,
+      },
+    });
+  }
+
+  const recheck = () =>
+    settlement.recheckOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      accessToken: "shpat_test",
+      latestReferenceId: "real-ref",
+    });
+
+  it("an order 1.1.0 told to refund by hand gets no gift card on Re-check after the upgrade", async () => {
+    await settledBy110(refundManuallyBy110);
+    // 1.1.0 recorded the payment before confirmation existed.
+    await legacyRow("real-ref", "OVER_FILLED", "150.00");
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    const result = await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect(result.outcome).toMatchObject({ settled: true, giftCardIssued: false, balanceUsd: "50.00" });
+    const m = await mapping();
+    expect(m.giftCardId).toBe("manual_refund");
+    // The merchant still sees that it needs a manual refund.
+    expect(m.syncError).toMatch(
+      /Overpaid by 50\.00 USD\. This overpayment was left for you to refund by hand/,
+    );
+  });
+
+  it("so does one 1.1.0 left with gift cards off, after the merchant switches them on", async () => {
+    await settledBy110(
+      "Overpaid by 50.00 USD. Automatic gift cards are off, so this must be refunded manually. " +
+        "Enable it in the Payram app settings to automate it.",
+    );
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    // beforeEach leaves gift cards switched on.
+    await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+
+  it("so does one 1.1.0 could not verify, once Payram confirms it", async () => {
+    await settledBy110(
+      "Overpaid by 50.00 USD, but the payment could not be verified with Payram, so no gift " +
+        "card was issued. Confirm the payment in Payram and refund manually.",
+    );
+    await legacyRow("real-ref", "OVER_FILLED", "150.00");
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+
+  it("the upgrade leaves every other order alone", async () => {
+    await settledBy110(
+      "Overpaid by 0.50 USD, which is below the 1.00 USD gift card minimum. No gift card was issued.",
+    );
+    await settledBy110(refundManuallyBy110, "2002");
+    await prisma.paymentMapping.update({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: "2002" } },
+      data: { giftCardId: "gid://shopify/GiftCard/7" },
+    });
+
+    await upgrade();
+    await upgrade(); // and running it twice changes nothing
+
+    expect((await mapping()).giftCardId).toBeNull();
+    const other = await prisma.paymentMapping.findUniqueOrThrow({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: "2002" } },
+    });
+    expect(other.giftCardId).toBe("gid://shopify/GiftCard/7");
+  });
+
+  it("a gift card Shopify refuses now is not issued by a later Re-check either", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(
+      new Error("Gift card could not be created: Gift cards are not enabled for this shop"),
+    );
+
+    const first = await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(first.body).toMatchObject({ settled: true, giftCardIssued: false });
+    expect((await mapping()).syncError).toMatch(/could not be created.*Refund manually/);
+
+    // The merchant refunds by hand, enables gift cards, then presses Re-check.
+    const again = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(again.outcome?.giftCardIssued).toBe(false);
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+});
+
+describe("a gift card Shopify may have made (audit F4)", () => {
+  const unclear = () =>
+    new admin.GiftCardOutcomeUnknownError(
+      "Gift card could not be created and it is unclear whether Shopify created one " +
+        "(Could not reach Shopify (create gift card). Please try again shortly.).",
+    );
+  const recheck = () =>
+    settlement.recheckOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      accessToken: "shpat_test",
+      latestReferenceId: "real-ref",
+    });
+  /** Ten minutes and more pass after the unclear attempt. */
+  async function waitOutShopify() {
+    const m = await mapping();
+    const since = new Date(String(m.giftCardId).slice("unconfirmed:".length));
+    await prisma.paymentMapping.update({
+      where: { id: m.id },
+      data: { giftCardId: `unconfirmed:${new Date(since.getTime() - 11 * 60_000).toISOString()}` },
+    });
+  }
+
+  it("a timeout after Shopify made the card: Re-check finds and records it, and mints no second card", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+
+    const first = await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(first.body).toMatchObject({ settled: true, giftCardIssued: false });
+    let m = await mapping();
+    expect(m.giftCardId).toMatch(/^unconfirmed:/);
+    // Needs review: listed with what to check and not to refund by hand.
+    expect(m.syncError).toMatch(/Shopify may have made it.*Do not refund it by hand as well/);
+
+    // Pressed straight away (the audit's probe P5): nothing is created.
+    const early = await recheck();
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
+    expect(early.outcome?.giftCardIssued).toBe(false);
+
+    // Later: Shopify lists the card the timed-out request made.
+    await waitOutShopify();
+    admin.findGiftCardsByNote.mockResolvedValue([
+      { id: "gid://shopify/GiftCard/55", lastCharacters: "w8w8", amount: "50.00", currencyCode: "USD" },
+    ]);
+    const later = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(later.outcome?.giftCardIssued).toBe(true);
+    m = await mapping();
+    expect(m).toMatchObject({
+      giftCardId: "gid://shopify/GiftCard/55",
+      giftCardLastChars: "w8w8",
+      giftCardAmount: "50.00",
+    });
+    expect(admin.findGiftCardsByNote.mock.calls[0][2]).toMatchObject({
+      noteIncludes: `[Payram order ${ORDER}]`,
+    });
+
+    // And from then on the order has its card: no more lookups, no more cards.
+    await recheck();
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).toHaveBeenCalledOnce();
+  });
+
+  it("a timeout before Shopify made anything: issued once Shopify confirms there is no card", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    await waitOutShopify();
+    admin.findGiftCardsByNote.mockResolvedValue([]);
+    const result = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(2);
+    expect(result.outcome?.giftCardIssued).toBe(true);
+    expect((await mapping()).giftCardId).toBe("gid://shopify/GiftCard/1");
+  });
+
+  it("repeat deliveries while it is unclear create nothing", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+    for (let i = 0; i < 4; i += 1) {
+      await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    }
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect((await mapping()).giftCardId).toMatch(/^unconfirmed:/);
+  });
+
+  it("a refusal Shopify states plainly still closes the slot for a manual refund", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(
+      new Error("Gift card could not be created: Gift cards are not enabled for this shop"),
+    );
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+});
+
+describe("webhooks refused after a newer API key appears in Payram (audit F2)", () => {
+  // payram-core signs with the project's NEWEST admin key. Once a shop is
+  // enforcing signatures, a key created later for anything else made every
+  // payment webhook fail 401 with nothing in the app, until Payram gave up.
+  const NEWER_KEY = "newer-project-api-key";
+  const config = () => prisma.merchantConfig.findUniqueOrThrow({ where: { shop: SHOP } });
+  const signedPost = (body: Record<string, unknown>, key = API_KEY) =>
+    post(body, { "X-Payram-Signature": sign(JSON.stringify(body), key) });
+
+  /** The shop's first signed webhook, with the saved key, pins it. */
+  async function pin() {
+    payramHas("real-ref", "OPEN", null);
+    const res = await signedPost(genuine("real-ref", "OPEN", "0"));
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhooksSince).toBeInstanceOf(Date);
+    vi.clearAllMocks();
+    payram.lookups = [];
+  }
+
+  function settingsRequest(fields: Record<string, string>) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.set(k, v);
+    return new Request("https://connector.example.test/app", { method: "POST", body: form });
+  }
+  const loadSettings = async () =>
+    (await settings.loader({
+      request: new Request("https://connector.example.test/app"),
+      params: {},
+      context: {},
+    } as Parameters<typeof settings.loader>[0])) as { webhooksRefusedAt: string | null };
+  const save = (fields: Record<string, string>) =>
+    settings.action({
+      request: settingsRequest({ intent: "save", payramBaseUrl: PAYRAM, ...fields }),
+      params: {},
+      context: {},
+    } as Parameters<typeof settings.action>[0]);
+
+  it("is refused with 401, records no payment, and tells the merchant to save the current key", async () => {
+    await pin();
+    const before = await mapping();
+    payramHas("real-ref", "FILLED", "100.00");
+
+    const res = await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+
+    expect(res.status).toBe(401);
+    // Nothing an attacker could use: no lookup, no payment row, no order change.
+    expect(payram.lookups).toEqual([]);
+    expectShopifyUntouched();
+    expect(await row("real-ref")).toMatchObject({ state: "OPEN", filledAmountInUsd: null });
+    const after = await mapping();
+    expect(after.syncError).toBe(before.syncError);
+    expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+    // What changed: the shop records the refusal, and the settings page says so.
+    const refusedAt = (await config()).signedWebhookRefusedAt;
+    expect(refusedAt).toBeInstanceOf(Date);
+    expect((await loadSettings()).webhooksRefusedAt).toBe(settlement.formatUtc(refusedAt!));
+    // Until now the buyer's page shows the order unpaid; Re-check repairs it.
+    expect((await session.quoteOrder(SHOP, ORDER)).phase).toBe("unpaid");
+  });
+
+  it("a flood of refused webhooks is one write a minute", async () => {
+    await pin();
+    await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    const first = (await config()).signedWebhookRefusedAt;
+
+    for (let i = 0; i < 5; i += 1) {
+      expect((await signedPost(forged(), NEWER_KEY)).status).toBe(401);
+    }
+
+    expect((await config()).signedWebhookRefusedAt?.getTime()).toBe(first?.getTime());
+  });
+
+  it("an unsigned webhook to an enforcing shop is refused without raising the warning", async () => {
+    await pin();
+    expect((await post(forged())).status).toBe(401);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
+  });
+
+  it("before the shop is enforcing, a webhook signed with another key raises nothing", async () => {
+    const res = await signedPost(forged(), NEWER_KEY);
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
+  });
+
+  it("saving the project's current key clears the warning, and its webhooks then settle", async () => {
+    await pin();
+    await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+
+    const saved = await save({ payramProjectApiKey: NEWER_KEY });
+    expect(saved).toMatchObject({ success: expect.stringMatching(/Settings saved/) });
+    expect(await config()).toMatchObject({ signedWebhooksSince: null, signedWebhookRefusedAt: null });
+    expect((await loadSettings()).webhooksRefusedAt).toBeNull();
+
+    // Payram resends; signed with the key now saved, it settles and re-pins.
+    payramHas("real-ref", "FILLED", "100.00");
+    const resent = await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    expect(resent.status).toBe(200);
+    expect(resent.body).toMatchObject({ settled: true });
+    expect((await config()).signedWebhooksSince).toBeInstanceOf(Date);
+  });
+
+  it("re-saving the same key keeps the warning: nothing was fixed", async () => {
+    await pin();
+    await signedPost(forged(), NEWER_KEY);
+
+    await save({ payramProjectApiKey: API_KEY });
+
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+    expect((await loadSettings()).webhooksRefusedAt).not.toBeNull();
+  });
+
+  it("the next correctly signed webhook clears the warning", async () => {
+    await pin();
+    await signedPost(forged(), NEWER_KEY);
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+
+    // The newer key was revoked in Payram, so it signs with the saved one again.
+    payramHas("real-ref", "FILLED", "100.00");
+    const res = await signedPost(genuine("real-ref", "FILLED", "100.00"));
+
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
   });
 });

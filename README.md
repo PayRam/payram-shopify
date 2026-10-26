@@ -288,7 +288,7 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. The installer generates it; set it yourself on a manual install — see the warning below |
 | `PORT` | — | Server port (default `2798`). The installer publishes and probes the same number; it reads this from `.env` only |
 | `CONNECTOR_BIND_ADDRESS` | — | Installer only. How the port is published: an address (`127.0.0.1` on new installs), `all` (every interface, IPv4+IPv6) or `none` (Docker networks only). A re-run keeps whatever the existing container had |
-| `CONNECTOR_IMAGE` | — | Installer only. Image to run instead of `payramapp/payram-shopify:latest` — a `sha-<commit>` tag or an `@sha256` digest. Set in the environment on a first run it is written here; remove the line to follow `:latest` again |
+| `CONNECTOR_IMAGE` | — | Installer only. Image to run instead of `payramapp/payram-shopify:latest` — a release tag such as `1.2.0`, a `sha-<commit>` tag (no version, so no update notices) or an `@sha256` digest. Set in the environment on a first run it is written here; remove the line to follow `:latest` again |
 | `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
 | `ALLOW_INSECURE_PAYRAM_URL` | — | Dev only. Disables SSRF protection on the Payram URL. **Never set in production** |
 
@@ -393,8 +393,19 @@ docker inspect payram-shopify-connector \
 
 This prints the commit the running image was built from. The installer prints the connector
 version and image digest right after the pull, and the app's Settings page shows the running
-version. Every image is also published with an immutable `sha-<commit>` tag; to stay on one,
-put `CONNECTOR_IMAGE=payramapp/payram-shopify:sha-<commit>` in `.env` and re-run the installer.
+version — which is also what lets it tell you when a newer release exists.
+
+How the image tags relate:
+
+| Tag | What it is | Carries a version (Settings page, update notices) |
+|---|---|---|
+| `latest` | What the installer pulls. Follows `main`; once a release is tagged there, it is that release's own build | Yes once the release is tagged; a `main` commit not yet tagged carries none |
+| `<version>`, e.g. `1.2.0`, and `1.2` | A release build | Yes |
+| `sha-<commit>` | The build of one `main` commit, never replaced | No — the page shows no version and no update notice |
+
+Re-running an older release's build never moves `latest` back. To stay on one release, put
+`CONNECTOR_IMAGE=payramapp/payram-shopify:<version>` (or its `@sha256` digest) in `.env` and
+re-run the installer; `sha-<commit>` pins one exact build too, but without update notices.
 
 > **Installed before May 11, 2026?** Early installers pulled `mason0816/payram-shopify-test`.
 > Re-running the installer moves you to `payramapp/payram-shopify`.
@@ -802,7 +813,15 @@ settings page (maximum 10%).
    Shopify automatically. The note records the amount and the card's last characters.
 3. If the buyer had no customer record, the note says so; send the code from Shopify Admin →
    *Gift cards*.
-4. Fulfil as normal. The order is paid.
+4. If no card could be issued (gift cards are off, or Shopify refused the card), the app says
+   *Refund manually*: do so. From then on the connector never issues a gift card for that order,
+   not even after gift cards are switched on or Re-check payment is pressed, so a buyer you refunded
+   by hand is never refunded twice. The order keeps saying it was left for a manual refund.
+   If Shopify did not answer whether it created the card (a timeout), the order says so instead:
+   do **not** refund by hand. From ten minutes later, **Re-check payment** looks in Shopify for a
+   card whose note ends `[Payram order <id>]`, records it if it is there, and issues one only if
+   there is none.
+5. Fulfil as normal. The order is paid.
 
 **Where to see problems.** Open the Payram app in Shopify Admin. Any order that is underpaid, or
 that the connector could not finish updating, is listed under *Recent crypto payments* with what
@@ -929,7 +948,7 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 | Shopify shows an error page when opening the install link | the link ends in `?shop=<your custom domain>` | `SHOPIFY_STORE_DOMAIN` is a storefront domain; Shopify's install flow accepts only `<handle>.myshopify.com` | Re-run the installer — it now refuses the stored value and asks again; paste your admin URL |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] received` present, no tag | Webhook status not recognised, or Payram did not confirm the reference for this order | Check the `syncError` on the order; confirm the payment in Payram, then **Re-check payment** |
-| Payram's webhook log shows `401` from the connector | `[payram-webhook] refused` | The store's Payram signs its webhooks, and this one was not signed with the API key saved in the app — usually a new API key created in Payram | Save the project's current API key in the app's settings; Payram resends on its own |
+| Payram's webhook log shows `401` from the connector; the app shows *Payram's payment notifications are being refused* | `[payram-webhook] refused` | The store's Payram signs its webhooks, and this one was not signed with the API key saved in the app — usually a new API key created in Payram, which signs with the project's newest key | Save the project's current API key in the app's settings. Payram resends for about 48 hours; for orders paid before that, press **Re-check payment** |
 | Payram's webhook log shows `503` from the connector | `[payram-verify] … request failed` | The connector could not reach Payram to confirm the payment | Check the Payram Base URL and that Payram is reachable from the connector; Payram resends on its own |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
@@ -985,6 +1004,8 @@ documented rather than quietly carried:
 | `payramBaseUrl` | Payram API base URL |
 | `payramProjectApiKeyEncrypted` | AES-256-GCM encrypted API key |
 | `paymentMethodName` | Label shown in checkout |
+| `signedWebhooksSince` | First webhook correctly signed with the saved key; from then on unsigned or wrongly signed webhooks are refused |
+| `signedWebhookRefusedAt` | Last time a webhook signed with another key was refused (at most once a minute); drives the settings page's warning to save the project's current key |
 
 ### `PaymentMapping`
 
@@ -997,6 +1018,7 @@ documented rather than quietly carried:
 | `shopifyFinancialStatus` | Synced from Shopify after mark-paid |
 | `shopifyPaidSyncedAt` | Timestamp of successful sync |
 | `syncError` | Error from last Shopify sync attempt |
+| `giftCardId` | The overpayment gift card issued for the order (`gid://shopify/GiftCard/…`); `pending` while one is being created; `unconfirmed:<time>` when Shopify did not say whether it created one, so Shopify is checked before any retry; `manual_refund` once the merchant was told to refund by hand, after which none is issued automatically |
 | `orderCurrency` | Presentment currency of the Shopify order, e.g. `EUR` |
 | `orderAmount` | Original order total in `orderCurrency`, as a decimal string |
 | `fxRate` | USD per 1 unit of `orderCurrency` at the time of payment |

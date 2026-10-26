@@ -395,6 +395,41 @@ export type WebhookAuthentication =
   /** This shop's Payram signs its webhooks, and this one is not signed by it. */
   | { outcome: "refused"; message: string };
 
+/** A refused signed webhook is recorded at most this often per shop. */
+const REFUSED_WEBHOOK_RECORD_INTERVAL_MS = 60_000;
+
+/**
+ * Note, for the merchant, that a webhook signed with another key was refused.
+ *
+ * What this means in practice: the Payram project has a newer admin API key
+ * than the one saved in the app, so every genuine payment webhook now fails
+ * with 401, and Payram gives up resending after about 48 hours. The settings
+ * page turns this time into a warning to save the project's current key.
+ *
+ * The body is never read for it and nothing about the payment is written —
+ * the caller may be anyone. One timestamp, at most once a minute per shop,
+ * so a flood of refused requests cannot turn into a flood of writes. A
+ * failure here never changes the 401.
+ */
+async function recordRefusedSignedWebhook(shop: string): Promise<void> {
+  const now = new Date();
+  try {
+    await prisma.merchantConfig.updateMany({
+      where: {
+        shop,
+        signedWebhooksSince: { not: null },
+        OR: [
+          { signedWebhookRefusedAt: null },
+          { signedWebhookRefusedAt: { lt: new Date(now.getTime() - REFUSED_WEBHOOK_RECORD_INTERVAL_MS) } },
+        ],
+      },
+      data: { signedWebhookRefusedAt: now },
+    });
+  } catch (err) {
+    console.error(`[payram-webhook] ${shop}: could not record a refused signed webhook:`, err);
+  }
+}
+
 /**
  * Decide whether a webhook body may be acted on at all.
  *
@@ -416,6 +451,11 @@ export type WebhookAuthentication =
  *
  * Saving a different Payram URL or API key clears the record, so moving to a
  * new server cannot leave the shop refusing that server's webhooks.
+ *
+ * A refused webhook that IS signed — with a key other than the saved one — is
+ * what a newer admin key on the project looks like, so it is recorded on the
+ * shop (`signedWebhookRefusedAt`) for the settings page to warn about; the
+ * next correctly signed webhook clears it.
  *
  * Rules: R-MALICIOUS-FLOW (MF-013), R-API-FOR-AGENTS.
  */
@@ -448,10 +488,19 @@ export async function authenticateWebhook(
         `[payram-webhook] ${shop}: first correctly signed Payram webhook — unsigned ones are refused from now on`,
       );
     }
+    if (credentials.config?.signedWebhookRefusedAt) {
+      // Payram signs with the saved key again: the warning is over.
+      await prisma.merchantConfig.updateMany({
+        where: { shop, signedWebhookRefusedAt: { not: null } },
+        data: { signedWebhookRefusedAt: null },
+      });
+      console.info(`[payram-webhook] ${shop}: webhooks verify with the saved API key again`);
+    }
     return { outcome: "signed" };
   }
 
   if (signedSince) {
+    if (signature) await recordRefusedSignedWebhook(shop);
     return {
       outcome: "refused",
       message: signature

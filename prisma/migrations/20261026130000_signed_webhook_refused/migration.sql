@@ -1,0 +1,13 @@
+-- Tell the merchant when their Payram's webhooks are being refused.
+--
+-- Once a shop has received a correctly signed webhook (signedWebhooksSince),
+-- every unsigned or wrongly signed one is refused with 401 before anything is
+-- read or written. payram-core signs with the project's NEWEST admin API key,
+-- so creating another key on the project — for another store, an agent, a
+-- rotation — made every payment webhook fail with nothing shown in the app,
+-- until Payram stopped resending after about 48 hours. This records when a
+-- webhook signed with another key was last refused, so the settings page can
+-- say so and ask for the project's current key.
+--
+-- Additive and nullable: existing rows get NULL, i.e. nothing refused.
+ALTER TABLE "MerchantConfig" ADD COLUMN "signedWebhookRefusedAt" DATETIME;

@@ -186,6 +186,31 @@ Severity: `low` / `medium` / `high` / `critical`.
   **Superseded by MF-012 (2026-10-22):** that residual risk was larger than
   stated — an unverified amount was recorded and later summed with verified
   ones, so it COULD mint value. Fixed there.
+- **Follow-up (2026-10-26, audit F3):** a second card could also come from the
+  merchant's own instructions. Whenever no card could be issued (gift cards
+  off, or the card could not be created) the merchant was told "Refund
+  manually", but the slot was left open (`giftCardId` NULL), so the next
+  delivery or Re-check payment issued a card once the cause went away — and
+  1.2.0 removed the cause for every order with a customer. A merchant who had
+  refunded by hand refunded twice. `giftCardId = 'manual_refund'` now closes
+  the slot whenever the merchant is told to refund by hand, and the migration
+  `20261026120000_manual_refund_gift_card_slot` closed it for the orders
+  earlier releases had told so (matched on the `syncError` words, the only
+  record they kept). Residual: an order whose "Refund manually" text was later
+  replaced by another `syncError` before the upgrade is not recognised and
+  stays open.
+- **Follow-up (2026-10-26, audit F4):** `giftCardCreate` timing out after
+  Shopify made the card freed the slot, so the next delivery or Re-check
+  minted a second card. An unclear failure (`GiftCardOutcomeUnknownError`) now
+  keeps the slot reserved (`giftCardId = 'unconfirmed:<time>'`) and tells the
+  merchant not to refund by hand. No card is created again until, at least ten
+  minutes later, Shopify's gift card list has been read in full and holds no
+  card whose note carries the order marker `[Payram order <id>]` (every card's
+  note does); a card that is there is recorded instead. A failed or incomplete
+  read keeps the slot reserved. Residual: a merchant who refunds by hand
+  anyway, despite the message, and then presses Re-check on an order where
+  Shopify made nothing is refunded twice; a card made more than ten minutes
+  after the timeout is not expected but would not be seen.
 - **Discovered-in:** overpayment/gift-card work, 2026-09-03.
 
 ---
@@ -330,6 +355,21 @@ Severity: `low` / `medium` / `high` / `critical`.
   signing key, forged webhooks still reach the confirmation step: they cost one
   Payram lookup each and can replace the order's `syncError` with a "could not
   be confirmed" note (nuisance, no money). Once a shop is enforcing, a new admin
-  API key created in Payram makes its webhooks fail 401 until that key is saved
-  in the app; Payram keeps resending meanwhile and Re-check payment still works.
+  API key created in Payram makes every payment webhook fail 401 until that key
+  is saved in the app. Nothing is written to the order — no payment, no
+  `syncError` — so the order never appears under "needs attention", the
+  buyer's payment page still shows it unpaid (and, once the link expires,
+  offers a fresh one the buyer could pay a second time), and Payram stops
+  resending after its schedule ends (about 48 hours). Since 2026-10-26 (audit
+  F2) each refused webhook that is signed with another key sets
+  `MerchantConfig.signedWebhookRefusedAt` — the time only, at most once a
+  minute, nothing from the body — and the settings page shows a red warning
+  to save the project's current API key and to Re-check orders paid
+  meanwhile. It clears on the next webhook that verifies with the saved key,
+  or when a different URL or key is saved. What remains: the merchant must
+  open the app to see it, and the app does not say which orders were paid
+  meanwhile; anyone can set the warning by posting a body with a made-up
+  signature for one of the shop's orders (a false alarm, no money: saving the
+  key that is already saved changes nothing). An unsigned refusal is not
+  recorded, since saving a key would not fix it.
 - **Discovered-in:** security audit, 2026-10-22.
