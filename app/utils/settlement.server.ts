@@ -105,12 +105,84 @@ function safeDecimal(value: string | null | undefined, fallback: string): Prisma
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* The gift-card slot — may a card still be issued for this order?     */
+/* ------------------------------------------------------------------ */
+//
+// `PaymentMapping.giftCardId` is the one place that decides it:
+//
+//   null                      open: settlement may issue a card
+//   "pending"                 a settlement is creating one right now
+//   "manual_refund"           the merchant was told to refund this
+//                             overpayment by hand; never issued automatically
+//   gid://shopify/GiftCard/…  the card that was issued
+//
+// Every transition is a compare-and-set on the column, so two deliveries can
+// never both decide the slot is theirs.
+
 /**
  * Placeholder written while a gift card is being created, so a concurrent
  * webhook delivery cannot also decide the slot is free. Replaced by the real
- * Shopify GID on success, cleared on failure.
+ * Shopify GID on success.
  */
 const GIFT_CARD_PENDING = "pending";
+
+/**
+ * The merchant has been told to refund this overpayment by hand — gift cards
+ * were off, or Shopify refused the card. Settlement never issues one for the
+ * order afterwards, even if the feature is switched on or the cause is fixed:
+ * a merchant who did as told would otherwise refund the buyer twice.
+ * Under-issuing is recoverable; double-issuing is not.
+ *
+ * Orders that releases up to 1.2.0 told to refund by hand — recorded then only
+ * as the words in `syncError` — were moved to this value by the migration
+ * 20261026120000_manual_refund_gift_card_slot.
+ */
+const GIFT_CARD_MANUAL_REFUND = "manual_refund";
+
+export type GiftCardSlot = "open" | "pending" | "manual_refund" | "issued";
+
+/** What `PaymentMapping.giftCardId` says about the order's gift card. */
+export function giftCardSlot(giftCardId: string | null | undefined): GiftCardSlot {
+  if (giftCardId == null || giftCardId === "") return "open";
+  if (giftCardId === GIFT_CARD_PENDING) return "pending";
+  if (giftCardId === GIFT_CARD_MANUAL_REFUND) return "manual_refund";
+  return "issued";
+}
+
+/**
+ * Close an open slot because the merchant is being told to refund by hand.
+ * Single statement; a slot that already holds anything else is left alone.
+ */
+async function markGiftCardForManualRefund(
+  shop: string,
+  shopifyOrderId: string,
+  from: null | typeof GIFT_CARD_PENDING,
+): Promise<void> {
+  await prisma.paymentMapping.updateMany({
+    where: { shop, shopifyOrderId, giftCardId: from },
+    data: { giftCardId: GIFT_CARD_MANUAL_REFUND, updatedAt: new Date() },
+  });
+}
+
+/**
+ * Money that arrived after the order's overpayment was already dealt with.
+ * Said out loud rather than silently pocketed; never issued automatically.
+ */
+function furtherExcessWarnings(
+  arrivedSince: Prisma.Decimal,
+  reportedBefore: Prisma.Decimal,
+  minimum: Prisma.Decimal,
+): string[] {
+  if (arrivedSince.lessThan(minimum)) return [];
+  return [
+    `A further ${money(arrivedSince, "USD")} arrived after the ${money(
+      reportedBefore,
+      "USD",
+    )} overpayment was already refunded as a gift card. Refund the ` +
+      "difference manually — no second card is issued automatically.",
+  ];
+}
 
 export const TAG_PAID = "payram_paid";
 export const TAG_PARTIAL = "payram_partially_paid";
@@ -754,7 +826,7 @@ export async function settleOrder(params: {
       invoicedUsd: invoiced.toFixed(2),
       balanceUsd: mapping.balanceUsd ?? null,
       settled: mapping.shopifyFinancialStatus === TAG_PAID,
-      giftCardIssued: Boolean(mapping.giftCardId),
+      giftCardIssued: giftCardSlot(mapping.giftCardId) === "issued",
       note: null,
       warnings: [],
     };
@@ -899,13 +971,43 @@ export async function settleOrder(params: {
 
   if (isOver) {
     const minimum = safeDecimal(config?.giftCardMinimumUsd, "1.00");
+    const slot = giftCardSlot(mapping.giftCardId);
+    // The overpayment settlement last reported for this order, to say how
+    // much of today's is new. An order that was short before reported none.
+    const reportedBefore = Prisma.Decimal.max(safeDecimal(mapping.balanceUsd, "0"), 0);
+    const arrivedSince = balance.minus(reportedBefore);
 
     // Every figure in `balance` is Payram-confirmed: unverified payments were
     // refused above, and unconfirmed rows are not in the total.
-    if (!config?.autoGiftCardOnOverpayment) {
+    if (slot === "manual_refund") {
+      // The merchant was told to refund this by hand. Whatever has changed
+      // since — gift cards switched on, the cause of a refusal fixed — a card
+      // now would refund the buyer a second time.
+      warnings.push(
+        `Overpaid by ${money(balance, "USD")}. This overpayment was left for you to refund by ` +
+          "hand, so no gift card is issued for it automatically. Refund it from Shopify Admin " +
+          "if you have not already." +
+          (reportedBefore.greaterThan(0) && arrivedSince.greaterThan(0)
+            ? ` ${money(arrivedSince, "USD")} of it arrived after ${money(
+                reportedBefore,
+                "USD",
+              )} was reported.`
+            : ""),
+      );
+    } else if (slot === "issued") {
+      // A card exists for this order. Never issue a second one automatically
+      // — a retried webhook must not mint value twice.
+      giftCardIssued = true;
+      warnings.push(...furtherExcessWarnings(arrivedSince, reportedBefore, minimum));
+    } else if (slot === "pending") {
+      // Another delivery is creating the card right now and reports it.
+    } else if (!config?.autoGiftCardOnOverpayment) {
+      // Closing the slot is what makes "refund manually" safe to follow.
+      await markGiftCardForManualRefund(shop, shopifyOrderId, null);
       warnings.push(
         `Overpaid by ${money(balance, "USD")}. Automatic gift cards are off, so this ` +
-          "must be refunded manually. Enable it in the Payram app settings to automate it.",
+          "must be refunded manually — switching them on later does not issue one for this " +
+          "order. Enable it in the Payram app settings to refund future overpayments automatically.",
       );
     } else if (balance.lessThan(minimum)) {
       warnings.push(
@@ -916,7 +1018,7 @@ export async function settleOrder(params: {
       // Compare-and-set claim. The read of `mapping.giftCardId` above happened
       // before the Shopify calls, so two concurrent deliveries could both pass
       // it and both mint real money. Reserve the slot first; whoever loses the
-      // race takes the "already issued" branch.
+      // race issues nothing.
       (
         await prisma.paymentMapping.updateMany({
           where: { shop, shopifyOrderId, giftCardId: null },
@@ -924,22 +1026,7 @@ export async function settleOrder(params: {
         })
       ).count === 0
     ) {
-      // A card already exists for this order. Never issue a second one
-      // automatically — a retried webhook must not mint value twice.
-      giftCardIssued = mapping.giftCardId !== GIFT_CARD_PENDING;
-      // But if genuinely more money has since arrived, say so rather than
-      // silently pocketing it. Under-issuing is safe; staying quiet is not.
-      const alreadyRefunded = new Prisma.Decimal(mapping.balanceUsd ?? 0);
-      const newExcess = balance.minus(alreadyRefunded);
-      if (newExcess.greaterThanOrEqualTo(minimum)) {
-        warnings.push(
-          `A further ${money(newExcess, "USD")} arrived after the ${money(
-            alreadyRefunded,
-            "USD",
-          )} overpayment was already refunded as a gift card. Refund the ` +
-            "difference manually — no second card is issued automatically.",
-        );
-      }
+      // A concurrent delivery claimed the slot after we read it; it reports.
     } else {
       try {
         // Gift cards are denominated in the shop's own currency, which under
@@ -993,18 +1080,21 @@ export async function settleOrder(params: {
           );
         }
       } catch (err) {
-        // Release the reservation so a later delivery can retry — but only from
-        // `pending`, never from a real card id.
-        await prisma.paymentMapping
-          .updateMany({
-            where: { shop, shopifyOrderId, giftCardId: GIFT_CARD_PENDING },
-            data: { giftCardId: null },
-          })
-          .catch(() => {});
+        // The merchant is told to refund by hand, so the slot closes for good
+        // — from `pending` only, never over a real card id. Reopening it (as
+        // releases up to 1.2.0 did) let the next delivery or Re-check mint a
+        // card for an overpayment the merchant had already refunded.
+        await markGiftCardForManualRefund(shop, shopifyOrderId, GIFT_CARD_PENDING).catch(
+          (markErr) =>
+            console.error(
+              "[payram-settle] could not record the manual refund; the slot stays reserved:",
+              markErr,
+            ),
+        );
         warnings.push(
           `Overpaid by ${money(balance, "USD")} but the gift card could not be created: ${
             err instanceof Error ? err.message : String(err)
-          }. Refund manually.`,
+          }. Refund manually — no gift card will be issued for this order automatically.`,
         );
       }
     }

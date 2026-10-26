@@ -14,7 +14,8 @@
  * Payram's genuine $1 to it, mark the order paid and refund a $51 gift card.
  */
 import { createHmac } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Build the database before anything below imports the Prisma client, so the
@@ -560,5 +561,152 @@ describe("webhook signatures (MF-013)", () => {
     expect(res.status).toBe(200);
     expect(await prisma.payramPayment.count()).toBe(0);
     expectShopifyUntouched();
+  });
+});
+
+describe("overpayments the merchant was told to refund by hand (audit F3)", () => {
+  // What releases up to 1.2.0 wrote when the gift card could not be created.
+  // On 1.1.0 that was every order with a customer: the invalid recipient field
+  // made Shopify reject the request, which read as an unclear failure.
+  const refundManuallyBy110 =
+    "Overpaid by 50.00 USD but the gift card could not be created: Gift card could not be " +
+    "created and it is unclear whether Shopify created one (Shopify rejected the create gift " +
+    "card request. If this persists, the merchant should reopen the Payram app in Shopify " +
+    "Admin to refresh its permissions.). Check Shopify Admin → Gift cards before refunding " +
+    "manually.. Refund manually.";
+
+  /** The upgrade: the migration that turns those words into a closed slot. */
+  async function upgrade() {
+    const sql = readFileSync(
+      join(
+        process.cwd(),
+        "prisma/migrations/20261026120000_manual_refund_gift_card_slot/migration.sql",
+      ),
+      "utf8",
+    );
+    await prisma.$executeRawUnsafe(sql);
+  }
+
+  /** The end state 1.1.0 left: paid in Shopify, $50 over, no card, told to refund by hand. */
+  async function settledBy110(syncError: string, order = ORDER) {
+    await prisma.paymentMapping.upsert({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: order } },
+      create: {
+        shop: SHOP,
+        shopifyOrderId: order,
+        payramReferenceId: order === ORDER ? "real-ref" : `ref-${order}`,
+        amountInUsd: "100.00",
+        orderCurrency: "USD",
+        fxRate: "1",
+      },
+      update: {},
+    });
+    await prisma.paymentMapping.update({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: order } },
+      data: {
+        paymentState: "OVER_FILLED",
+        filledAmountInUsd: "150.00",
+        balanceUsd: "50.00",
+        shopifyFinancialStatus: "payram_paid",
+        shopifyMarkedPaidAt: new Date("2026-10-20T10:00:00Z"),
+        giftCardId: null,
+        syncError,
+      },
+    });
+  }
+
+  const recheck = () =>
+    settlement.recheckOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      accessToken: "shpat_test",
+      latestReferenceId: "real-ref",
+    });
+
+  it("an order 1.1.0 told to refund by hand gets no gift card on Re-check after the upgrade", async () => {
+    await settledBy110(refundManuallyBy110);
+    // 1.1.0 recorded the payment before confirmation existed.
+    await legacyRow("real-ref", "OVER_FILLED", "150.00");
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    const result = await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect(result.outcome).toMatchObject({ settled: true, giftCardIssued: false, balanceUsd: "50.00" });
+    const m = await mapping();
+    expect(m.giftCardId).toBe("manual_refund");
+    // The merchant still sees that it needs a manual refund.
+    expect(m.syncError).toMatch(
+      /Overpaid by 50\.00 USD\. This overpayment was left for you to refund by hand/,
+    );
+  });
+
+  it("so does one 1.1.0 left with gift cards off, after the merchant switches them on", async () => {
+    await settledBy110(
+      "Overpaid by 50.00 USD. Automatic gift cards are off, so this must be refunded manually. " +
+        "Enable it in the Payram app settings to automate it.",
+    );
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    // beforeEach leaves gift cards switched on.
+    await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+
+  it("so does one 1.1.0 could not verify, once Payram confirms it", async () => {
+    await settledBy110(
+      "Overpaid by 50.00 USD, but the payment could not be verified with Payram, so no gift " +
+        "card was issued. Confirm the payment in Payram and refund manually.",
+    );
+    await legacyRow("real-ref", "OVER_FILLED", "150.00");
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+
+    await upgrade();
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+
+  it("the upgrade leaves every other order alone", async () => {
+    await settledBy110(
+      "Overpaid by 0.50 USD, which is below the 1.00 USD gift card minimum. No gift card was issued.",
+    );
+    await settledBy110(refundManuallyBy110, "2002");
+    await prisma.paymentMapping.update({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: "2002" } },
+      data: { giftCardId: "gid://shopify/GiftCard/7" },
+    });
+
+    await upgrade();
+    await upgrade(); // and running it twice changes nothing
+
+    expect((await mapping()).giftCardId).toBeNull();
+    const other = await prisma.paymentMapping.findUniqueOrThrow({
+      where: { shop_shopifyOrderId: { shop: SHOP, shopifyOrderId: "2002" } },
+    });
+    expect(other.giftCardId).toBe("gid://shopify/GiftCard/7");
+  });
+
+  it("a gift card Shopify refuses now is not issued by a later Re-check either", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(
+      new Error("Gift card could not be created: Gift cards are not enabled for this shop"),
+    );
+
+    const first = await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(first.body).toMatchObject({ settled: true, giftCardIssued: false });
+    expect((await mapping()).syncError).toMatch(/could not be created.*Refund manually/);
+
+    // The merchant refunds by hand, enables gift cards, then presses Re-check.
+    const again = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(again.outcome?.giftCardIssued).toBe(false);
+    expect((await mapping()).giftCardId).toBe("manual_refund");
   });
 });

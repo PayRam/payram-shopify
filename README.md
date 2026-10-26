@@ -813,7 +813,11 @@ settings page (maximum 10%).
    Shopify automatically. The note records the amount and the card's last characters.
 3. If the buyer had no customer record, the note says so; send the code from Shopify Admin →
    *Gift cards*.
-4. Fulfil as normal. The order is paid.
+4. If no card could be issued (gift cards are off, or Shopify refused the card), the app says
+   *Refund manually*: do so. From then on the connector never issues a gift card for that order,
+   not even after gift cards are switched on or Re-check payment is pressed, so a buyer you refunded
+   by hand is never refunded twice. The order keeps saying it was left for a manual refund.
+5. Fulfil as normal. The order is paid.
 
 **Where to see problems.** Open the Payram app in Shopify Admin. Any order that is underpaid, or
 that the connector could not finish updating, is listed under *Recent crypto payments* with what
@@ -1008,6 +1012,7 @@ documented rather than quietly carried:
 | `shopifyFinancialStatus` | Synced from Shopify after mark-paid |
 | `shopifyPaidSyncedAt` | Timestamp of successful sync |
 | `syncError` | Error from last Shopify sync attempt |
+| `giftCardId` | The overpayment gift card issued for the order (`gid://shopify/GiftCard/…`); `pending` while one is being created; `manual_refund` once the merchant was told to refund by hand, after which none is issued automatically |
 | `orderCurrency` | Presentment currency of the Shopify order, e.g. `EUR` |
 | `orderAmount` | Original order total in `orderCurrency`, as a decimal string |
 | `fxRate` | USD per 1 unit of `orderCurrency` at the time of payment |

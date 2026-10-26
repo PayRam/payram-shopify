@@ -186,6 +186,19 @@ Severity: `low` / `medium` / `high` / `critical`.
   **Superseded by MF-012 (2026-10-22):** that residual risk was larger than
   stated — an unverified amount was recorded and later summed with verified
   ones, so it COULD mint value. Fixed there.
+- **Follow-up (2026-10-26, audit F3):** a second card could also come from the
+  merchant's own instructions. Whenever no card could be issued (gift cards
+  off, or the card could not be created) the merchant was told "Refund
+  manually", but the slot was left open (`giftCardId` NULL), so the next
+  delivery or Re-check payment issued a card once the cause went away — and
+  1.2.0 removed the cause for every order with a customer. A merchant who had
+  refunded by hand refunded twice. `giftCardId = 'manual_refund'` now closes
+  the slot whenever the merchant is told to refund by hand, and the migration
+  `20261026120000_manual_refund_gift_card_slot` closed it for the orders
+  earlier releases had told so (matched on the `syncError` words, the only
+  record they kept). Residual: an order whose "Refund manually" text was later
+  replaced by another `syncError` before the upgrade is not recognised and
+  stays open.
 - **Discovered-in:** overpayment/gift-card work, 2026-09-03.
 
 ---

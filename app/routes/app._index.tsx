@@ -24,7 +24,7 @@ import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
 import { validatePayramBaseUrl } from "~/utils/payram.server";
 import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
-import { recheckOrder } from "~/utils/settlement.server";
+import { giftCardSlot, recheckOrder } from "~/utils/settlement.server";
 import { getUpdateStatus } from "~/utils/updates.server";
 
 function summarizeResponseText(value: string): string | null {
@@ -118,6 +118,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       giftCard: p.giftCardAmount
         ? `${p.giftCardAmount} ${p.giftCardCurrency ?? ""}`.trim()
         : null,
+      // Whether a gift card can still be issued for this order, and why not.
+      giftCardSlot: giftCardSlot(p.giftCardId),
       // Settlement applies a tolerance, so the sign of the balance is NOT the
       // same question as "is this order settled". Use what settlement recorded.
       settled: p.shopifyFinancialStatus === "payram_paid",
@@ -962,6 +964,7 @@ docker run -d --name payram-shopify-connector \\
                     const over =
                       p.settled &&
                       (p.giftCard != null ||
+                        p.giftCardSlot === "manual_refund" ||
                         (p.syncError != null && /overpaid/i.test(p.syncError)));
                     return (
                       <Card key={p.shopifyOrderId} background="bg-surface-secondary">
@@ -995,7 +998,9 @@ docker run -d --name payram-shopify-connector \\
                                 Overpaid by ${Number(p.balanceUsd).toFixed(2)}.
                                 {p.giftCard
                                   ? ` Refunded as a ${p.giftCard} gift card.`
-                                  : " Not yet refunded — see the message below."}
+                                  : p.giftCardSlot === "manual_refund"
+                                    ? " Left for you to refund by hand — no gift card is issued for this order automatically."
+                                    : " Not yet refunded — see the message below."}
                               </p>
                             </Banner>
                           )}
