@@ -10,9 +10,13 @@
 # TAGGING
 # -------
 # Mirrors payramapp/payram so both images can be pinned the same way:
-#   sha-<short>   every build, immutable — the tag to pin in production
+#   sha-<short>   main and dispatched builds, immutable — the tag to pin in
+#                 production. A v* run does not republish it: it rebuilds the
+#                 same commit with APP_VERSION set, which would swap the image
+#                 behind a tag someone pinned.
 #   <version>     on a v* tag, plus the major.minor ladder
-#   latest        main only
+#   latest        main only (metadata-action would add it to every v* run by
+#                 default, so re-running an old release could move it back)
 #
 # The installer hardcodes `:latest`, so a merchant re-running it silently takes
 # whatever was last pushed. `sha-` tags give them something stable to pin to,
@@ -36,6 +40,11 @@ on:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
+
+# Jobs that need more ask for it; everything else, the reusable test workflow
+# included, only reads.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -178,8 +187,9 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.DOCKER_IMAGE }}
+          flavor: latest=false
           tags: |
-            type=sha,prefix=sha-,format=short
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref_type != 'tag' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
@@ -197,21 +207,20 @@ jobs:
       # The tags above can only be right if both platforms made it; a merchant on
       # ARM pulling an amd64-only `latest` gets "exec format error".
       - name: Check both platforms are published
-        env:
-          SHA_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
-          ref="${DOCKER_IMAGE}:${SHA_TAG::11}"
-          # Attestation manifests carry the platform unknown/unknown; skip them.
-          platforms="$(docker buildx imagetools inspect "$ref" --raw \
-            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | join(" ")')"
-          echo "$ref: $platforms"
-          for want in linux/amd64 linux/arm64; do
-            case " $platforms " in
-              *" $want "*) ;;
-              *) echo "::error::$ref is missing $want"; exit 1 ;;
-            esac
-          done
+          while IFS= read -r ref; do
+            # Attestation manifests carry the platform unknown/unknown; skip them.
+            platforms="$(docker buildx imagetools inspect "$ref" --raw \
+              | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | join(" ")')"
+            echo "$ref: $platforms"
+            for want in linux/amd64 linux/arm64; do
+              case " $platforms " in
+                *" $want "*) ;;
+                *) echo "::error::$ref is missing $want"; exit 1 ;;
+              esac
+            done
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
 
       # A tagged build is a release merchants are told about in-app, so publish
       # the notes they will read. Mark the release body with [installer-required]
