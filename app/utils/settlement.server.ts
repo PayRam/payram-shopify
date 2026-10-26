@@ -54,7 +54,10 @@ import {
   appendOrderNote,
   createGiftCard,
   fetchOrderSettlementContext,
+  findGiftCardsByNote,
+  GiftCardOutcomeUnknownError,
   markOrderPaid,
+  type FoundGiftCard,
 } from "~/utils/shopify-admin.server";
 
 /** Payram's payment classification, as sent on the merchant webhook. */
@@ -105,12 +108,170 @@ function safeDecimal(value: string | null | undefined, fallback: string): Prisma
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* The gift-card slot — may a card still be issued for this order?     */
+/* ------------------------------------------------------------------ */
+//
+// `PaymentMapping.giftCardId` is the one place that decides it:
+//
+//   null                      open: settlement may issue a card
+//   "pending"                 a settlement is creating one right now
+//   "unconfirmed:<ISO time>"  creating one did not say whether it worked;
+//                             Shopify is checked for the card before any retry
+//   "manual_refund"           the merchant was told to refund this
+//                             overpayment by hand; never issued automatically
+//   gid://shopify/GiftCard/…  the card that was issued
+//
+// Every transition is a compare-and-set on the column, so two deliveries can
+// never both decide the slot is theirs.
+
 /**
  * Placeholder written while a gift card is being created, so a concurrent
  * webhook delivery cannot also decide the slot is free. Replaced by the real
- * Shopify GID on success, cleared on failure.
+ * Shopify GID on success.
  */
 const GIFT_CARD_PENDING = "pending";
+
+/**
+ * The merchant has been told to refund this overpayment by hand — gift cards
+ * were off, or Shopify refused the card. Settlement never issues one for the
+ * order afterwards, even if the feature is switched on or the cause is fixed:
+ * a merchant who did as told would otherwise refund the buyer twice.
+ * Under-issuing is recoverable; double-issuing is not.
+ *
+ * Orders that releases up to 1.2.0 told to refund by hand — recorded then only
+ * as the words in `syncError` — were moved to this value by the migration
+ * 20261026120000_manual_refund_gift_card_slot.
+ */
+const GIFT_CARD_MANUAL_REFUND = "manual_refund";
+
+/**
+ * giftCardCreate gave no answer — a timeout, a dropped connection — so Shopify
+ * may have made the card. The slot stays reserved, the order says so, and no
+ * card is created again until Shopify has been asked for one carrying this
+ * order's note marker (`giftCardNoteMarker`) and has none. The time is when the
+ * unclear attempt ended, so the check waits out Shopify's indexing.
+ */
+const GIFT_CARD_UNCONFIRMED_PREFIX = "unconfirmed:";
+
+/**
+ * How long after an unclear attempt Shopify is given before its gift card list
+ * is believed. A card made moments ago may not be listed yet, and reading
+ * "none" too early would mint a second one.
+ */
+const GIFT_CARD_LOOKUP_DELAY_MS = 10 * 60 * 1000;
+
+export type GiftCardSlot = "open" | "pending" | "unconfirmed" | "manual_refund" | "issued";
+
+/** What `PaymentMapping.giftCardId` says about the order's gift card. */
+export function giftCardSlot(giftCardId: string | null | undefined): GiftCardSlot {
+  if (giftCardId == null || giftCardId === "") return "open";
+  if (giftCardId === GIFT_CARD_PENDING) return "pending";
+  if (giftCardId === GIFT_CARD_MANUAL_REFUND) return "manual_refund";
+  if (giftCardId.startsWith(GIFT_CARD_UNCONFIRMED_PREFIX)) return "unconfirmed";
+  return "issued";
+}
+
+function unconfirmedGiftCardValue(since: Date): string {
+  return `${GIFT_CARD_UNCONFIRMED_PREFIX}${since.toISOString()}`;
+}
+
+/** When the unclear attempt ended. Unreadable → long ago, so the check may run. */
+function unconfirmedGiftCardSince(giftCardId: string): Date {
+  const since = new Date(giftCardId.slice(GIFT_CARD_UNCONFIRMED_PREFIX.length));
+  return Number.isNaN(since.getTime()) ? new Date(0) : since;
+}
+
+function lookupAllowedAt(since: Date): Date {
+  return new Date(since.getTime() + GIFT_CARD_LOOKUP_DELAY_MS);
+}
+
+/** "2026-10-26 12:10 UTC" — the same on the server and in the merchant's browser. */
+export function formatUtc(date: Date): string {
+  return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+/**
+ * Carried by every gift card note, so the card can be found again for this
+ * order. The closing bracket keeps order 12 from matching order 123.
+ */
+function giftCardNoteMarker(shopifyOrderId: string): string {
+  return `[Payram order ${shopifyOrderId}]`;
+}
+
+function giftCardNote(
+  orderName: string | null,
+  shopifyOrderId: string,
+  overpaidUsd: Prisma.Decimal,
+): string {
+  return (
+    `Payram overpayment refund for order ${orderName ?? shopifyOrderId} ` +
+    `(${money(overpaidUsd, "USD")} overpaid). ${giftCardNoteMarker(shopifyOrderId)}`
+  );
+}
+
+/**
+ * Close an open slot because the merchant is being told to refund by hand.
+ * Single statement; a slot that already holds anything else is left alone.
+ */
+async function markGiftCardForManualRefund(
+  shop: string,
+  shopifyOrderId: string,
+  from: null | typeof GIFT_CARD_PENDING,
+): Promise<void> {
+  await prisma.paymentMapping.updateMany({
+    where: { shop, shopifyOrderId, giftCardId: from },
+    data: { giftCardId: GIFT_CARD_MANUAL_REFUND, updatedAt: new Date() },
+  });
+}
+
+/**
+ * The order needs review: a gift card may exist. Says what the merchant can
+ * check and what the app does next — and not to refund by hand meanwhile,
+ * since the app may still issue the card.
+ */
+function unconfirmedGiftCardWarning(
+  balance: Prisma.Decimal,
+  shopifyOrderId: string,
+  lookupFrom: Date | null,
+): string {
+  return (
+    `Overpaid by ${money(balance, "USD")}. Creating the gift card did not say whether it ` +
+    "worked, so Shopify may have made it. Its note would end " +
+    `"${giftCardNoteMarker(shopifyOrderId)}" in Shopify Admin → Gift cards. Do not refund it ` +
+    "by hand as well: " +
+    (lookupFrom ? `from ${formatUtc(lookupFrom)}, ` : "") +
+    "Re-check payment looks for the card in Shopify, records it if it is there, and issues " +
+    "one only if there is none."
+  );
+}
+
+function giftCardsOffWarning(balance: Prisma.Decimal): string {
+  return (
+    `Overpaid by ${money(balance, "USD")}. Automatic gift cards are off, so this ` +
+    "must be refunded manually — switching them on later does not issue one for this " +
+    "order. Enable it in the Payram app settings to refund future overpayments automatically."
+  );
+}
+
+/**
+ * Money that arrived after the order's overpayment was already dealt with.
+ * Said out loud rather than silently pocketed; never issued automatically.
+ */
+function furtherExcessWarnings(
+  arrivedSince: Prisma.Decimal,
+  reportedBefore: Prisma.Decimal,
+  minimum: Prisma.Decimal,
+): string[] {
+  if (arrivedSince.lessThan(minimum)) return [];
+  return [
+    `A further ${money(arrivedSince, "USD")} arrived after the ${money(
+      reportedBefore,
+      "USD",
+    )} overpayment was already refunded as a gift card. Refund the ` +
+      "difference manually — no second card is issued automatically.",
+  ];
+}
 
 export const TAG_PAID = "payram_paid";
 export const TAG_PARTIAL = "payram_partially_paid";
@@ -754,7 +915,7 @@ export async function settleOrder(params: {
       invoicedUsd: invoiced.toFixed(2),
       balanceUsd: mapping.balanceUsd ?? null,
       settled: mapping.shopifyFinancialStatus === TAG_PAID,
-      giftCardIssued: Boolean(mapping.giftCardId),
+      giftCardIssued: giftCardSlot(mapping.giftCardId) === "issued",
       note: null,
       warnings: [],
     };
@@ -897,16 +1058,235 @@ export async function settleOrder(params: {
   let giftCardIssued = false;
   const giftFields: Record<string, string | null> = {};
 
+  /** Record a card that exists in Shopify as this order's, and note it on the order. */
+  const recordGiftCard = async (
+    card: { id: string; lastCharacters: string | null; amount: string; currencyCode: string },
+    delivery: string,
+  ): Promise<void> => {
+    giftCardIssued = true;
+    giftFields.giftCardId = card.id;
+    giftFields.giftCardLastChars = card.lastCharacters;
+    giftFields.giftCardAmount = card.amount;
+    giftFields.giftCardCurrency = card.currencyCode;
+    try {
+      await appendOrderNote(
+        shop,
+        accessToken,
+        shopifyOrderId,
+        // Pass the note as Shopify last reported it and let appendOrderNote
+        // append. Synthesising `existing + settlement line` here duplicated
+        // that line on any retry, because the fetched note already had it.
+        // Only reached when orderContext loaded, so this is never a blind null.
+        orderContext?.note ?? "",
+        `Payram: refunded overpayment as gift card ${card.amount} ${card.currencyCode} ` +
+          `ending ${card.lastCharacters ?? "?"}. ${delivery}`,
+      );
+    } catch (err) {
+      warnings.push(
+        `Gift card was created but the order note failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  /**
+   * Create the card for `balance`. Only called holding the slot (`pending`),
+   * and leaves it holding the card, closed for a manual refund (nothing was
+   * created), or unconfirmed (Shopify did not say whether it created one).
+   */
+  const issueGiftCard = async (): Promise<void> => {
+    try {
+      // Gift cards are denominated in the shop's own currency, which under
+      // Shopify Markets is not necessarily the buyer's presentment currency.
+      const giftCurrency = orderContext?.shopCurrencyCode ?? orderCurrency;
+      const giftAmount =
+        giftCurrency === orderCurrency && mapping.fxRate
+          ? convertFromUsdAtRate(balance, mapping.fxRate)
+          : await convertFromUsd(balance, giftCurrency);
+
+      const card = await createGiftCard(shop, accessToken, {
+        amount: giftAmount.toFixed(2),
+        currencyCode: giftCurrency,
+        customerId: orderContext?.customerId ?? null,
+        note: giftCardNote(orderContext?.orderName ?? null, shopifyOrderId, balance),
+        message:
+          "You sent a little more than your order total. Here is the difference as a gift card.",
+      });
+
+      await recordGiftCard(
+        {
+          id: card.id,
+          lastCharacters: card.lastCharacters,
+          amount: giftAmount.toFixed(2),
+          currencyCode: card.currencyCode ?? giftCurrency,
+        },
+        card.notified
+          ? "Shopify has emailed it to the customer."
+          : "No customer was attached, so send the code from Shopify Admin → Gift cards.",
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      if (err instanceof GiftCardOutcomeUnknownError) {
+        // Shopify may have created the card. Keep the slot reserved and look
+        // for the card before any later attempt — freeing it (as releases up
+        // to 1.2.0 did) let the next delivery or Re-check mint a second one.
+        const since = new Date();
+        await prisma.paymentMapping
+          .updateMany({
+            where: { shop, shopifyOrderId, giftCardId: GIFT_CARD_PENDING },
+            data: { giftCardId: unconfirmedGiftCardValue(since), updatedAt: since },
+          })
+          .catch((markErr) =>
+            console.error(
+              "[payram-settle] could not record the unclear gift card; the slot stays reserved:",
+              markErr,
+            ),
+          );
+        warnings.push(unconfirmedGiftCardWarning(balance, shopifyOrderId, lookupAllowedAt(since)));
+        return;
+      }
+      // Nothing was created, and the merchant is told to refund by hand, so
+      // the slot closes for good — from `pending` only, never over a real card
+      // id. Reopening it (as releases up to 1.2.0 did) let the next delivery
+      // or Re-check mint a card for an overpayment already refunded by hand.
+      await markGiftCardForManualRefund(shop, shopifyOrderId, GIFT_CARD_PENDING).catch(
+        (markErr) =>
+          console.error(
+            "[payram-settle] could not record the manual refund; the slot stays reserved:",
+            markErr,
+          ),
+      );
+      warnings.push(
+        `Overpaid by ${money(balance, "USD")} but the gift card could not be created: ${detail}. ` +
+          "Refund manually — no gift card will be issued for this order automatically.",
+      );
+    }
+  };
+
+  /**
+   * An earlier attempt did not say whether Shopify created the card. Look for
+   * it — by the order marker every card's note carries — before anything else:
+   * record it if it exists, and create one only if Shopify has none.
+   */
+  const resolveUnconfirmedGiftCard = async (unconfirmedValue: string): Promise<void> => {
+    const since = unconfirmedGiftCardSince(unconfirmedValue);
+    const allowedAt = lookupAllowedAt(since);
+    if (Date.now() < allowedAt.getTime()) {
+      // Shopify's gift card list can lag a card just created; "none" read
+      // too early would mint a second one.
+      warnings.push(unconfirmedGiftCardWarning(balance, shopifyOrderId, allowedAt));
+      return;
+    }
+    const claimed = await prisma.paymentMapping.updateMany({
+      where: { shop, shopifyOrderId, giftCardId: unconfirmedValue },
+      data: { giftCardId: GIFT_CARD_PENDING, updatedAt: new Date() },
+    });
+    // A concurrent delivery is resolving it; it reports.
+    if (claimed.count === 0) return;
+
+    let found: FoundGiftCard[];
+    try {
+      found = await findGiftCardsByNote(shop, accessToken, {
+        noteIncludes: giftCardNoteMarker(shopifyOrderId),
+        // Every card for this order is newer than its first payment link; the
+        // hour covers clock differences between this server and Shopify.
+        createdSince: new Date(mapping.createdAt.getTime() - 60 * 60 * 1000),
+      });
+    } catch (err) {
+      console.error("[payram-settle] could not look for an unclear gift card:", err);
+      await prisma.paymentMapping
+        .updateMany({
+          where: { shop, shopifyOrderId, giftCardId: GIFT_CARD_PENDING },
+          data: { giftCardId: unconfirmedValue },
+        })
+        .catch((markErr) =>
+          console.error(
+            "[payram-settle] could not restore the unclear gift card; the slot stays reserved:",
+            markErr,
+          ),
+        );
+      warnings.push(
+        unconfirmedGiftCardWarning(balance, shopifyOrderId, null) +
+          ` Shopify could not be asked just now (${
+            err instanceof Error ? err.message : String(err)
+          }); use Re-check payment again shortly.`,
+      );
+      return;
+    }
+
+    if (found.length > 0) {
+      const [card, ...extra] = found;
+      await recordGiftCard(
+        {
+          id: card.id,
+          lastCharacters: card.lastCharacters,
+          amount: card.amount ?? "?",
+          currencyCode: card.currencyCode ?? orderContext?.shopCurrencyCode ?? orderCurrency,
+        },
+        "It was created by an earlier attempt that did not confirm; if the customer has not " +
+          "received it, send the code from Shopify Admin → Gift cards.",
+      );
+      if (extra.length > 0) {
+        warnings.push(
+          `Shopify has ${found.length} gift cards for this order's overpayment (ending ${found
+            .map((c) => c.lastCharacters ?? "?")
+            .join(", ")}). Only one was meant to be issued: keep the card ending ` +
+            `${card.lastCharacters ?? "?"} and disable the others in Shopify Admin → Gift cards.`,
+        );
+      }
+      return;
+    }
+
+    if (!config?.autoGiftCardOnOverpayment) {
+      // Switched off since the unclear attempt, and Shopify made no card.
+      await markGiftCardForManualRefund(shop, shopifyOrderId, GIFT_CARD_PENDING);
+      warnings.push(giftCardsOffWarning(balance));
+      return;
+    }
+    // Shopify has no card for this order: the earlier attempt made nothing.
+    // The minimum was met when that attempt started, so it is not re-applied.
+    await issueGiftCard();
+  };
+
   if (isOver) {
     const minimum = safeDecimal(config?.giftCardMinimumUsd, "1.00");
+    const slot = giftCardSlot(mapping.giftCardId);
+    // The overpayment settlement last reported for this order, to say how
+    // much of today's is new. An order that was short before reported none.
+    const reportedBefore = Prisma.Decimal.max(safeDecimal(mapping.balanceUsd, "0"), 0);
+    const arrivedSince = balance.minus(reportedBefore);
 
     // Every figure in `balance` is Payram-confirmed: unverified payments were
     // refused above, and unconfirmed rows are not in the total.
-    if (!config?.autoGiftCardOnOverpayment) {
+    if (slot === "manual_refund") {
+      // The merchant was told to refund this by hand. Whatever has changed
+      // since — gift cards switched on, the cause of a refusal fixed — a card
+      // now would refund the buyer a second time.
       warnings.push(
-        `Overpaid by ${money(balance, "USD")}. Automatic gift cards are off, so this ` +
-          "must be refunded manually. Enable it in the Payram app settings to automate it.",
+        `Overpaid by ${money(balance, "USD")}. This overpayment was left for you to refund by ` +
+          "hand, so no gift card is issued for it automatically. Refund it from Shopify Admin " +
+          "if you have not already." +
+          (reportedBefore.greaterThan(0) && arrivedSince.greaterThan(0)
+            ? ` ${money(arrivedSince, "USD")} of it arrived after ${money(
+                reportedBefore,
+                "USD",
+              )} was reported.`
+            : ""),
       );
+    } else if (slot === "issued") {
+      // A card exists for this order. Never issue a second one automatically
+      // — a retried webhook must not mint value twice.
+      giftCardIssued = true;
+      warnings.push(...furtherExcessWarnings(arrivedSince, reportedBefore, minimum));
+    } else if (slot === "pending") {
+      // Another delivery is creating the card right now and reports it.
+    } else if (slot === "unconfirmed") {
+      await resolveUnconfirmedGiftCard(mapping.giftCardId ?? "");
+    } else if (!config?.autoGiftCardOnOverpayment) {
+      // Closing the slot is what makes "refund manually" safe to follow.
+      await markGiftCardForManualRefund(shop, shopifyOrderId, null);
+      warnings.push(giftCardsOffWarning(balance));
     } else if (balance.lessThan(minimum)) {
       warnings.push(
         `Overpaid by ${money(balance, "USD")}, which is below the ${money(minimum, "USD")} ` +
@@ -916,7 +1296,7 @@ export async function settleOrder(params: {
       // Compare-and-set claim. The read of `mapping.giftCardId` above happened
       // before the Shopify calls, so two concurrent deliveries could both pass
       // it and both mint real money. Reserve the slot first; whoever loses the
-      // race takes the "already issued" branch.
+      // race issues nothing.
       (
         await prisma.paymentMapping.updateMany({
           where: { shop, shopifyOrderId, giftCardId: null },
@@ -924,89 +1304,9 @@ export async function settleOrder(params: {
         })
       ).count === 0
     ) {
-      // A card already exists for this order. Never issue a second one
-      // automatically — a retried webhook must not mint value twice.
-      giftCardIssued = mapping.giftCardId !== GIFT_CARD_PENDING;
-      // But if genuinely more money has since arrived, say so rather than
-      // silently pocketing it. Under-issuing is safe; staying quiet is not.
-      const alreadyRefunded = new Prisma.Decimal(mapping.balanceUsd ?? 0);
-      const newExcess = balance.minus(alreadyRefunded);
-      if (newExcess.greaterThanOrEqualTo(minimum)) {
-        warnings.push(
-          `A further ${money(newExcess, "USD")} arrived after the ${money(
-            alreadyRefunded,
-            "USD",
-          )} overpayment was already refunded as a gift card. Refund the ` +
-            "difference manually — no second card is issued automatically.",
-        );
-      }
+      // A concurrent delivery claimed the slot after we read it; it reports.
     } else {
-      try {
-        // Gift cards are denominated in the shop's own currency, which under
-        // Shopify Markets is not necessarily the buyer's presentment currency.
-        const giftCurrency = orderContext?.shopCurrencyCode ?? orderCurrency;
-        const giftAmount =
-          giftCurrency === orderCurrency && mapping.fxRate
-            ? convertFromUsdAtRate(balance, mapping.fxRate)
-            : await convertFromUsd(balance, giftCurrency);
-
-        const card = await createGiftCard(shop, accessToken, {
-          amount: giftAmount.toFixed(2),
-          currencyCode: giftCurrency,
-          customerId: orderContext?.customerId ?? null,
-          note: `Payram overpayment refund for order ${
-            orderContext?.orderName ?? shopifyOrderId
-          } (${money(balance, "USD")} overpaid).`,
-          message:
-            "You sent a little more than your order total. Here is the difference as a gift card.",
-        });
-
-        giftCardIssued = true;
-        giftFields.giftCardId = card.id;
-        giftFields.giftCardLastChars = card.lastCharacters;
-        giftFields.giftCardAmount = giftAmount.toFixed(2);
-        giftFields.giftCardCurrency = card.currencyCode ?? giftCurrency;
-
-        const delivery = card.notified
-          ? "Shopify has emailed it to the customer."
-          : "No customer was attached, so send the code from Shopify Admin → Gift cards.";
-        try {
-          await appendOrderNote(
-            shop,
-            accessToken,
-            shopifyOrderId,
-            // Pass the note as Shopify last reported it and let appendOrderNote
-            // append. Synthesising `existing + settlement line` here duplicated
-            // that line on any retry, because the fetched note already had it.
-            // Only reached when orderContext loaded, so this is never a blind null.
-            orderContext?.note ?? "",
-            `Payram: refunded overpayment as gift card ${money(
-              giftAmount,
-              giftFields.giftCardCurrency ?? "",
-            )} ending ${card.lastCharacters ?? "?"}. ${delivery}`,
-          );
-        } catch (err) {
-          warnings.push(
-            `Gift card was created but the order note failed: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        }
-      } catch (err) {
-        // Release the reservation so a later delivery can retry — but only from
-        // `pending`, never from a real card id.
-        await prisma.paymentMapping
-          .updateMany({
-            where: { shop, shopifyOrderId, giftCardId: GIFT_CARD_PENDING },
-            data: { giftCardId: null },
-          })
-          .catch(() => {});
-        warnings.push(
-          `Overpaid by ${money(balance, "USD")} but the gift card could not be created: ${
-            err instanceof Error ? err.message : String(err)
-          }. Refund manually.`,
-        );
-      }
+      await issueGiftCard();
     }
   }
 

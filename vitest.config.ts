@@ -13,6 +13,7 @@ export default defineConfig({
   resolve: { tsconfigPaths: true },
   test: {
     environment: "node",
-    include: ["app/**/*.test.ts", "app/**/*.test.tsx"],
+    // scripts/: the release workflow's decisions (should-publish-latest.sh).
+    include: ["app/**/*.test.ts", "app/**/*.test.tsx", "scripts/**/*.test.ts"],
   },
 });
