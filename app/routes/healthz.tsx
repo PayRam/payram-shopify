@@ -25,13 +25,11 @@
  * should not fingerprint itself to anyone who asks. The dashboard already shows
  * the running version to the merchant, who is authenticated.
  */
-import { json } from "@remix-run/node";
-
 /** Stable marker. The installer greps for this exact string — do not reword. */
 export const HEALTH_MARKER = "payram-shopify-connector";
 
 export const loader = () =>
-  json(
+  Response.json(
     { app: HEALTH_MARKER, ok: true },
     // A cached 200 from a proxy would make a broken route look alive.
     { headers: { "Cache-Control": "no-store" } },

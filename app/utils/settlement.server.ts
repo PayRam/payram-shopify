@@ -27,19 +27,28 @@
  *
  * TRUST
  * -----
- * The Payram webhook is unsigned (MF-004), so its amounts are attacker-supplied.
- * Anything that moves money -- issuing a gift card -- requires `verified: true`,
- * meaning the figures were re-read from Payram directly. Unverified payments are
- * still recorded and tagged; they simply never mint value.
+ * The Payram webhook body is attacker-supplied: older Payram releases do not
+ * sign it (MF-004), and the `customer_id` it is matched on is printed in the
+ * buyer's own payment link. So the rule is absolute:
+ *
+ *   Only figures Payram itself confirms — the reference exists AND its
+ *   customerId is this order's — become money received, tag or note an order,
+ *   mark it paid, or mint a gift card. An unconfirmed message changes no money
+ *   row and nothing on the Shopify order.
+ *
+ * Every PayramPayment row records whether Payram confirmed it (`verifiedAt`),
+ * and `sumReceivedUsd` counts confirmed rows only. Rows written before that
+ * column existed are unconfirmed — some may hold forged amounts — and are
+ * confirmed lazily with Payram, a few at a time, before they can count (MF-012).
  *
  * Rules: R-DB-TX (reads and writes that inform each other are transactional),
  * R-API-FOR-AGENTS (merchant-facing text says what to do next),
- * R-MALICIOUS-FLOW (MF-008).
+ * R-MALICIOUS-FLOW (MF-008, MF-011, MF-012).
  */
 import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { convertFromUsd, convertFromUsdAtRate } from "~/utils/fx.server";
-import { sumReceivedUsd } from "~/utils/payment-session.server";
+import { fetchPayramPayment } from "~/utils/payram.server";
 import {
   addOrderTags,
   appendOrderNote,
@@ -135,6 +144,367 @@ export function normalizePayramState(raw: unknown): PayramState {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Confirmation — only what Payram confirms is money received          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * At most this many unconfirmed payments are looked up per settlement or
+ * payment-page visit. Rows from before the confirmation column can include any
+ * number of forged ones; nothing unconfirmed counts in the meantime, so the
+ * bound only delays an honest older payment, it can never inflate a total.
+ */
+const PENDING_CONFIRMATIONS_PER_PASS = 5;
+
+/** Re-check payment reads at most this many references for one order. */
+const RECHECK_MAX_REFERENCES = 25;
+
+/** Payram lookups in flight at once — a hanging Payram costs one timeout, not N. */
+const LOOKUP_CONCURRENCY = 5;
+
+/** What Payram said about one reference, judged for one order. */
+export type PaymentConfirmation =
+  | {
+      referenceId: string;
+      outcome: "confirmed";
+      state: PayramState;
+      filledAmountInUsd: string | null;
+    }
+  | {
+      referenceId: string;
+      /** Payram answered, and the reference is not this order's money. */
+      outcome: "rejected";
+      reason: "not_found" | "other_order";
+      ownerCustomerId: string | null;
+    }
+  | {
+      referenceId: string;
+      /** No answer — try again later. Nothing may be concluded from it. */
+      outcome: "unavailable";
+      reason: string;
+    };
+
+type ConfirmedPayment = Extract<PaymentConfirmation, { outcome: "confirmed" }>;
+
+/**
+ * Ask Payram whether `referenceId` is real and belongs to this order.
+ *
+ * Verifying that the reference exists is not enough — it must also be THIS
+ * order's money. Without the ownership check, a reference belonging to order A
+ * could be posted with order B's customer_id and have its funds (and any
+ * resulting gift card) credited to B.
+ *
+ * Never throws.
+ */
+export async function confirmPayramReference(
+  shop: string,
+  shopifyOrderId: string,
+  referenceId: string,
+): Promise<PaymentConfirmation> {
+  let lookup: Awaited<ReturnType<typeof fetchPayramPayment>>;
+  try {
+    lookup = await fetchPayramPayment(shop, referenceId);
+  } catch (err) {
+    console.error("[payram-confirm] lookup failed:", err);
+    return { referenceId, outcome: "unavailable", reason: "Payram could not be reached" };
+  }
+
+  if (lookup.status === "unavailable") {
+    return { referenceId, outcome: "unavailable", reason: lookup.reason };
+  }
+  if (lookup.status === "not_found") {
+    return { referenceId, outcome: "rejected", reason: "not_found", ownerCustomerId: null };
+  }
+
+  const expected = `shopify:${shop}:order:${shopifyOrderId}`;
+  const owner = lookup.payment.customerId;
+  const ownsOrder =
+    owner != null &&
+    (owner === expected ||
+      // Top-ups are issued under a suffixed customerId for the same order.
+      owner.startsWith(`${expected}:`));
+  if (!ownsOrder) {
+    return { referenceId, outcome: "rejected", reason: "other_order", ownerCustomerId: owner };
+  }
+
+  const state = normalizePayramState(lookup.payment.paymentState);
+  return {
+    referenceId,
+    outcome: "confirmed",
+    state,
+    // OPEN means nothing has arrived yet and CANCELLED that nothing will.
+    // Neither carries funds, so neither may carry an amount.
+    filledAmountInUsd:
+      state === "OPEN" || state === "CANCELLED" ? null : lookup.payment.filledAmountInUsd,
+  };
+}
+
+/** Look up several references, a few at a time. Order of results matches input. */
+async function confirmPayramReferences(
+  shop: string,
+  shopifyOrderId: string,
+  referenceIds: string[],
+): Promise<PaymentConfirmation[]> {
+  const results: PaymentConfirmation[] = new Array(referenceIds.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < referenceIds.length) {
+      const i = next++;
+      results[i] = await confirmPayramReference(shop, shopifyOrderId, referenceIds[i]);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(LOOKUP_CONCURRENCY, referenceIds.length) }, worker),
+  );
+  return results;
+}
+
+/**
+ * Everything received for an order: Payram-confirmed payments, ignoring
+ * cancelled requests.
+ *
+ * The ONE implementation of the money-summing rule. Settlement and the buyer's
+ * payment page both call it; two copies could drift, and the two disagreeing
+ * about what an order has received is exactly the class of bug this connector
+ * exists to remove. An unconfirmed row never counts — not even to tell a buyer
+ * they owe nothing.
+ */
+export async function sumReceivedUsd(
+  tx: Prisma.TransactionClient | typeof prisma,
+  shop: string,
+  shopifyOrderId: string,
+): Promise<Prisma.Decimal> {
+  const rows = await tx.payramPayment.findMany({
+    where: { shop, shopifyOrderId },
+    select: { filledAmountInUsd: true, state: true, verifiedAt: true, rejectedAt: true },
+  });
+  return rows
+    .filter((r) => r.verifiedAt != null && r.rejectedAt == null && r.state !== "CANCELLED")
+    .reduce(
+      (sum, r) => sum.plus(new Prisma.Decimal(r.filledAmountInUsd ?? 0)),
+      new Prisma.Decimal(0),
+    );
+}
+
+/** Would this row change the total if Payram confirmed it as stored? */
+function wouldCountIfConfirmed(row: {
+  state: string | null;
+  filledAmountInUsd: string | null;
+}): boolean {
+  if (row.state === "CANCELLED" || row.filledAmountInUsd == null) return false;
+  try {
+    return new Prisma.Decimal(row.filledAmountInUsd).greaterThan(0);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask Payram about this order's payments that are still unconfirmed.
+ *
+ * These are rows written before the connector recorded confirmation, which may
+ * include amounts from forged webhooks. Only rows that would add money if
+ * confirmed are looked up (a cancelled or empty row counts nothing either way),
+ * rejected rows are never retried here, and at most a few per call — so each
+ * row is confirmed at most once and a forged one costs one lookup, ever.
+ *
+ * Network only; pass the result to `applyPaymentConfirmations` inside the
+ * transaction that reads the total.
+ */
+export async function confirmPendingPayments(
+  shop: string,
+  shopifyOrderId: string,
+  options: { except?: string[] } = {},
+): Promise<PaymentConfirmation[]> {
+  const except = options.except ?? [];
+  const rows = await prisma.payramPayment.findMany({
+    where: { shop, shopifyOrderId },
+    orderBy: { createdAt: "asc" },
+  });
+  const pending = rows
+    .filter(
+      (r) =>
+        r.verifiedAt == null &&
+        r.rejectedAt == null &&
+        !except.includes(r.payramReferenceId) &&
+        wouldCountIfConfirmed(r),
+    )
+    .slice(0, PENDING_CONFIRMATIONS_PER_PASS)
+    .map((r) => r.payramReferenceId);
+  return pending.length ? confirmPayramReferences(shop, shopifyOrderId, pending) : [];
+}
+
+/**
+ * Record a payment whose figures Payram has just confirmed belong to this order.
+ *
+ * Payram decides which order a reference belongs to, so the row is (re)assigned
+ * to this order: one first written under the wrong order by a forged webhook
+ * moves to its real owner here. The tx hash is only ever set, never cleared —
+ * Payram re-sends every three seconds and `payment_info` is absent on some
+ * deliveries.
+ */
+export async function recordConfirmedPayment(
+  tx: Prisma.TransactionClient,
+  payment: {
+    shop: string;
+    shopifyOrderId: string;
+    referenceId: string;
+    state: PayramState;
+    filledAmountInUsd: string | null;
+    txHash: string | null;
+  },
+): Promise<void> {
+  const { shop, shopifyOrderId, referenceId, state, filledAmountInUsd, txHash } = payment;
+  const now = new Date();
+  await tx.payramPayment.upsert({
+    where: { payramReferenceId: referenceId },
+    create: {
+      shop,
+      shopifyOrderId,
+      payramReferenceId: referenceId,
+      state,
+      filledAmountInUsd,
+      txHash,
+      verifiedAt: now,
+    },
+    update: {
+      shop,
+      shopifyOrderId,
+      state,
+      filledAmountInUsd,
+      verifiedAt: now,
+      rejectedAt: null,
+      ...(txHash ? { txHash } : {}),
+      updatedAt: now,
+    },
+  });
+}
+
+/** What applying Payram's answers did to an order's payments. */
+export interface ConfirmationTally {
+  /** Rows whose contribution to the total may have changed. */
+  changed: number;
+  /** References Payram said are not this order's. They do not count. */
+  rejected: string[];
+  /** Unconfirmed references Payram did not answer for. Not counted yet. */
+  uncounted: string[];
+  /** Confirmed references Payram did not answer for. Their last confirmed figures stand. */
+  stale: string[];
+}
+
+/**
+ * Write Payram's answers about an order's payments.
+ *
+ * Confirmed figures are recorded. A rejection marks an unconfirmed row
+ * `rejectedAt` so it never counts and is never looked up automatically again;
+ * a row Payram confirmed earlier is never un-confirmed by a later "not found",
+ * which is far more likely a misconfigured URL than a vanished payment.
+ *
+ * `refresh` (Re-check payment) overwrites confirmed rows with Payram's current
+ * figures. Without it only rows that are still unconfirmed are written, and
+ * only if they still are — a concurrent webhook that confirmed newer figures
+ * in the meantime wins (compare-and-set on `verifiedAt`).
+ *
+ * Call inside the transaction that reads the total (R-DB-TX).
+ */
+export async function applyPaymentConfirmations(
+  tx: Prisma.TransactionClient,
+  shop: string,
+  shopifyOrderId: string,
+  confirmations: PaymentConfirmation[],
+  options: { refresh?: boolean } = {},
+): Promise<ConfirmationTally> {
+  const tally: ConfirmationTally = { changed: 0, rejected: [], uncounted: [], stale: [] };
+  if (confirmations.length === 0) return tally;
+
+  const rows = await tx.payramPayment.findMany({ where: { shop, shopifyOrderId } });
+  const byReference = new Map(rows.map((r) => [r.payramReferenceId, r]));
+  const now = new Date();
+
+  for (const c of confirmations) {
+    const row = byReference.get(c.referenceId);
+    const confirmedEarlier = row?.verifiedAt != null;
+
+    if (c.outcome === "confirmed" && c.state !== "UNDEFINED") {
+      if (options.refresh) {
+        await recordConfirmedPayment(tx, {
+          shop,
+          shopifyOrderId,
+          referenceId: c.referenceId,
+          state: c.state,
+          filledAmountInUsd: c.filledAmountInUsd,
+          txHash: null,
+        });
+        tally.changed += 1;
+      } else {
+        const res = await tx.payramPayment.updateMany({
+          where: { payramReferenceId: c.referenceId, verifiedAt: null },
+          data: {
+            shop,
+            shopifyOrderId,
+            state: c.state,
+            filledAmountInUsd: c.filledAmountInUsd,
+            verifiedAt: now,
+            rejectedAt: null,
+          },
+        });
+        tally.changed += res.count;
+      }
+      continue;
+    }
+
+    if (c.outcome === "rejected" && !confirmedEarlier) {
+      if (row && row.rejectedAt == null) {
+        await tx.payramPayment.updateMany({
+          where: { payramReferenceId: c.referenceId, shop, shopifyOrderId, verifiedAt: null },
+          data: { rejectedAt: now },
+        });
+        // The audit trail: what was claimed, and why it will never count.
+        console.warn(
+          `[payram-confirm] ${shop} order ${shopifyOrderId}: reference ${c.referenceId} ` +
+            `rejected by Payram (${c.reason === "other_order" ? `belongs to ${String(c.ownerCustomerId)}` : "no such payment"}); ` +
+            `it claimed ${String(row.state)} ${String(row.filledAmountInUsd)} USD and will not count`,
+        );
+      }
+      tally.rejected.push(c.referenceId);
+      continue;
+    }
+
+    // No usable answer: unavailable, an unrecognised state, or Payram now
+    // disowning a reference it confirmed before.
+    (confirmedEarlier ? tally.stale : tally.uncounted).push(c.referenceId);
+  }
+
+  return tally;
+}
+
+/** Merchant-facing sentences for what confirmation found. Empty when all is well. */
+function describeConfirmationTally(tally: ConfirmationTally): string[] {
+  const list = (refs: string[]) =>
+    refs.slice(0, 3).join(", ") + (refs.length > 3 ? ` and ${refs.length - 3} more` : "");
+  const lines: string[] = [];
+  if (tally.rejected.length) {
+    lines.push(
+      `${tally.rejected.length} payment message(s) recorded for this order could not be confirmed ` +
+        `with Payram — Payram has no such payment for this order — so they do not count toward it ` +
+        `(${list(tally.rejected)}). If the customer says they paid, check the order in Payram.`,
+    );
+  }
+  if (tally.uncounted.length) {
+    lines.push(
+      `${tally.uncounted.length} payment(s) for this order could not be confirmed with Payram just ` +
+        "now, so they are not counted yet. Use Re-check payment once Payram is reachable.",
+    );
+  }
+  if (tally.stale.length) {
+    lines.push(
+      `${tally.stale.length} payment reference(s) could not be read from Payram just now; the ` +
+        "figures Payram confirmed for them earlier are used.",
+    );
+  }
+  return lines;
+}
+
 /** Outcome of settling an order, for logging and the webhook response. */
 export interface SettlementOutcome {
   state: PayramState;
@@ -159,6 +529,11 @@ function money(amount: Prisma.Decimal, currency: string): string {
 /**
  * Record a payment against an order and bring the Shopify order into line.
  *
+ * Only for figures Payram has confirmed belong to this order: `verified: false`
+ * is refused outright, with nothing recorded and nothing sent to Shopify.
+ * Before totting up, the order's other still-unconfirmed payments are confirmed
+ * with Payram (a few per call), so the total is made of confirmed rows only.
+ *
  * Never throws for Shopify-side failures: a webhook that 500s would be retried
  * by Payram forever for a permanent condition. Problems are captured in
  * `warnings` and persisted to `syncError`.
@@ -171,7 +546,10 @@ export async function settleOrder(params: {
   filledAmountInUsd: string | null;
   txHash: string | null;
   accessToken: string;
-  /** True only when the amounts were re-read from Payram, not taken from the webhook. */
+  /**
+   * True only when Payram itself confirmed these figures belong to this order
+   * (see `confirmPayramReference`). False is refused: nothing is recorded.
+   */
   verified: boolean;
   /**
    * Re-run the Shopify side even when nothing has changed.
@@ -181,6 +559,13 @@ export async function settleOrder(params: {
    * because marking the order paid failed the first time.
    */
   force?: boolean;
+  /**
+   * Payram's answers for this order's OTHER references, already fetched by the
+   * caller — Re-check payment reads every reference, and these refresh rows
+   * Payram confirmed before. When omitted, settlement confirms the order's
+   * still-unconfirmed payments itself.
+   */
+  otherReferences?: PaymentConfirmation[];
 }): Promise<SettlementOutcome> {
   const {
     shop,
@@ -192,6 +577,7 @@ export async function settleOrder(params: {
     accessToken,
     verified,
     force = false,
+    otherReferences,
   } = params;
 
   const warnings: string[] = [];
@@ -214,42 +600,70 @@ export async function settleOrder(params: {
     };
   }
 
+  // An unconfirmed message changes no money row and nothing on the Shopify
+  // order (MF-012). The webhook already refuses to call us with one; this is
+  // the function that writes money rows, tags orders and mints value, so it
+  // refuses too rather than trusting every caller to have checked.
+  if (!verified) {
+    return {
+      state,
+      receivedUsd: "0.00",
+      invoicedUsd: null,
+      balanceUsd: null,
+      settled: false,
+      giftCardIssued: false,
+      note: null,
+      warnings: [
+        "This payment could not be confirmed with Payram, so nothing was recorded and the " +
+          "order was left untouched. If the customer paid, use Re-check payment.",
+      ],
+    };
+  }
+
+  // Older rows for this order may be unconfirmed — possibly forged. Ask Payram
+  // about them now (network, so outside the transaction); the answers are
+  // written below in the same transaction that reads the total.
+  const others =
+    otherReferences ??
+    (await confirmPendingPayments(shop, shopifyOrderId, { except: [referenceId] }));
+
   // --- Record this reference, then recompute the total from all of them ---
-  // R-DB-TX: the upsert and the aggregate read are one atomic unit, so a
+  // R-DB-TX: the upserts and the aggregate read are one atomic unit, so a
   // concurrent webhook cannot make the sum disagree with the rows.
-  const { received, mapping, unchanged } = await prisma.$transaction(async (tx) => {
+  const { received, mapping, unchanged, tally } = await prisma.$transaction(async (tx) => {
     // Payram re-sends a webhook every 3 seconds for the whole confirmation
     // window (webhook_processor_job.go ticks at 3s and re-sends for every
     // confirming deposit). A 12-confirmation BTC payment therefore arrives
     // thousands of times. Detect "nothing actually changed" BEFORE overwriting
     // the row, so repeat deliveries cost one query instead of four network calls.
+    //
+    // "Nothing changed" requires the row to have been CONFIRMED for this very
+    // order already. A row from before confirmation existed — or one a forged
+    // webhook put under the wrong order — can carry the same figures and still
+    // change the total the moment it is confirmed here.
     const prior = await tx.payramPayment.findUnique({
       where: { payramReferenceId: referenceId },
     });
     const same =
       prior !== null &&
+      prior.verifiedAt != null &&
+      prior.rejectedAt == null &&
+      prior.shop === shop &&
+      prior.shopifyOrderId === shopifyOrderId &&
       prior.state === state &&
       prior.filledAmountInUsd === filledAmountInUsd;
 
-    await tx.payramPayment.upsert({
-      where: { payramReferenceId: referenceId },
-      create: {
-        shop,
-        shopifyOrderId,
-        payramReferenceId: referenceId,
-        state,
-        filledAmountInUsd,
-        txHash,
-      },
-      update: {
-        state,
-        filledAmountInUsd,
-        // Only ever set the hash, never clear it. Payram re-sends every three
-        // seconds and `payment_info` is absent on some deliveries, so writing
-        // it unconditionally erases the on-chain reference already recorded.
-        ...(txHash ? { txHash } : {}),
-        updatedAt: new Date(),
-      },
+    await recordConfirmedPayment(tx, {
+      shop,
+      shopifyOrderId,
+      referenceId,
+      state,
+      filledAmountInUsd,
+      txHash,
+    });
+
+    const t = await applyPaymentConfirmations(tx, shop, shopifyOrderId, others, {
+      refresh: otherReferences !== undefined,
     });
 
     // One implementation of the money-summing rule, shared with the payment page
@@ -260,8 +674,10 @@ export async function settleOrder(params: {
       where: { shop_shopifyOrderId: { shop, shopifyOrderId } },
     });
 
-    return { received: total, mapping: m, unchanged: same };
+    return { received: total, mapping: m, unchanged: same && t.changed === 0, tally: t };
   });
+
+  warnings.push(...describeConfirmationTally(tally));
 
   // The caller resolved the mapping before calling us, so its absence here means
   // the row was deleted mid-flight. Nothing to settle against.
@@ -316,7 +732,18 @@ export async function settleOrder(params: {
   // "is Shopify paid" clause would add nothing for those, and for rows that
   // predate the column it would defeat the short-circuit entirely, running four
   // Admin API calls every three seconds for the whole confirmation window.
-  if (!force && unchanged && mapping.paymentState === state && !mapping.syncError) {
+  //
+  // The total must also be the one settlement last acted on. It moves without
+  // this reference changing when an older payment is confirmed or rejected —
+  // here, or by the payment page — and the Shopify order must follow it.
+  if (
+    !force &&
+    unchanged &&
+    warnings.length === 0 &&
+    mapping.paymentState === state &&
+    !mapping.syncError &&
+    mapping.filledAmountInUsd === received.toFixed(2)
+  ) {
     // `settled` must mean the same thing here as on the first delivery. Deriving
     // it from the balance sign would report a shortfall absorbed by the
     // tolerance as unsettled on every re-delivery, while the order stays tagged
@@ -436,17 +863,11 @@ export async function settleOrder(params: {
   //
   // Best-effort: a failure here must never undo a settled payment. The tag and
   // note still stand, and the merchant is told what to do.
+  // Marking an order PAID is not reversible through the API and is what
+  // payouts, order filters and fulfilment apps read. It is only reachable with
+  // Payram-confirmed figures: unverified payments were refused above.
   let markedPaidAt: Date | null = mapping.shopifyMarkedPaidAt ?? null;
-  if (settled && !markedPaidAt && !verified) {
-    // The webhook is unsigned, so an unverified payment is attacker-supplied.
-    // Marking an order PAID is not reversible through the API and is what
-    // payouts, order filters and fulfilment apps read — strictly more damaging
-    // than a tag. It belongs behind the same gate as minting a gift card.
-    warnings.push(
-      "This payment could not be verified with Payram, so the order was tagged but not " +
-        "marked paid in Shopify. Confirm it in Payram, then use Re-check payment.",
-    );
-  } else if (settled && !markedPaidAt) {
+  if (settled && !markedPaidAt) {
     try {
       const res = await markOrderPaid(shop, accessToken, shopifyOrderId);
       if (res.ok) {
@@ -479,14 +900,9 @@ export async function settleOrder(params: {
   if (isOver) {
     const minimum = safeDecimal(config?.giftCardMinimumUsd, "1.00");
 
-    if (!verified) {
-      // Refuse to mint value from figures we could not confirm with Payram.
-      warnings.push(
-        `Overpaid by ${money(balance, "USD")}, but the payment could not be verified ` +
-          "with Payram, so no gift card was issued. Confirm the payment in Payram and " +
-          "refund manually.",
-      );
-    } else if (!config?.autoGiftCardOnOverpayment) {
+    // Every figure in `balance` is Payram-confirmed: unverified payments were
+    // refused above, and unconfirmed rows are not in the total.
+    if (!config?.autoGiftCardOnOverpayment) {
       warnings.push(
         `Overpaid by ${money(balance, "USD")}. Automatic gift cards are off, so this ` +
           "must be refunded manually. Enable it in the Payram app settings to automate it.",
@@ -536,6 +952,7 @@ export async function settleOrder(params: {
 
         const card = await createGiftCard(shop, accessToken, {
           amount: giftAmount.toFixed(2),
+          currencyCode: giftCurrency,
           customerId: orderContext?.customerId ?? null,
           note: `Payram overpayment refund for order ${
             orderContext?.orderName ?? shopifyOrderId
@@ -615,6 +1032,102 @@ export async function settleOrder(params: {
     giftCardIssued,
     note,
     warnings,
+  };
+}
+
+/** What Re-check payment found, for the merchant. */
+export interface RecheckResult {
+  /** Null when Payram confirmed none of the order's references. */
+  outcome: SettlementOutcome | null;
+  /** References Payram did not answer for. */
+  unreachable: string[];
+  /** References Payram said are not this order's. They do not count. */
+  notConfirmed: string[];
+}
+
+/**
+ * The merchant's "Re-check payment": read every reference this order has from
+ * Payram and settle the order on Payram's figures alone.
+ *
+ * Webhooks are the normal path, but they can be missing (no webhook configured
+ * in Payram), late, or exhausted after retries. This is the self-service repair,
+ * and the one path that looks again at references Payram rejected before — a
+ * wrong Payram URL rejects everything, and fixing it must be able to undo that.
+ * A reference Payram does not confirm for this order never counts, whatever is
+ * stored for it.
+ *
+ * Re-check EVERY reference, not just the latest: a top-up arrives under a
+ * brand-new Payram reference, so an order underpaid and then topped up has more
+ * than one, and refreshing only the most recent would leave it reading short.
+ */
+export async function recheckOrder(params: {
+  shop: string;
+  shopifyOrderId: string;
+  accessToken: string;
+  /** The reference of the order's most recent payment link. */
+  latestReferenceId: string;
+}): Promise<RecheckResult> {
+  const { shop, shopifyOrderId, accessToken, latestReferenceId } = params;
+
+  const rows = await prisma.payramPayment.findMany({
+    where: { shop, shopifyOrderId },
+    select: { payramReferenceId: true, rejectedAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+  // Rejected references last, so a pile of forged ones cannot crowd real
+  // payments out of the bounded read.
+  const references = Array.from(
+    new Set([
+      latestReferenceId,
+      ...rows.filter((r) => r.rejectedAt == null).map((r) => r.payramReferenceId),
+      ...rows.filter((r) => r.rejectedAt != null).map((r) => r.payramReferenceId),
+    ]),
+  ).slice(0, RECHECK_MAX_REFERENCES);
+
+  const confirmations = await confirmPayramReferences(shop, shopifyOrderId, references);
+  const usable = confirmations.filter(
+    (c): c is ConfirmedPayment => c.outcome === "confirmed" && c.state !== "UNDEFINED",
+  );
+
+  if (usable.length === 0) {
+    // Nothing to settle on. Still record Payram's rejections, so forged rows
+    // stop being looked up on every payment-page visit.
+    const tally = await prisma.$transaction((tx) =>
+      applyPaymentConfirmations(tx, shop, shopifyOrderId, confirmations, { refresh: true }),
+    );
+    return {
+      outcome: null,
+      unreachable: [...tally.uncounted, ...tally.stale],
+      notConfirmed: tally.rejected,
+    };
+  }
+
+  // The last confirmed reference anchors the settlement (its state becomes the
+  // order's displayed state, as when each reference was settled in turn);
+  // every other answer is applied in the same transaction.
+  const anchor = usable[usable.length - 1];
+  const outcome = await settleOrder({
+    shop,
+    shopifyOrderId,
+    referenceId: anchor.referenceId,
+    state: anchor.state,
+    filledAmountInUsd: anchor.filledAmountInUsd,
+    txHash: null,
+    accessToken,
+    verified: true,
+    // The merchant explicitly asked, so redo the Shopify side even if nothing
+    // about the payment changed. This is what repairs an order that settled
+    // but failed to be marked paid.
+    force: true,
+    otherReferences: confirmations.filter((c) => c !== anchor),
+  });
+
+  return {
+    outcome,
+    unreachable: confirmations
+      .filter((c) => c.outcome === "unavailable" || (c.outcome === "confirmed" && c.state === "UNDEFINED"))
+      .map((c) => c.referenceId),
+    notConfirmed: confirmations.filter((c) => c.outcome === "rejected").map((c) => c.referenceId),
   };
 }
 

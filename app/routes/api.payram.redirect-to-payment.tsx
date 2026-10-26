@@ -18,8 +18,8 @@
  * immediately instead of a blank tab.
  */
 import { createHmac, timingSafeEqual } from "crypto";
-import type { LoaderFunctionArgs } from "@remix-run/node";
-import { redirect } from "@remix-run/node";
+import type { LoaderFunctionArgs } from "react-router";
+import { redirect } from "react-router";
 import prisma from "~/db.server";
 import { signOrderToken } from "~/utils/order-token.server";
 

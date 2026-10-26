@@ -4,8 +4,8 @@ import {
   Outlet,
   Scripts,
   ScrollRestoration,
-} from "@remix-run/react";
-import type { LinksFunction } from "@remix-run/node";
+  type LinksFunction,
+} from "react-router";
 
 export const links: LinksFunction = () => [
   { rel: "preconnect", href: "https://cdn.shopify.com/" },

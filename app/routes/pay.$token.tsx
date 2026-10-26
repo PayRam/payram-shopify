@@ -24,7 +24,7 @@
  * Without it — a bookmark, browser history, a return visit — the page stops and
  * shows the current state, because the buyer did not just ask to pay.
  */
-import type { LoaderFunctionArgs } from "@remix-run/node";
+import type { LoaderFunctionArgs } from "react-router";
 import { verifyOrderToken } from "~/utils/order-token.server";
 
 function escapeHtml(value: string): string {

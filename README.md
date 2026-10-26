@@ -24,7 +24,8 @@ the whole flow works for **guest checkout**.
 
 Read this section first if you are configuring, extending or debugging this connector.
 
-**What this is.** A [Remix](https://remix.run) app (Node ≥ 18, Prisma + SQLite) sitting
+**What this is.** A [React Router](https://reactrouter.com) 7 app on Shopify's
+`@shopify/shopify-app-react-router` (Node ≥ 26.12.1, Prisma + SQLite, Admin API 2026-10) sitting
 between a Shopify store and a self-hosted Payram instance. It holds no funds and never sees
 a private key. It decides *how much to charge*, *in what currency*, and *what an arriving
 payment means for the Shopify order*.
@@ -59,8 +60,11 @@ refund an overpayment as a gift card.
    Convert before calling `/api/v1/payment`, and fail closed if no rate is available.
 3. **Money is `TEXT` in the database and `Decimal` in code — never a float.** SQLite's
    NUMERIC affinity silently demotes `DECIMAL` to floating point.
-4. **The Payram webhook is unsigned.** Never mint value (gift cards) from it without
-   re-reading the payment from Payram *and* checking it belongs to that order.
+4. **Nothing in a Payram webhook body is believed.** Older Payram releases do not sign it,
+   and the `customer_id` it is matched on is in the buyer's own payment link. Only figures
+   Payram itself confirms — the reference exists *and* belongs to that order — may count as
+   money received, tag or note an order, mark it paid, or mint a gift card. An unconfirmed
+   message changes nothing but a note telling the merchant what happened.
 5. **An unrecognised payment status must never settle an order.** Unknown means unknown.
 6. **Never create a Payram payment from the webhook.** Payram re-sends every 3 seconds
    during confirmation, and creating a payment cancels the buyer's live checkout link.
@@ -441,7 +445,7 @@ npx prisma migrate dev --name init
 shopify app dev
 ```
 
-This starts the Remix server, creates a Cloudflare tunnel, and streams logs.
+This starts the React Router dev server, creates a Cloudflare tunnel, and streams logs.
 
 ### 5. Configure Payram credentials in the app
 
@@ -534,16 +538,37 @@ retry — see [Currency Handling](#currency-handling).
 
 ### `POST /api/payram/webhook`
 
-Expected JSON body (accepts common field name variants):
+payram-core's payment webhook (`SendWebhookToMerchant`); snake_case and camelCase field names
+are both accepted:
 
 ```json
 {
-  "referenceId": "payram-ref-id",
-  "status": "paid"
+  "customer_id": "shopify:{shop}:order:{orderId}",
+  "reference_id": "payram-ref-id",
+  "status": "OPEN | FILLED | PARTIALLY_FILLED | OVER_FILLED | CANCELLED",
+  "filled_amount_in_usd": "40.00"
 }
 ```
 
-Terminal statuses that trigger Shopify sync: `paid`, `confirmed`, `closed`, `completed`.
+The body only says **which reference to ask Payram about**. Its amounts are never recorded:
+
+1. **Signature.** payram-core 3.9.0+ sends `X-Payram-Signature: sha256=<HMAC-SHA256 of the raw
+   body, keyed with the project API key>`. Once a shop has received one correctly signed with
+   its saved key, unsigned or wrongly signed webhooks are refused before anything is recorded.
+   Shops whose Payram does not sign yet keep working — step 2 still guards them.
+2. **Confirmation.** The reference is read from Payram (`GET /api/v1/payment/reference/{id}`).
+   Only if Payram confirms it belongs to this order are Payram's figures recorded and settled.
+
+| Response | When | Payram then |
+|---|---|---|
+| `200` | Handled, or deliberately ignored (no such order, unrecognised status, Payram does not confirm the reference) | stops |
+| `401` | Refused by the signature check | resends — succeeds once the right API key is saved |
+| `503` | Payram could not be asked (unreachable, 5xx, not configured) — nothing recorded | resends |
+| `500` | Settlement failed on the Shopify side | resends |
+
+payram-core resends anything that is not 2xx: three quick attempts, then 30 min, 1 h, 2 h,
+4 h, 8 h, 24 h and 48 h, after which the delivery is marked failed. **Re-check payment** covers
+anything that never arrived.
 
 ---
 
@@ -669,6 +694,10 @@ as `FILLED`, `PARTIALLY_FILLED` or `OVER_FILLED`, and the connector acts on all 
 
 - **Only after Payram confirms it on-chain.** While a deposit is still collecting confirmations the
   order is left untouched; it is updated once Payram reports the payment as received.
+- **Only what Payram confirms for this order.** Every amount is read from Payram itself, never
+  from the webhook message. Payments recorded by versions before 2026-10-22 count once Payram
+  confirms them — checked automatically the next time the order settles or the buyer opens their
+  payment link, or straight away with **Re-check payment**.
 - **Everything is added up.** A buyer can pay in more than one go — every payment made for the
   order counts toward its total.
 - **Within tolerance is paid.** A shortfall or excess smaller than the tolerance —
@@ -785,9 +814,11 @@ without the permission needed to issue them.
 overpayment below the minimum, a payment Payram could not confirm. The connector never guesses and
 never silently swallows a discrepancy.
 
-> **Security note.** The Payram webhook is unsigned, so the connector re-reads every payment from
-> Payram (`GET /api/v1/payment/reference/{id}`) before acting, and issues a gift card only when that
-> verification succeeds. A forged webhook cannot mint value. See `state/malicious-flows.md` (MF-008).
+> **Security note.** A webhook message is never trusted for money. The connector re-reads every
+> payment from Payram (`GET /api/v1/payment/reference/{id}`) and acts only on what Payram confirms
+> belongs to the order; anything else is ignored and noted on the order. A forged webhook cannot add
+> to what an order has received, mark it paid, or mint value. See `state/malicious-flows.md`
+> (MF-008, MF-012, MF-013).
 
 ---
 
@@ -897,7 +928,9 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 | Installer says *"Docker is running, but this user is not allowed to use it"* | `docker info` → `permission denied … docker.sock` | Linux default: only root and the `docker` group may use the socket | `sudo usermod -aG docker $USER`, log out and in, re-run. Or run the installer with `sudo` every time — then the install directory is root's |
 | Shopify shows an error page when opening the install link | the link ends in `?shop=<your custom domain>` | `SHOPIFY_STORE_DOMAIN` is a storefront domain; Shopify's install flow accepts only `<handle>.myshopify.com` | Re-run the installer — it now refuses the stored value and asks again; paste your admin URL |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
-| Orders never tagged paid | `[payram-webhook] settling` present, no tag | Webhook status not recognised, or ownership check failed | Check the `syncError` on the order; confirm the payment in Payram |
+| Orders never tagged paid | `[payram-webhook] received` present, no tag | Webhook status not recognised, or Payram did not confirm the reference for this order | Check the `syncError` on the order; confirm the payment in Payram, then **Re-check payment** |
+| Payram's webhook log shows `401` from the connector | `[payram-webhook] refused` | The store's Payram signs its webhooks, and this one was not signed with the API key saved in the app — usually a new API key created in Payram | Save the project's current API key in the app's settings; Payram resends on its own |
+| Payram's webhook log shows `503` from the connector | `[payram-verify] … request failed` | The connector could not reach Payram to confirm the payment | Check the Payram Base URL and that Payram is reachable from the connector; Payram resends on its own |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
 | Overpaid, no gift card | Red banner in the app, or `syncError` | Feature off, below the minimum, payment not confirmed with Payram, a card already issued for this order, permissions missing, or gift cards disabled in Shopify | The banner or note names which. Missing permissions: re-run the installer, then approve in Shopify Admin |
@@ -917,7 +950,7 @@ curl https://YOUR_DOMAIN/healthz      # => {"app":"payram-shopify-connector","ok
 curl http://127.0.0.1:2798/healthz    # same, run on the server itself
 
 npm test          # unit tests: conversion, settlement, top-ups, tolerance, tokens
-npm run build     # Remix build
+npm run build     # React Router build
 npx prisma migrate deploy   # applies pending migrations (also run by scripts/start.sh)
 ```
 
@@ -936,8 +969,9 @@ documented rather than quietly carried:
 - **MF-003** — the entry route is unauthenticated, so a guessed order ID can trigger payment
   creation. The signed token makes the resulting link tamper-proof but does not make orders
   unenumerable.
-- **MF-004** — Payram webhooks are unsigned. Mitigated by re-reading every payment from
-  Payram and refusing to move money on anything unverified.
+- **MF-004 / MF-013** — Payram releases before 3.9.0 do not sign webhooks. Signatures are
+  enforced per shop once its Payram is seen signing; independently, nothing in a webhook counts
+  until Payram confirms it for the order (MF-012).
 
 ---
 
@@ -993,7 +1027,7 @@ transient, DB-backed so it survives restarts.
 |------|---------|
 | `extensions/thank-you-block/src/Checkout.tsx` | UI extension — Preact component for the Thank You block |
 | `extensions/thank-you-block/shopify.extension.toml` | Extension config — target only. The block has no merchant settings |
-| `extensions/thank-you-block/package.json` | `@shopify/ui-extensions@2026.1.3` + `preact` |
+| `extensions/thank-you-block/package.json` | `@shopify/ui-extensions@2026.10.2` + `preact` (checkout extension API 2026-10) |
 | `extensions/thank-you-block/tsconfig.json` | `jsxImportSource: preact`, `moduleResolution: Bundler` |
 
 ### How the extension reads order data
@@ -1051,9 +1085,9 @@ so merchants had to click *Mark as paid* on every crypto order.
 
 Marking paid is **best-effort and deliberately gated**:
 
-- Only a payment **verified with Payram** can mark an order paid. The webhook is unsigned, and
-  setting Shopify's financial status is not reversible through the API, so it requires the same
-  trust level as issuing a gift card.
+- Only payments **confirmed with Payram** for the order can mark it paid. The webhook message is
+  not trusted, and setting Shopify's financial status is not reversible through the API, so it
+  requires the same trust level as issuing a gift card.
 - **Underpaid orders are never marked paid**, and no order is marked twice.
 - If Shopify refuses — most often because the staff member who installed the app lacks the
   *mark orders as paid* permission — the order still settles and stays tagged, and the reason

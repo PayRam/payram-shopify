@@ -2,7 +2,7 @@
 # Payram Shopify Connector
 #
 # Multi-stage build:
-#   builder  — installs all deps and compiles the Remix app
+#   builder  — installs all deps and compiles the React Router app
 #   runner   — production image with only runtime deps
 #
 # Build:
@@ -16,12 +16,20 @@
 # ---------------------------------------------------------------------------
 
 # ---- builder ---------------------------------------------------------------
-FROM node:20-alpine AS builder
+FROM node:26.12.1-alpine3.24 AS builder
 
 WORKDIR /app
 
-# Install OS deps needed by some npm packages (e.g. native crypto bindings)
-RUN apk add --no-cache python3 make g++
+# Install OS deps needed by some npm packages (e.g. native crypto bindings).
+#
+# openssl is here for `prisma generate`, not for the build. Prisma picks the
+# "native" engine by running `openssl version`. Without the binary it guesses
+# OpenSSL 1.1, while the runner stage below has OpenSSL 3. On amd64 the explicit
+# linux-musl-openssl-3.0.x target in schema.prisma covered the gap. On arm64
+# nothing did: the image shipped only an openssl-1.1.x engine, and the app failed
+# at startup with "Prisma session table does not exist". /healthz never touches
+# the database, so it stayed green.
+RUN apk add --no-cache python3 make g++ openssl
 
 # Copy manifests first for better layer caching
 COPY package.json package-lock.json ./
@@ -47,14 +55,14 @@ RUN if grep -q "{{ CLIENT_ID }}" shopify.app.toml 2>/dev/null; then \
 # Generate Prisma client
 RUN npx prisma generate
 
-# Build the Remix app
+# Build the React Router app
 RUN NODE_ENV=production npm run build
 
 # Prune dev dependencies
 RUN npm prune --omit=dev
 
 # ---- runner ----------------------------------------------------------------
-FROM node:20-alpine AS runner
+FROM node:26.12.1-alpine3.24 AS runner
 
 WORKDIR /app
 

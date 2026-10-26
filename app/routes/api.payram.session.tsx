@@ -13,8 +13,7 @@
  * The order is identified only by the signed token — never by a raw order ID in
  * the request body — so this endpoint cannot be pointed at someone else's order.
  */
-import type { ActionFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
+import type { ActionFunctionArgs } from "react-router";
 import { verifyOrderToken } from "~/utils/order-token.server";
 import {
   createCheckout,
@@ -26,7 +25,7 @@ const EMAIL_RE = /^[^@\s]{1,254}@[^@\s]{1,253}\.[^@\s]{1,63}$/;
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") {
-    return json({ error: "Method not allowed" }, { status: 405 });
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 
   let body: Record<string, unknown>;
@@ -35,16 +34,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // request.json() resolves happily for `null`, `1` and `"x"` — none of which
     // hit the catch, and all of which throw on the property read below.
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return json({ error: "Invalid request." }, { status: 400 });
+      return Response.json({ error: "Invalid request." }, { status: 400 });
     }
     body = parsed as Record<string, unknown>;
   } catch {
-    return json({ error: "Invalid request." }, { status: 400 });
+    return Response.json({ error: "Invalid request." }, { status: 400 });
   }
 
   const claims = verifyOrderToken(String(body.token ?? ""));
   if (!claims) {
-    return json(
+    return Response.json(
       { error: "This payment link is not valid. Please reopen it from your order." },
       { status: 403 },
     );
@@ -55,13 +54,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const email = emailRaw && EMAIL_RE.test(emailRaw) ? emailRaw : undefined;
 
   if (emailRaw && !email) {
-    return json({ error: "Please enter a valid email address." }, { status: 400 });
+    return Response.json({ error: "Please enter a valid email address." }, { status: 400 });
   }
 
   try {
     if (step === "quote") {
       const quote = await quoteOrder(claims.shop, claims.shopifyOrderId);
-      return json({ ok: true, quote });
+      return Response.json({ ok: true, quote });
     }
 
     if (step === "create") {
@@ -70,18 +69,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         claims.shopifyOrderId,
         email,
       );
-      return json({ ok: true, ...session });
+      return Response.json({ ok: true, ...session });
     }
 
-    return json({ error: "Unknown step." }, { status: 400 });
+    return Response.json({ error: "Unknown step." }, { status: 400 });
   } catch (err) {
     if (err instanceof PaymentSessionError) {
-      return json({ error: err.message }, { status: err.status });
+      return Response.json({ error: err.message }, { status: err.status });
     }
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[payram-session] unexpected failure:", msg);
     // Generic on system errors — never leak internals to a buyer.
-    return json(
+    return Response.json(
       {
         error:
           "Something went wrong preparing your payment. Please try again in a moment.",
