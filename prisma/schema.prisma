@@ -68,6 +68,14 @@ model MerchantConfig {
   // its webhooks are accepted and confirmed with Payram like any other.
   // Cleared when the Payram URL or API key is changed in settings.
   signedWebhooksSince          DateTime?
+  // When this shop last refused a Payram webhook signed with a key other than
+  // the saved one — what happens to every webhook once a newer admin API key
+  // exists on the Payram project, since Payram signs with its newest. The
+  // settings page warns the merchant to save that key. Only this time is
+  // written for a refused webhook, at most once a minute; nothing from it is
+  // recorded. Cleared by the next correctly signed webhook, and when the Payram
+  // URL or API key is changed in settings.
+  signedWebhookRefusedAt       DateTime?
   createdAt                    DateTime @default(now())
   updatedAt                    DateTime @updatedAt
 }

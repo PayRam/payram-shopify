@@ -57,7 +57,8 @@
  * on the delivery-log schedule of 30 min up to 48 h):
  *   200  handled, or deliberately ignored — Payram's answer is final
  *   401  refused by the signature check — Payram retries; succeeds once the
- *        right key is saved
+ *        right key is saved. A refusal signed with another key also tells the
+ *        merchant (MerchantConfig.signedWebhookRefusedAt → settings page)
  *   503  Payram could not be asked — Payram retries
  *   500  settlement itself failed (Shopify) — Payram retries
  */

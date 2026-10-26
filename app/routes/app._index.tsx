@@ -24,7 +24,7 @@ import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
 import { validatePayramBaseUrl } from "~/utils/payram.server";
 import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
-import { giftCardSlot, recheckOrder } from "~/utils/settlement.server";
+import { formatUtc, giftCardSlot, recheckOrder } from "~/utils/settlement.server";
 import { getUpdateStatus } from "~/utils/updates.server";
 
 function summarizeResponseText(value: string): string | null {
@@ -132,6 +132,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     paymentMethodName:
       config?.paymentMethodName ?? "Pay with Crypto via Payram",
     hasApiKey: !!config?.payramProjectApiKeyEncrypted,
+    // Set while this shop refuses Payram's webhooks for being signed with
+    // another key — Payram signs with the project's newest admin API key.
+    webhooksRefusedAt:
+      config?.signedWebhooksSince && config.signedWebhookRefusedAt
+        ? formatUtc(config.signedWebhookRefusedAt)
+        : null,
     autoGiftCardOnOverpayment: config?.autoGiftCardOnOverpayment ?? false,
     giftCardMinimumUsd: config?.giftCardMinimumUsd ?? "1.00",
     settlementTolerancePercent: config?.settlementTolerancePercent ?? "1.0",
@@ -499,7 +505,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     // A different Payram server or key may not sign its webhooks yet, or signs
     // with another key, so stop refusing unsigned ones until it proves it does
-    // (authenticateWebhook in payram.server.ts).
+    // (authenticateWebhook in payram.server.ts). The warning about refused
+    // webhooks goes with it: they were refused for the old key.
     const credentialsChanged =
       current != null && (current.payramBaseUrl !== payramBaseUrl || keyChanged);
 
@@ -519,7 +526,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       update: {
         payramBaseUrl,
         payramProjectApiKeyEncrypted: encryptedKey,
-        ...(credentialsChanged ? { signedWebhooksSince: null } : {}),
+        ...(credentialsChanged ? { signedWebhooksSince: null, signedWebhookRefusedAt: null } : {}),
         paymentMethodName,
         autoGiftCardOnOverpayment,
         giftCardMinimumUsd,
@@ -565,6 +572,7 @@ export default function SettingsPage() {
     hasGiftCardScope,
     update,
     updateChecksEnabled,
+    webhooksRefusedAt,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -776,6 +784,29 @@ docker run -d --name payram-shopify-connector \\
                 domain, no orders, no customers — and never installs anything.
                 Enable it under <b>Check for connector updates</b> below.
               </p>
+            </Banner>
+          )}
+
+          {webhooksRefusedAt && (
+            <Banner tone="critical" title="Payram's payment notifications are being refused">
+              <BlockStack gap="200">
+                <p>
+                  Payram is signing its payment notifications with a different API
+                  key from the one saved below, so this app refuses them and records
+                  nothing: orders paid meanwhile are not marked paid, and their
+                  buyers' payment pages still show them unpaid. Last refused:{" "}
+                  {webhooksRefusedAt}.
+                </p>
+                <p>
+                  This happens when another API key is created for the Payram
+                  project — Payram signs with the project's newest key. Paste that
+                  key into <b>Payram Project API Key</b> below and save. Payram
+                  resends a refused notification for about 48 hours; for orders
+                  paid before you save, use <b>Re-check payment</b>. If nobody
+                  created a new key, these notifications did not come from your
+                  Payram, and nothing from them was recorded.
+                </p>
+              </BlockStack>
             </Banner>
           )}
 

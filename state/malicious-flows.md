@@ -355,6 +355,21 @@ Severity: `low` / `medium` / `high` / `critical`.
   signing key, forged webhooks still reach the confirmation step: they cost one
   Payram lookup each and can replace the order's `syncError` with a "could not
   be confirmed" note (nuisance, no money). Once a shop is enforcing, a new admin
-  API key created in Payram makes its webhooks fail 401 until that key is saved
-  in the app; Payram keeps resending meanwhile and Re-check payment still works.
+  API key created in Payram makes every payment webhook fail 401 until that key
+  is saved in the app. Nothing is written to the order — no payment, no
+  `syncError` — so the order never appears under "needs attention", the
+  buyer's payment page still shows it unpaid (and, once the link expires,
+  offers a fresh one the buyer could pay a second time), and Payram stops
+  resending after its schedule ends (about 48 hours). Since 2026-10-26 (audit
+  F2) each refused webhook that is signed with another key sets
+  `MerchantConfig.signedWebhookRefusedAt` — the time only, at most once a
+  minute, nothing from the body — and the settings page shows a red warning
+  to save the project's current API key and to Re-check orders paid
+  meanwhile. It clears on the next webhook that verifies with the saved key,
+  or when a different URL or key is saved. What remains: the merchant must
+  open the app to see it, and the app does not say which orders were paid
+  meanwhile; anyone can set the warning by posting a body with a made-up
+  signature for one of the shop's orders (a false alarm, no money: saving the
+  key that is already saved changes nothing). An unsigned refusal is not
+  recorded, since saving a key would not fix it.
 - **Discovered-in:** security audit, 2026-10-22.

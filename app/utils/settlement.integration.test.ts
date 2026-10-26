@@ -56,6 +56,10 @@ const admin = vi.hoisted(() => ({
 }));
 vi.mock("~/utils/shopify-admin.server", () => admin);
 
+// The embedded admin's session check; the settings page itself is real.
+const shopifyAuth = vi.hoisted(() => ({ admin: vi.fn() }));
+vi.mock("~/shopify.server", () => ({ authenticate: shopifyAuth }));
+
 const SHOP = "acme.myshopify.com";
 const ORDER = "1001";
 const CUSTOMER_ID = `shopify:${SHOP}:order:${ORDER}`;
@@ -100,6 +104,7 @@ function payramHas(
 }
 
 import prisma from "~/db.server";
+import * as settings from "~/routes/app._index";
 import * as webhook from "~/routes/api.payram.webhook";
 import * as encryption from "~/utils/encryption.server";
 import * as session from "~/utils/payment-session.server";
@@ -122,6 +127,7 @@ beforeEach(async () => {
   payram.lookups = [];
 
   admin.findOfflineAccessToken.mockResolvedValue("shpat_test");
+  shopifyAuth.admin.mockResolvedValue({ session: { shop: SHOP, scope: "write_gift_cards" } });
   admin.fetchOrderTotal.mockResolvedValue({
     orderName: "#1001",
     amount: "100.00",
@@ -816,5 +822,131 @@ describe("a gift card Shopify may have made (audit F4)", () => {
     expect(admin.createGiftCard).toHaveBeenCalledOnce();
     expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
     expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+});
+
+describe("webhooks refused after a newer API key appears in Payram (audit F2)", () => {
+  // payram-core signs with the project's NEWEST admin key. Once a shop is
+  // enforcing signatures, a key created later for anything else made every
+  // payment webhook fail 401 with nothing in the app, until Payram gave up.
+  const NEWER_KEY = "newer-project-api-key";
+  const config = () => prisma.merchantConfig.findUniqueOrThrow({ where: { shop: SHOP } });
+  const signedPost = (body: Record<string, unknown>, key = API_KEY) =>
+    post(body, { "X-Payram-Signature": sign(JSON.stringify(body), key) });
+
+  /** The shop's first signed webhook, with the saved key, pins it. */
+  async function pin() {
+    payramHas("real-ref", "OPEN", null);
+    const res = await signedPost(genuine("real-ref", "OPEN", "0"));
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhooksSince).toBeInstanceOf(Date);
+    vi.clearAllMocks();
+    payram.lookups = [];
+  }
+
+  function settingsRequest(fields: Record<string, string>) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.set(k, v);
+    return new Request("https://connector.example.test/app", { method: "POST", body: form });
+  }
+  const loadSettings = async () =>
+    (await settings.loader({
+      request: new Request("https://connector.example.test/app"),
+      params: {},
+      context: {},
+    } as Parameters<typeof settings.loader>[0])) as { webhooksRefusedAt: string | null };
+  const save = (fields: Record<string, string>) =>
+    settings.action({
+      request: settingsRequest({ intent: "save", payramBaseUrl: PAYRAM, ...fields }),
+      params: {},
+      context: {},
+    } as Parameters<typeof settings.action>[0]);
+
+  it("is refused with 401, records no payment, and tells the merchant to save the current key", async () => {
+    await pin();
+    const before = await mapping();
+    payramHas("real-ref", "FILLED", "100.00");
+
+    const res = await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+
+    expect(res.status).toBe(401);
+    // Nothing an attacker could use: no lookup, no payment row, no order change.
+    expect(payram.lookups).toEqual([]);
+    expectShopifyUntouched();
+    expect(await row("real-ref")).toMatchObject({ state: "OPEN", filledAmountInUsd: null });
+    const after = await mapping();
+    expect(after.syncError).toBe(before.syncError);
+    expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+    // What changed: the shop records the refusal, and the settings page says so.
+    const refusedAt = (await config()).signedWebhookRefusedAt;
+    expect(refusedAt).toBeInstanceOf(Date);
+    expect((await loadSettings()).webhooksRefusedAt).toBe(settlement.formatUtc(refusedAt!));
+    // Until now the buyer's page shows the order unpaid; Re-check repairs it.
+    expect((await session.quoteOrder(SHOP, ORDER)).phase).toBe("unpaid");
+  });
+
+  it("a flood of refused webhooks is one write a minute", async () => {
+    await pin();
+    await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    const first = (await config()).signedWebhookRefusedAt;
+
+    for (let i = 0; i < 5; i += 1) {
+      expect((await signedPost(forged(), NEWER_KEY)).status).toBe(401);
+    }
+
+    expect((await config()).signedWebhookRefusedAt?.getTime()).toBe(first?.getTime());
+  });
+
+  it("an unsigned webhook to an enforcing shop is refused without raising the warning", async () => {
+    await pin();
+    expect((await post(forged())).status).toBe(401);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
+  });
+
+  it("before the shop is enforcing, a webhook signed with another key raises nothing", async () => {
+    const res = await signedPost(forged(), NEWER_KEY);
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
+  });
+
+  it("saving the project's current key clears the warning, and its webhooks then settle", async () => {
+    await pin();
+    await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+
+    const saved = await save({ payramProjectApiKey: NEWER_KEY });
+    expect(saved).toMatchObject({ success: expect.stringMatching(/Settings saved/) });
+    expect(await config()).toMatchObject({ signedWebhooksSince: null, signedWebhookRefusedAt: null });
+    expect((await loadSettings()).webhooksRefusedAt).toBeNull();
+
+    // Payram resends; signed with the key now saved, it settles and re-pins.
+    payramHas("real-ref", "FILLED", "100.00");
+    const resent = await signedPost(genuine("real-ref", "FILLED", "100.00"), NEWER_KEY);
+    expect(resent.status).toBe(200);
+    expect(resent.body).toMatchObject({ settled: true });
+    expect((await config()).signedWebhooksSince).toBeInstanceOf(Date);
+  });
+
+  it("re-saving the same key keeps the warning: nothing was fixed", async () => {
+    await pin();
+    await signedPost(forged(), NEWER_KEY);
+
+    await save({ payramProjectApiKey: API_KEY });
+
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+    expect((await loadSettings()).webhooksRefusedAt).not.toBeNull();
+  });
+
+  it("the next correctly signed webhook clears the warning", async () => {
+    await pin();
+    await signedPost(forged(), NEWER_KEY);
+    expect((await config()).signedWebhookRefusedAt).toBeInstanceOf(Date);
+
+    // The newer key was revoked in Payram, so it signs with the saved one again.
+    payramHas("real-ref", "FILLED", "100.00");
+    const res = await signedPost(genuine("real-ref", "FILLED", "100.00"));
+
+    expect(res.status).toBe(200);
+    expect((await config()).signedWebhookRefusedAt).toBeNull();
   });
 });

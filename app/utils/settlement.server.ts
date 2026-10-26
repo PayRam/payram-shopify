@@ -187,7 +187,7 @@ function lookupAllowedAt(since: Date): Date {
 }
 
 /** "2026-10-26 12:10 UTC" — the same on the server and in the merchant's browser. */
-function formatUtc(date: Date): string {
+export function formatUtc(date: Date): string {
   return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
 

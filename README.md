@@ -948,7 +948,7 @@ Every failure the connector can see is written somewhere observable. Nothing is 
 | Shopify shows an error page when opening the install link | the link ends in `?shop=<your custom domain>` | `SHOPIFY_STORE_DOMAIN` is a storefront domain; Shopify's install flow accepts only `<handle>.myshopify.com` | Re-run the installer — it now refuses the stored value and asks again; paste your admin URL |
 | Orders never tagged paid, nothing in the logs | no `[payram-webhook]` lines at all | **No webhook configured in Payram**, or it points at the wrong URL | Add it (see [Step 5b](#step-5b--point-payrams-webhook-at-the-connector)), then use **Re-check payment** for orders already paid |
 | Orders never tagged paid | `[payram-webhook] received` present, no tag | Webhook status not recognised, or Payram did not confirm the reference for this order | Check the `syncError` on the order; confirm the payment in Payram, then **Re-check payment** |
-| Payram's webhook log shows `401` from the connector | `[payram-webhook] refused` | The store's Payram signs its webhooks, and this one was not signed with the API key saved in the app — usually a new API key created in Payram | Save the project's current API key in the app's settings; Payram resends on its own |
+| Payram's webhook log shows `401` from the connector; the app shows *Payram's payment notifications are being refused* | `[payram-webhook] refused` | The store's Payram signs its webhooks, and this one was not signed with the API key saved in the app — usually a new API key created in Payram, which signs with the project's newest key | Save the project's current API key in the app's settings. Payram resends for about 48 hours; for orders paid before that, press **Re-check payment** |
 | Payram's webhook log shows `503` from the connector | `[payram-verify] … request failed` | The connector could not reach Payram to confirm the payment | Check the Payram Base URL and that Payram is reachable from the connector; Payram resends on its own |
 | Order tagged `payram_paid` but Shopify says "Payment pending" | warning on the order in the app | `orderMarkAsPaid` was refused — usually the installing staff member lacks *mark orders as paid* | Grant that permission and press **Re-check payment**, or use Shopify's own **Mark as paid** |
 | Buyer sees "Exchange rate unavailable" | `[payram-fx] rate provider unreachable` | No egress to `open.er-api.com` | Allow outbound HTTPS. **Never** bypass — no payment is created rather than one at a guessed rate |
@@ -1004,6 +1004,8 @@ documented rather than quietly carried:
 | `payramBaseUrl` | Payram API base URL |
 | `payramProjectApiKeyEncrypted` | AES-256-GCM encrypted API key |
 | `paymentMethodName` | Label shown in checkout |
+| `signedWebhooksSince` | First webhook correctly signed with the saved key; from then on unsigned or wrongly signed webhooks are refused |
+| `signedWebhookRefusedAt` | Last time a webhook signed with another key was refused (at most once a minute); drives the settings page's warning to save the project's current key |
 
 ### `PaymentMapping`
 
