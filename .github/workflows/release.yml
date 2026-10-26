@@ -13,14 +13,25 @@
 #   sha-<short>   main and dispatched builds, immutable — the tag to pin in
 #                 production. A v* run does not republish it: it rebuilds the
 #                 same commit with APP_VERSION set, which would swap the image
-#                 behind a tag someone pinned.
-#   <version>     on a v* tag, plus the major.minor ladder
-#   latest        main only (metadata-action would add it to every v* run by
-#                 default, so re-running an old release could move it back)
+#                 behind a tag someone pinned. Carries no version, so the app
+#                 shows none and announces no update.
+#   <version>     on a v* tag, plus the major.minor ladder. Stamped with the
+#                 version (PAYRAM_VERSION).
+#   latest        main's current head only, and with the version when it is
+#                 tagged: the v* run of main's head moves it to its stamped
+#                 build, and a main push moves it only when no v* tag points at
+#                 the commit (otherwise the two runs race and the unstamped one
+#                 could land last). A re-run of an older tag or of a superseded
+#                 main build is not main's head, so it never moves `latest`
+#                 back. scripts/should-publish-latest.sh decides; metadata-
+#                 action's own `latest` is off (flavor: latest=false).
 #
-# The installer hardcodes `:latest`, so a merchant re-running it silently takes
-# whatever was last pushed. `sha-` tags give them something stable to pin to,
-# and give us something to roll back to.
+# The installer hardcodes `:latest`, so a merchant re-running it takes whatever
+# was last pushed — which is why `latest` must carry the version: without it
+# the Settings page shows no version and no later release is ever announced to
+# that merchant (2026-10-26: `latest` was the unstamped main build of v1.2.0).
+# `sha-` tags give merchants something stable to pin to, and us something to
+# roll back to.
 #
 # NATIVE RUNNERS, NO EMULATION
 # ----------------------------
@@ -159,8 +170,9 @@ jobs:
       DOCKER_IMAGE: payramapp/payram-shopify
 
     steps:
-      # For the annotated tag's message in "Publish GitHub Release"; `gh` there
-      # authenticates with GH_TOKEN, so the checkout keeps no credential.
+      # For the annotated tag's message in "Publish GitHub Release" and for
+      # scripts/should-publish-latest.sh; `gh` authenticates with GH_TOKEN and
+      # the public remote needs none, so the checkout keeps no credential.
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -182,6 +194,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # `latest` follows main's head and carries the version when the head is
+      # tagged; see TAGGING above. Reads the remote, so it fails the run (and
+      # publishes nothing) if GitHub cannot be asked.
+      - name: Decide whether latest moves
+        id: latest
+        run: bash scripts/should-publish-latest.sh
+
       - name: Derive tags
         id: meta
         uses: docker/metadata-action@v6
@@ -192,7 +211,7 @@ jobs:
             type=sha,prefix=sha-,format=short,enable=${{ github.ref_type != 'tag' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ steps.latest.outputs.publish == 'true' }}
 
       - name: Tag both platforms
         working-directory: ${{ runner.temp }}/digests
@@ -258,5 +277,5 @@ jobs:
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
             echo ""
-            echo "Pin the \`sha-\` tag in production; \`latest\` moves."
+            echo "\`latest\` moved: ${{ steps.latest.outputs.publish }}. Pin the \`sha-\` tag in production; \`latest\` moves."
           } >> "$GITHUB_STEP_SUMMARY"

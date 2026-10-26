@@ -288,7 +288,7 @@ Configuration lives in three places. An agent changing behaviour should know whi
 | `PAYMENT_LINK_SECRET` | **production** | Signs `/pay/{token}` links. The installer generates it; set it yourself on a manual install — see the warning below |
 | `PORT` | — | Server port (default `2798`). The installer publishes and probes the same number; it reads this from `.env` only |
 | `CONNECTOR_BIND_ADDRESS` | — | Installer only. How the port is published: an address (`127.0.0.1` on new installs), `all` (every interface, IPv4+IPv6) or `none` (Docker networks only). A re-run keeps whatever the existing container had |
-| `CONNECTOR_IMAGE` | — | Installer only. Image to run instead of `payramapp/payram-shopify:latest` — a `sha-<commit>` tag or an `@sha256` digest. Set in the environment on a first run it is written here; remove the line to follow `:latest` again |
+| `CONNECTOR_IMAGE` | — | Installer only. Image to run instead of `payramapp/payram-shopify:latest` — a release tag such as `1.2.0`, a `sha-<commit>` tag (no version, so no update notices) or an `@sha256` digest. Set in the environment on a first run it is written here; remove the line to follow `:latest` again |
 | `PAYRAM_BASE_URL` / `PAYRAM_PROJECT_API_KEY` | — | Dev shortcut to skip the Settings page. Per-shop DB config wins |
 | `ALLOW_INSECURE_PAYRAM_URL` | — | Dev only. Disables SSRF protection on the Payram URL. **Never set in production** |
 
@@ -393,8 +393,19 @@ docker inspect payram-shopify-connector \
 
 This prints the commit the running image was built from. The installer prints the connector
 version and image digest right after the pull, and the app's Settings page shows the running
-version. Every image is also published with an immutable `sha-<commit>` tag; to stay on one,
-put `CONNECTOR_IMAGE=payramapp/payram-shopify:sha-<commit>` in `.env` and re-run the installer.
+version — which is also what lets it tell you when a newer release exists.
+
+How the image tags relate:
+
+| Tag | What it is | Carries a version (Settings page, update notices) |
+|---|---|---|
+| `latest` | What the installer pulls. Follows `main`; once a release is tagged there, it is that release's own build | Yes once the release is tagged; a `main` commit not yet tagged carries none |
+| `<version>`, e.g. `1.2.0`, and `1.2` | A release build | Yes |
+| `sha-<commit>` | The build of one `main` commit, never replaced | No — the page shows no version and no update notice |
+
+Re-running an older release's build never moves `latest` back. To stay on one release, put
+`CONNECTOR_IMAGE=payramapp/payram-shopify:<version>` (or its `@sha256` digest) in `.env` and
+re-run the installer; `sha-<commit>` pins one exact build too, but without update notices.
 
 > **Installed before May 11, 2026?** Early installers pulled `mason0816/payram-shopify-test`.
 > Re-running the installer moves you to `payramapp/payram-shopify`.
