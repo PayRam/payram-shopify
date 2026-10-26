@@ -17,6 +17,14 @@
 # The installer hardcodes `:latest`, so a merchant re-running it silently takes
 # whatever was last pushed. `sha-` tags give them something stable to pin to,
 # and give us something to roll back to.
+#
+# NATIVE RUNNERS, NO EMULATION
+# ----------------------------
+# Each platform builds on its own hardware and pushes an untagged image by
+# digest; `publish` then puts both digests under the tags above. Building arm64
+# under QEMU on an amd64 runner broke on Node 26: `prisma generate` read a
+# corrupted schema JSON at a different offset on every run (2026-10-26, run
+# 40279546824), so `main` merged and nothing was published.
 name: Release image
 
 on:
@@ -33,20 +41,32 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
-  publish:
+  build:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          # arm64 is included because self-hosted merchants commonly run on ARM
+          # VPS (Ampere, Oracle free tier). Without it `docker pull` on those
+          # hosts either fails or silently runs emulated.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
-      # write: v* builds also publish a GitHub Release, which is what the
-      # connector's in-app update notice reads.
-      contents: write
+      contents: read
 
     env:
       DOCKER_IMAGE: payramapp/payram-shopify
+      PLATFORM: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Fail here, loudly, rather than at `docker login` with an opaque error.
       # These secrets exist on payram-core but are repo-scoped, so they must be
@@ -63,8 +83,86 @@ jobs:
             exit 1
           fi
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      # linux/arm64 -> linux-arm64: names this platform's cache and artifact.
+      - name: Name the platform
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Labels only; the tags are applied once, in `publish`.
+      - name: Derive labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Readable from inside the running container, unlike the OCI labels.
+          # APP_VERSION comes from the TAG, never from metadata-action's `version`
+          # output: on a main build that output resolves to the literal "latest"
+          # (the raw tag outranks the sha tag), which would stamp every merchant's
+          # image PAYRAM_VERSION=latest and make the update banner nag forever.
+          # Untagged builds ship no version, and the app then stays silent.
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      # write: v* builds also publish a GitHub Release, which is what the
+      # connector's in-app update notice reads.
+      contents: write
+
+    env:
+      DOCKER_IMAGE: payramapp/payram-shopify
+
+    steps:
+      # For the annotated tag's message in "Publish GitHub Release"; `gh` there
+      # authenticates with GH_TOKEN, so the checkout keeps no credential.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
@@ -86,28 +184,34 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-      # arm64 is included because self-hosted merchants commonly run on ARM VPS
-      # (Ampere, Oracle free tier). Without it `docker pull` on those hosts
-      # either fails or silently runs emulated.
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Readable from inside the running container, unlike the OCI labels.
-          # APP_VERSION comes from the TAG, never from metadata-action's `version`
-          # output: on a main build that output resolves to the literal "latest"
-          # (the raw tag outranks the sha tag), which would stamp every merchant's
-          # image PAYRAM_VERSION=latest and make the update banner nag forever.
-          # Untagged builds ship no version, and the app then stays silent.
-          build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
-            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Tag both platforms
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          tags=()
+          while IFS= read -r tag; do tags+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do sources+=("${DOCKER_IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+
+      # The tags above can only be right if both platforms made it; a merchant on
+      # ARM pulling an amd64-only `latest` gets "exec format error".
+      - name: Check both platforms are published
+        env:
+          SHA_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ref="${DOCKER_IMAGE}:${SHA_TAG::11}"
+          # Attestation manifests carry the platform unknown/unknown; skip them.
+          platforms="$(docker buildx imagetools inspect "$ref" --raw \
+            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | join(" ")')"
+          echo "$ref: $platforms"
+          for want in linux/amd64 linux/arm64; do
+            case " $platforms " in
+              *" $want "*) ;;
+              *) echo "::error::$ref is missing $want"; exit 1 ;;
+            esac
+          done
 
       # A tagged build is a release merchants are told about in-app, so publish
       # the notes they will read. Mark the release body with [installer-required]
