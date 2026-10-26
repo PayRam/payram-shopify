@@ -1,7 +1,7 @@
 /**
  * Payram Thank You Block — Checkout UI Extension
  * Target: purchase.thank-you.block.render
- * Runtime: Shopify 2026-01
+ * Runtime: Shopify 2026-10
  *
  * NOTE: The extension sandbox only allows s-* custom elements.
  * No native HTML elements (div, p, img, span) are permitted.
@@ -190,7 +190,7 @@ function PayramBlock() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Default export — called by the 2026-01 runtime                      */
+/* Default export — called by the 2026-10 runtime                      */
 /* ------------------------------------------------------------------ */
 export default function () {
   render(<PayramBlock />, document.body);

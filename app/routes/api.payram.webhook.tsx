@@ -61,8 +61,7 @@
  *   503  Payram could not be asked — Payram retries
  *   500  settlement itself failed (Shopify) — Payram retries
  */
-import type { ActionFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
+import type { ActionFunctionArgs } from "react-router";
 import prisma from "~/db.server";
 import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
 import { authenticateWebhook } from "~/utils/payram.server";
@@ -112,7 +111,7 @@ function decimalString(value: unknown): string | null {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") {
-    return json({ error: "Method not allowed" }, { status: 405 });
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 
   // The signature covers the exact bytes Payram sent, so keep them.
@@ -123,11 +122,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // JSON.parse accepts `null`, `1` and `"x"`, all of which would throw on the
     // property reads below and turn into a 500 that Payram retries.
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return json({ error: "Invalid JSON body" }, { status: 400 });
+      return Response.json({ error: "Invalid JSON body" }, { status: 400 });
     }
     body = parsed as Record<string, unknown>;
   } catch {
-    return json({ error: "Invalid JSON body" }, { status: 400 });
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   // Accept both Payram's snake_case webhook fields and camelCase variants.
@@ -147,7 +146,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const txHash = firstTxHash(body.payment_info ?? body.paymentInfo);
 
   if (!referenceId) {
-    return json(
+    return Response.json(
       { error: "Missing reference_id in webhook payload" },
       { status: 400 },
     );
@@ -183,7 +182,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         body.customer_id ?? "",
       )}`,
     );
-    return json({ ok: true, note: "no matching order, ignoring" });
+    return Response.json({ ok: true, note: "no matching order, ignoring" });
   }
 
   // --- 1. Signature ---
@@ -192,7 +191,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     console.error(
       `[payram-webhook] refused reference=${referenceId} for ${mapping.shop}: ${auth.message}`,
     );
-    return json({ error: auth.message }, { status: 401 });
+    return Response.json({ error: auth.message }, { status: 401 });
   }
 
   console.info("[payram-webhook] received", {
@@ -221,7 +220,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         lastSyncAt: new Date(),
       },
     });
-    return json({ ok: true, note: "unrecognised status, ignored" });
+    return Response.json({ ok: true, note: "unrecognised status, ignored" });
   }
 
   // --- 2. Confirm with Payram before anything is recorded ---
@@ -247,7 +246,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         "Key in this app's settings; if the order still looks wrong later, use Re-check payment.",
     );
     // 503: payram-core re-sends any non-2xx, and this answer can change.
-    return json(
+    return Response.json(
       { error: "Payram could not be reached to confirm this payment. Send it again later." },
       { status: 503 },
     );
@@ -270,7 +269,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             "ignored. If the customer paid, use Re-check payment.",
     );
     // 200: Payram has answered; resending the same message cannot change that.
-    return json({ ok: true, note: "not confirmed by Payram, ignored" });
+    return Response.json({ ok: true, note: "not confirmed by Payram, ignored" });
   }
 
   // From here on, every figure is Payram's.
@@ -282,7 +281,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       "Payram reported a payment status this app does not recognise for this order. " +
         "The order was left untouched — check this payment in Payram.",
     );
-    return json({ ok: true, note: "unrecognised status, ignored" });
+    return Response.json({ ok: true, note: "unrecognised status, ignored" });
   }
 
   // Nothing has arrived, or the request was voided. Record it against the
@@ -303,7 +302,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         data: { payramStatus: confirmedState, lastSyncAt: new Date() },
       });
     });
-    return json({ ok: true, state: confirmedState });
+    return Response.json({ ok: true, state: confirmedState });
   }
 
   const accessToken = await findOfflineAccessToken(mapping.shop);
@@ -318,7 +317,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
     // 200: reinstalling is a merchant action; retrying will not fix it.
-    return json({ ok: true, note: "shop not connected" });
+    return Response.json({ ok: true, note: "shop not connected" });
   }
 
   try {
@@ -344,7 +343,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       warnings: outcome.warnings,
     });
 
-    return json({
+    return Response.json({
       ok: true,
       state: outcome.state,
       settled: outcome.settled,
@@ -361,7 +360,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       })
       .catch(() => {});
     // 500 so Payram retries — this is likely transient (network, Shopify 5xx).
-    return json({ error: "Settlement failed" }, { status: 500 });
+    return Response.json({ error: "Settlement failed" }, { status: 500 });
   }
 };
 

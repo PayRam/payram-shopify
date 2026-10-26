@@ -10,9 +10,8 @@
  *     Shopify's own payouts, filters and reports agree with reality.
  */
 import prisma from "~/db.server";
-import { sessionStorage } from "~/shopify.server";
+import { apiVersion, sessionStorage } from "~/shopify.server";
 
-const SHOPIFY_API_VERSION = "2025-01";
 const PAYRAM_PAID_TAG = "payram_paid";
 
 /** Admin API budget. The buyer is waiting on the order lookup. */
@@ -51,7 +50,7 @@ async function adminGraphql<T>(
   let res: Response;
   try {
     res = await fetch(
-      `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      `https://${shop}/admin/api/${apiVersion}/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -187,7 +186,7 @@ export async function fetchOrderTotal(
   let res: Response;
   try {
     res = await fetch(
-      `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      `https://${shop}/admin/api/${apiVersion}/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -327,7 +326,7 @@ export async function tagShopifyOrderPaid(
   let res: Response;
   try {
     res = await fetch(
-      `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      `https://${shop}/admin/api/${apiVersion}/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -602,9 +601,21 @@ interface GiftCardData {
  * requires signing in through customer accounts or Shop Pay).
  *
  * When the order has a customer, `recipientAttributes` asks Shopify to email the
- * card directly — that is what makes this automatic. If that field is rejected
- * (older API surface, or PCD limits), the card is still created without it so
- * the value is never lost; the merchant delivers it from Admin instead.
+ * card directly — that is what makes this automatic. If Shopify refuses that
+ * (a userError, e.g. PCD limits), the card is still created without it so the
+ * value is never lost; the merchant delivers it from Admin instead.
+ *
+ * The recipient is `recipientAttributes.id`. This used to send `recipient`,
+ * which GiftCardRecipientInput has never had: Shopify rejected the whole
+ * request as invalid, that surfaced as a thrown (ambiguous) error rather than
+ * a userError, so the no-recipient retry never ran and no card was issued for
+ * any order with a customer.
+ *
+ * The amount is `initialAmount`, amount plus currency. `initialValue` (a bare
+ * decimal, implicitly the shop currency) is deprecated from Admin API 2026-07,
+ * which added local-currency gift cards. Callers pass the currency the amount
+ * was computed in, so the card can no longer be issued in a different currency
+ * from the one its amount was converted to.
  *
  * NOTE: the full gift card code is intentionally not requested or stored. It is
  * bearer value — anyone holding it can spend it. Shopify remains its custodian.
@@ -613,14 +624,17 @@ export async function createGiftCard(
   shop: string,
   accessToken: string,
   params: {
+    /** Decimal string in `currencyCode`, e.g. "4.20". */
     amount: string;
+    /** ISO-4217 code the amount is denominated in — normally the shop currency. */
+    currencyCode: string;
     customerId: string | null;
     note: string;
     message?: string;
   },
 ): Promise<GiftCardResult> {
   const baseInput: Record<string, unknown> = {
-    initialValue: params.amount,
+    initialAmount: { amount: params.amount, currencyCode: params.currencyCode },
     note: params.note,
   };
   if (params.customerId) {
@@ -631,7 +645,7 @@ export async function createGiftCard(
     ? {
         ...baseInput,
         recipientAttributes: {
-          recipient: params.customerId,
+          id: params.customerId,
           ...(params.message ? { message: params.message } : {}),
         },
       }

@@ -7,8 +7,7 @@
  *   shopifyOrderId    + shop  — look up by order
  *   payramReferenceId         — look up by Payram reference
  */
-import type { LoaderFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
+import type { LoaderFunctionArgs } from "react-router";
 import prisma from "~/db.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -19,7 +18,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shop = url.searchParams.get("shop") ?? undefined;
 
   if (!shopifyOrderId && !payramReferenceId) {
-    return json(
+    return Response.json(
       { error: "Provide shopifyOrderId (+ shop) or payramReferenceId" },
       { status: 400 }
     );
@@ -38,12 +37,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 
   if (!mapping) {
-    return json({ error: "Mapping not found" }, { status: 404 });
+    return Response.json({ error: "Mapping not found" }, { status: 404 });
   }
 
   // Do not expose the checkout URL in status responses (it is a direct
   // payment link). Return all other non-sensitive fields.
-  return json({
+  return Response.json({
     shop: mapping.shop,
     shopifyOrderId: mapping.shopifyOrderId,
     shopifyOrderName: mapping.shopifyOrderName,

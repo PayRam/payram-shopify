@@ -952,6 +952,7 @@ export async function settleOrder(params: {
 
         const card = await createGiftCard(shop, accessToken, {
           amount: giftAmount.toFixed(2),
+          currencyCode: giftCurrency,
           customerId: orderContext?.customerId ?? null,
           note: `Payram overpayment refund for order ${
             orderContext?.orderName ?? shopifyOrderId

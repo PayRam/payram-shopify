@@ -1,7 +1,11 @@
 import { useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
-import { Form, useActionData, useLoaderData, useNavigation } from "@remix-run/react";
+import type {
+  ActionFunctionArgs,
+  HeadersFunction,
+  LoaderFunctionArgs,
+} from "react-router";
+import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
+import { boundary } from "@shopify/shopify-app-react-router/server";
 import {
   Banner,
   BlockStack,
@@ -97,7 +101,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const grantedScopes = (session.scope ?? "").split(",").map((x) => x.trim());
   const hasGiftCardScope = grantedScopes.includes("write_gift_cards");
 
-  return json({
+  return {
     shop: session.shop,
     update,
     needsAttention,
@@ -131,8 +135,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     settlementTolerancePercent: config?.settlementTolerancePercent ?? "1.0",
     settlementToleranceMinUsd: config?.settlementToleranceMinUsd ?? "1.00",
     updateChecksEnabled: config?.updateChecksEnabled ?? false,
-  });
+  };
 };
+
+// authenticate.admin can answer with a thrown response (a session-token bounce,
+// an exit-iframe redirect). Under single fetch those keep their headers only if
+// the route that threw them exports this.
+export const headers: HeadersFunction = (headersArgs) =>
+  boundary.headers(headersArgs);
 
 /** Ceiling on the underpayment tolerance a merchant can configure. */
 const MAX_TOLERANCE_PERCENT = 10;
@@ -206,36 +216,36 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const giftCardMinimumUsd = giftCardMinimumUsdRaw;
 
   if (!/^\d+(\.\d{1,3})?$/.test(settlementTolerancePercent)) {
-    return json({
+    return {
       error:
         `Underpayment tolerance must be a plain number such as 1 or 0.5 — got "${tolPctRaw}". ` +
         "Do not include a % sign, and use a dot for decimals.",
-    });
+    };
   }
   // An unbounded percentage is a foot-gun with real cost: at 100 the allowance
   // equals the invoice, nothing is ever short, and a payment of zero settles as
   // paid in full. Someone typing 100 meaning 1.00 would get exactly that.
   if (Number(settlementTolerancePercent) > MAX_TOLERANCE_PERCENT) {
-    return json({
+    return {
       error:
         `Underpayment tolerance of ${settlementTolerancePercent}% is too high — the most ` +
         `that can be accepted is ${MAX_TOLERANCE_PERCENT}%. At high values almost any ` +
         "payment, including none at all, would settle as paid in full.",
-    });
+    };
   }
   if (!/^\d+(\.\d{1,2})?$/.test(settlementToleranceMinUsd)) {
-    return json({
+    return {
       error:
         `Minimum tolerance must be an amount in USD such as 1.00 — got "${tolMinRaw}". ` +
         "Use a dot for decimals, with no currency symbol.",
-    });
+    };
   }
   if (!/^\d+(\.\d{1,2})?$/.test(giftCardMinimumUsd)) {
-    return json({
+    return {
       error:
         `Minimum overpayment to refund must be an amount in USD such as 1.00 — got ` +
         `"${giftCardMinimumUsdRaw}". Use a dot for decimals, with no currency symbol.`,
-    });
+    };
   }
 
   // --- Test Payram server reachability ---
@@ -247,27 +257,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "recheck") {
     const shopifyOrderId = String(formData.get("shopifyOrderId") ?? "").trim();
     if (!/^\d+$/.test(shopifyOrderId)) {
-      return json({ error: "Invalid order reference." });
+      return { error: "Invalid order reference." };
     }
 
     const mapping = await prisma.paymentMapping.findUnique({
       where: { shop_shopifyOrderId: { shop: session.shop, shopifyOrderId } },
     });
     if (!mapping?.payramReferenceId) {
-      return json({
+      return {
         error:
           `No Payram payment has been created for order ${shopifyOrderId} yet, so there is ` +
           "nothing to re-check. This happens when the buyer never opened the payment page.",
-      });
+      };
     }
 
     const accessToken = await findOfflineAccessToken(session.shop);
     if (!accessToken) {
-      return json({
+      return {
         error:
           "This store is not fully connected to Shopify. Reopen this app from Shopify Admin, " +
           "then try again.",
-      });
+      };
     }
 
     // Every reference this order has is read from Payram; only what Payram
@@ -280,14 +290,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
 
     if (!outcome) {
-      return json({
+      return {
         error: unreachable.length
           ? "Payram did not return this payment. Check that the Payram Base URL and API Key " +
             "above are correct and that your Payram server is reachable."
           : `Payram does not confirm any payment for order ${shopifyOrderId} ` +
             `(${notConfirmed.length} reference(s) checked), so nothing is counted toward it. ` +
             "Check the order in Payram.",
-      });
+      };
     }
 
     // Warnings are informational (gift cards off, a note that could not be
@@ -304,19 +314,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       .filter(Boolean)
       .join(" ");
 
-    return json({ success: detail });
+    return { success: detail };
   }
 
   if (intent === "test-server") {
     if (!payramBaseUrl) {
-      return json({ error: "Enter a Payram Base URL to test." });
+      return { error: "Enter a Payram Base URL to test." };
     }
     try {
       validatePayramBaseUrl(payramBaseUrl);
     } catch (err) {
-      return json({
+      return {
         error: err instanceof Error ? err.message : "Invalid URL",
-      });
+      };
     }
 
     try {
@@ -331,33 +341,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       if (res.ok) {
         const payramCoreDetected = /welcome to payram core/i.test(responseText);
-        return json({
+        return {
           success: payramCoreDetected
             ? `Payram server reachable — HTTP ${res.status}. Payram Core responded normally.`
             : `Payram server reachable — HTTP ${res.status}${summary ? `. Response: ${summary}` : ""}`,
-        });
+        };
       }
 
-      return json({
+      return {
         error: `Payram server returned HTTP ${res.status}${summary ? `: ${summary}` : "."}`,
-      });
+      };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return json({ error: `Connection failed: ${msg}` });
+      return { error: `Connection failed: ${msg}` };
     }
   }
 
   // --- Test Payram payment API / API key ---
   if (intent === "test-payment-api") {
     if (!payramBaseUrl) {
-      return json({ error: "Enter a Payram Base URL to test." });
+      return { error: "Enter a Payram Base URL to test." };
     }
     try {
       validatePayramBaseUrl(payramBaseUrl);
     } catch (err) {
-      return json({
+      return {
         error: err instanceof Error ? err.message : "Invalid URL",
-      });
+      };
     }
 
     // Resolve API key: prefer form input, fall back to stored key
@@ -367,7 +377,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         where: { shop: session.shop },
       });
       if (!existing?.payramProjectApiKeyEncrypted) {
-        return json({ error: "No API key saved yet. Enter one above." });
+        return { error: "No API key saved yet. Enter one above." };
       }
       apiKey = decrypt(existing.payramProjectApiKeyEncrypted);
     }
@@ -400,9 +410,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           try {
             payload = JSON.parse(responseText) as Record<string, unknown>;
           } catch {
-            return json({
+            return {
               error: `Payram payment API returned HTTP ${res.status} but did not return valid JSON.`,
-            });
+            };
           }
         }
 
@@ -410,37 +420,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const referenceId = getReferenceId(payload);
 
         if (!checkoutUrl) {
-          return json({
+          return {
             error:
               `Payram payment API returned HTTP ${res.status} but did not include a checkout URL.`,
-          });
+          };
         }
 
-        return json({
+        return {
           success: `Test payment link created successfully — HTTP ${res.status}${referenceId ? ` (${referenceId})` : ""}`,
           checkoutUrl,
-        });
+        };
       }
 
-      return json({
+      return {
         error:
           `Payram payment API returned HTTP ${res.status}` +
           `${summary ? `: ${summary}` : "."}`,
-      });
+      };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return json({ error: `Connection failed: ${msg}` });
+      return { error: `Connection failed: ${msg}` };
     }
   }
 
   // --- Save settings ---
   if (!payramBaseUrl) {
-    return json({ error: "Payram Base URL is required." });
+    return { error: "Payram Base URL is required." };
   }
   try {
     validatePayramBaseUrl(payramBaseUrl);
   } catch (err) {
-    return json({ error: err instanceof Error ? err.message : "Invalid URL" });
+    return { error: err instanceof Error ? err.message : "Invalid URL" };
   }
 
   const existing = await prisma.merchantConfig.findUnique({
@@ -452,7 +462,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     encryptedKey = encrypt(payramProjectApiKey);
   }
   if (!encryptedKey) {
-    return json({ error: "Payram Project API Key is required." });
+    return { error: "Payram Project API Key is required." };
   }
 
   // Log what the browser actually submitted. A merchant reporting "it says
@@ -531,11 +541,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // Report what was actually stored, read back from the database. "Settings
   // saved." on its own cannot distinguish a save that worked from one that
   // wrote a value the merchant did not choose.
-  return json({
+  return {
     success: `Settings saved. Overpayment gift cards: ${
       savedRow?.autoGiftCardOnOverpayment ? "on" : "off"
     }. Update notices: ${savedRow?.updateChecksEnabled ? "on" : "off"}.`,
-  });
+  };
 };
 
 export default function SettingsPage() {

@@ -130,7 +130,14 @@ check "rename happened before the new run"  "[ \"\$(grep -n '^docker rename' '$F
 check "inspect ran before stop"             "[ \"\$(grep -n '^docker inspect' '$FAKE_LOG' | head -1 | cut -d: -f1)\" -lt \"\$(grep -n '^docker stop' '$FAKE_LOG' | cut -d: -f1)\" ]"
 check "app URL kept"                        "[ \"\$(envval SHOPIFY_APP_URL '$E')\" = https://old.example.com ]"
 check "banner: not reachable"               "grep -q 'not reachable yet' '$WORK/out.txt'"
-check "generic routing advice shown"        "grep -q 'No reverse proxy was found' '$WORK/out.txt'"
+# The installer picks its routing advice from the real host (/etc/nginx), so
+# the expected advice depends on where this test runs: GitHub's Ubuntu runners
+# have nginx installed, a developer laptop usually does not.
+if [ -d /etc/nginx ]; then
+  check "nginx routing advice shown (host has nginx)" "grep -q 'nginx on this host has no entry' '$WORK/out.txt' && ! grep -q 'No reverse proxy was found' '$WORK/out.txt'"
+else
+  check "generic routing advice shown"      "grep -q 'No reverse proxy was found' '$WORK/out.txt'"
+fi
 [ $rc -ne 0 ] && tail -20 "$WORK/out.txt"
 
 # ── Scenario C: existing loopback container → stays loopback, no warning; BSD/macOS `script`

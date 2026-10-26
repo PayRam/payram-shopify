@@ -334,6 +334,38 @@ describe("settleOrder — overpayment", () => {
     expect(args.amount).toBe("5.33");
   });
 
+  it("issues the card in the currency its amount was computed in", async () => {
+    seedMapping();
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    // Admin API 2026-07+ takes initialAmount = amount + currency. The amount
+    // above is EUR because the shop currency is EUR; the card must be EUR too.
+    const args = admin.createGiftCard.mock.calls[0][2] as {
+      amount: string;
+      currencyCode: string;
+    };
+    expect(args).toMatchObject({ amount: "5.33", currencyCode: "EUR" });
+  });
+
+  it("converts at the live rate and issues in the shop currency when it differs from the order's", async () => {
+    // A Markets order presented in EUR on a USD shop: gift cards are shop money.
+    admin.fetchOrderSettlementContext.mockResolvedValue({
+      orderName: "#1001",
+      note: null,
+      customerId: "gid://shopify/Customer/5",
+      shopCurrencyCode: "USD",
+    });
+    seedMapping();
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    expect(fx.convertFromUsd).toHaveBeenCalledWith(expect.anything(), "USD");
+    const args = admin.createGiftCard.mock.calls[0][2] as {
+      amount: string;
+      currencyCode: string;
+    };
+    expect(args).toMatchObject({ amount: "5.78", currencyCode: "USD" });
+  });
+
   it("attaches the customer so Shopify emails the card", async () => {
     seedMapping();
     await settle("ref-1", "OVER_FILLED" as never, "60.00");
