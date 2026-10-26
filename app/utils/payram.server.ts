@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { decrypt } from "~/utils/encryption.server";
@@ -23,6 +24,45 @@ export interface PayramCreatePaymentResult {
 
 export async function getMerchantConfig(shop: string) {
   return prisma.merchantConfig.findUnique({ where: { shop } });
+}
+
+/** Where this shop's Payram lives and the key to use with it. */
+interface PayramCredentials {
+  /** Base URL without a trailing slash. */
+  baseUrl: string;
+  apiKey: string;
+  /** The stored config row; null when credentials came from the environment. */
+  config: Awaited<ReturnType<typeof getMerchantConfig>>;
+}
+
+/**
+ * Resolve a shop's Payram credentials.
+ *
+ *  1. MerchantConfig row in DB (per-shop, set via the Settings page)
+ *  2. PAYRAM_BASE_URL + PAYRAM_PROJECT_API_KEY env vars (dev convenience)
+ *
+ * Returns null when neither exists. Throws when the stored key cannot be
+ * decrypted (ENCRYPTION_KEY missing or changed).
+ */
+async function resolvePayramCredentials(
+  shop: string,
+): Promise<PayramCredentials | null> {
+  const config = await getMerchantConfig(shop);
+  if (config) {
+    return {
+      baseUrl: config.payramBaseUrl.replace(/\/$/, ""),
+      apiKey: decrypt(config.payramProjectApiKeyEncrypted),
+      config,
+    };
+  }
+  if (process.env.PAYRAM_BASE_URL && process.env.PAYRAM_PROJECT_API_KEY) {
+    return {
+      baseUrl: process.env.PAYRAM_BASE_URL.replace(/\/$/, ""),
+      apiKey: process.env.PAYRAM_PROJECT_API_KEY,
+      config: null,
+    };
+  }
+  return null;
 }
 
 /**
@@ -97,27 +137,17 @@ export function validatePayramBaseUrl(rawUrl: string): void {
 export async function createPayramPayment(
   input: PayramCreatePaymentInput
 ): Promise<PayramCreatePaymentResult> {
-  const config = await getMerchantConfig(input.shop);
-
-  let baseUrlRaw: string;
-  let apiKey: string;
-
-  if (config) {
-    baseUrlRaw = config.payramBaseUrl;
-    apiKey = decrypt(config.payramProjectApiKeyEncrypted);
-  } else if (process.env.PAYRAM_BASE_URL && process.env.PAYRAM_PROJECT_API_KEY) {
-    baseUrlRaw = process.env.PAYRAM_BASE_URL;
-    apiKey = process.env.PAYRAM_PROJECT_API_KEY;
-  } else {
+  const credentials = await resolvePayramCredentials(input.shop);
+  if (!credentials) {
     throw new Error(
       `No Payram config found for shop: ${input.shop}. ` +
         "Either save credentials via the app Settings page, or set " +
         "PAYRAM_BASE_URL and PAYRAM_PROJECT_API_KEY in .env."
     );
   }
+  const { baseUrl, apiKey } = credentials;
 
   const customerId = `shopify:${input.shop}:order:${input.shopifyOrderId}`;
-  const baseUrl = baseUrlRaw.replace(/\/$/, "");
   const url = `${baseUrl}/api/v1/payment`;
 
   validatePayramBaseUrl(url);
@@ -197,6 +227,33 @@ export interface PayramPaymentSnapshot {
   customerId: string | null;
 }
 
+/**
+ * What asking Payram about one reference produced.
+ *
+ * "Payram said no" and "Payram did not answer" must stay apart: the first is
+ * final (a webhook for it is answered 200 so Payram stops resending), the
+ * second is temporary (answered 503 so Payram's webhook processor retries).
+ * Folding both into one `null` is what let an unreachable Payram look the same
+ * as a forged reference.
+ */
+export type PayramLookup =
+  | { status: "found"; payment: PayramPaymentSnapshot }
+  /** Payram answered: it has no payment under this reference. */
+  | { status: "not_found"; httpStatus: number }
+  /** No answer: no config, a rejected URL, the network, a timeout, a 5xx. */
+  | { status: "unavailable"; reason: string };
+
+/**
+ * Statuses that are Payram answering "no such payment".
+ *
+ * payram-core's PaymentRequestMiddleware answers 401 for a reference it does
+ * not have (internal/api/middleware/payment_request_middleware.go). 404 and 410
+ * mean the same from a proxy or an older core. Everything else that is not 2xx
+ * — 403 from a firewall, 429, 5xx — is treated as no answer, because calling a
+ * real payment "not found" is the expensive mistake: it stops Payram's retries.
+ */
+const NOT_FOUND_STATUSES = new Set([401, 404, 410]);
+
 /** Non-negative money only — a negative fill would subtract from an order. */
 function pickDecimalString(...values: unknown[]): string | null {
   for (const v of values) {
@@ -210,46 +267,41 @@ function pickDecimalString(...values: unknown[]): string | null {
 /**
  * Read a payment's authoritative state straight from Payram.
  *
- * The merchant webhook carries no signature (see state/malicious-flows.md,
- * MF-004), so its amounts are attacker-controllable. Anything that moves money
- * — notably issuing a gift card for an overpayment — must be based on this,
- * not on the webhook body.
+ * The merchant webhook's body is attacker-controllable (see
+ * state/malicious-flows.md, MF-004 and MF-012), so nothing that counts money,
+ * tags an order or mints a gift card may come from it. It must come from this.
  *
  * This mirrors the WooCommerce connector's `fetch_payment_status()`, which
  * re-verifies for exactly the same reason.
  *
  * GET {payramBaseUrl}/api/v1/payment/reference/{referenceId}
  *
- * Returns null when the payment cannot be verified; callers must then refuse to
- * move money rather than fall back to the webhook's numbers.
+ * Never throws. The caller still has to check `payment.customerId` belongs to
+ * the order before using the figures.
  */
 export async function fetchPayramPayment(
   shop: string,
   referenceId: string,
-): Promise<PayramPaymentSnapshot | null> {
-  const config = await getMerchantConfig(shop);
-
-  let baseUrlRaw: string;
-  let apiKey: string;
-  if (config) {
-    baseUrlRaw = config.payramBaseUrl;
-    apiKey = decrypt(config.payramProjectApiKeyEncrypted);
-  } else if (process.env.PAYRAM_BASE_URL && process.env.PAYRAM_PROJECT_API_KEY) {
-    baseUrlRaw = process.env.PAYRAM_BASE_URL;
-    apiKey = process.env.PAYRAM_PROJECT_API_KEY;
-  } else {
+): Promise<PayramLookup> {
+  let credentials: PayramCredentials | null;
+  try {
+    credentials = await resolvePayramCredentials(shop);
+  } catch (err) {
+    console.error(`[payram-verify] could not read the Payram config for ${shop}:`, err);
+    return { status: "unavailable", reason: "the saved Payram API key could not be read" };
+  }
+  if (!credentials) {
     console.error(`[payram-verify] no Payram config for shop ${shop}`);
-    return null;
+    return { status: "unavailable", reason: "no Payram server is configured" };
   }
 
-  const baseUrl = baseUrlRaw.replace(/\/$/, "");
-  const url = `${baseUrl}/api/v1/payment/reference/${encodeURIComponent(referenceId)}`;
+  const url = `${credentials.baseUrl}/api/v1/payment/reference/${encodeURIComponent(referenceId)}`;
 
   try {
     validatePayramBaseUrl(url);
   } catch (err) {
     console.error("[payram-verify] base URL rejected:", err);
-    return null;
+    return { status: "unavailable", reason: "the Payram Base URL is not allowed" };
   }
 
   const controller = new AbortController();
@@ -258,25 +310,29 @@ export async function fetchPayramPayment(
   let res: Response;
   try {
     res = await fetch(url, {
-      headers: { "API-Key": apiKey, Accept: "application/json" },
+      headers: { "API-Key": credentials.apiKey, Accept: "application/json" },
       signal: controller.signal,
     });
   } catch (err) {
     console.error("[payram-verify] request failed:", err);
-    return null;
+    return { status: "unavailable", reason: "Payram could not be reached" };
   } finally {
     clearTimeout(timeoutId);
   }
 
+  if (NOT_FOUND_STATUSES.has(res.status)) {
+    console.warn(`[payram-verify] Payram has no payment ${referenceId} (HTTP ${res.status})`);
+    return { status: "not_found", httpStatus: res.status };
+  }
   if (!res.ok) {
     console.error(`[payram-verify] HTTP ${res.status} for reference ${referenceId}`);
-    return null;
+    return { status: "unavailable", reason: `Payram answered HTTP ${res.status}` };
   }
 
   const json = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!json) {
+  if (!json || typeof json !== "object") {
     console.error("[payram-verify] unreadable response");
-    return null;
+    return { status: "unavailable", reason: "Payram's answer could not be read" };
   }
 
   // The two reference routes differ in casing: /payment/reference/:id returns
@@ -285,17 +341,134 @@ export async function fetchPayramPayment(
   const customerId = json.customerID ?? json.customerId ?? json.customer_id;
 
   return {
-    customerId: typeof customerId === "string" ? customerId : null,
-    paymentState: typeof state === "string" ? state : null,
-    filledAmountInUsd: pickDecimalString(
-      json.filledAmountInUSD,
-      json.filledAmountInUsd,
-      json.filled_amount_in_usd,
-    ),
-    amountInUsd: pickDecimalString(
-      json.amountInUSD,
-      json.amountInUsd,
-      json.amount_in_usd,
-    ),
+    status: "found",
+    payment: {
+      customerId: typeof customerId === "string" ? customerId : null,
+      paymentState: typeof state === "string" ? state : null,
+      filledAmountInUsd: pickDecimalString(
+        json.filledAmountInUSD,
+        json.filledAmountInUsd,
+        json.filled_amount_in_usd,
+      ),
+      amountInUsd: pickDecimalString(
+        json.amountInUSD,
+        json.amountInUsd,
+        json.amount_in_usd,
+      ),
+    },
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Webhook signatures                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * payram-core 3.9.0+ adds this to every webhook it sends — payment, payout and
+ * ping (pkg/utils/utils.go → signWebhook): `sha256=<hex HMAC-SHA256 of the raw
+ * body, keyed with the project API key>`.
+ */
+const PAYRAM_SIGNATURE_HEADER = "X-Payram-Signature";
+
+/** Does `header` sign exactly these bytes with `apiKey`? Constant-time. */
+export function isPayramSignatureValid(
+  rawBody: Uint8Array,
+  header: string,
+  apiKey: string,
+): boolean {
+  const match = /^sha256=([0-9a-f]{64})$/i.exec(header.trim());
+  if (!match) return false;
+  const expected = crypto.createHmac("sha256", apiKey).update(rawBody).digest();
+  const given = Buffer.from(match[1], "hex");
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+export type WebhookAuthentication =
+  /** Signed with this shop's saved API key. */
+  | { outcome: "signed" }
+  /**
+   * Not proven to come from Payram, but not refused: this shop has never
+   * received a correctly signed webhook, so its Payram may predate signing.
+   * Everything in it must still be confirmed with Payram before it counts.
+   */
+  | { outcome: "unauthenticated"; signatureMismatch: boolean }
+  /** This shop's Payram signs its webhooks, and this one is not signed by it. */
+  | { outcome: "refused"; message: string };
+
+/**
+ * Decide whether a webhook body may be acted on at all.
+ *
+ * WHY NOT SIMPLY REQUIRE THE SIGNATURE
+ * ------------------------------------
+ * Payram releases before 3.9.0 do not sign, so requiring it would stop every
+ * order on those servers from settling. And payram-core signs with the
+ * project's NEWEST active admin key (api_key_repo_impl.go →
+ * GetByExternalPlatformId), so a merchant who pasted an older key of the same
+ * project would see every genuine webhook fail. Refusing from day one would
+ * break both silently.
+ *
+ * So the shop is trusted to sign once it has proven it does: the first webhook
+ * that verifies with the saved key records `signedWebhooksSince`, and from then
+ * on an unsigned or wrongly signed webhook is refused before anything is read
+ * or written. Until then a webhook is accepted as unauthenticated — which costs
+ * little, because nothing in an unauthenticated body is ever believed: every
+ * reference is confirmed with Payram before it can count (MF-012).
+ *
+ * Saving a different Payram URL or API key clears the record, so moving to a
+ * new server cannot leave the shop refusing that server's webhooks.
+ *
+ * Rules: R-MALICIOUS-FLOW (MF-013), R-API-FOR-AGENTS.
+ */
+export async function authenticateWebhook(
+  shop: string,
+  rawBody: Uint8Array,
+  headers: Headers,
+): Promise<WebhookAuthentication> {
+  let credentials: PayramCredentials | null = null;
+  try {
+    credentials = await resolvePayramCredentials(shop);
+  } catch (err) {
+    // An unreadable key cannot verify anything; Payram confirmation will fail
+    // the same way and say so.
+    console.error(`[payram-webhook] could not read the Payram config for ${shop}:`, err);
+  }
+
+  const signature = headers.get(PAYRAM_SIGNATURE_HEADER)?.trim() || null;
+  const signedSince = credentials?.config?.signedWebhooksSince ?? null;
+
+  if (signature && credentials && isPayramSignatureValid(rawBody, signature, credentials.apiKey)) {
+    if (credentials.config && !signedSince) {
+      // Single statement, atomic on its own. The `null` guard keeps the first
+      // timestamp if two signed deliveries race.
+      await prisma.merchantConfig.updateMany({
+        where: { shop, signedWebhooksSince: null },
+        data: { signedWebhooksSince: new Date() },
+      });
+      console.info(
+        `[payram-webhook] ${shop}: first correctly signed Payram webhook — unsigned ones are refused from now on`,
+      );
+    }
+    return { outcome: "signed" };
+  }
+
+  if (signedSince) {
+    return {
+      outcome: "refused",
+      message: signature
+        ? "Webhook signature does not match the Payram API key saved in the Shopify app, so " +
+          "nothing was recorded. If the API key was changed in Payram, save the current key " +
+          "in the Payram app in Shopify Admin; Payram will resend this webhook."
+        : "Webhook is not signed. This store's Payram signs its webhooks, so an unsigned one " +
+          "is refused and nothing was recorded.",
+    };
+  }
+
+  if (signature) {
+    console.warn(
+      `[payram-webhook] ${shop}: webhook signature does not match the saved Payram API key. ` +
+        "Accepting it unauthenticated (every amount is still confirmed with Payram). " +
+        "Save the project's current API key in settings to have unsigned webhooks refused.",
+    );
+  }
+  return { outcome: "unauthenticated", signatureMismatch: Boolean(signature) };
 }

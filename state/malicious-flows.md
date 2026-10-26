@@ -82,8 +82,10 @@ Severity: `low` / `medium` / `high` / `critical`.
 ## MF-004 — Unsigned Payram webhook
 
 - **Severity:** medium
-- **Status:** **pending** (pre-existing; documented as a TODO in
-  `app/routes/api.payram.webhook.tsx`)
+- **Status:** superseded by **MF-013** (2026-10-22) for the signature, and by
+  **MF-012** for what an unauthenticated webhook can do. Original entry kept below.
+  (Was: **pending**, pre-existing; documented as a TODO in
+  `app/routes/api.payram.webhook.tsx`.)
 - **Attack:** `POST /api/payram/webhook` performs no signature verification. An
   attacker who learns or guesses a `referenceId` can post a `paid` status and
   have the Shopify order tagged `payram_paid` without any payment settling.
@@ -179,6 +181,9 @@ Severity: `low` / `medium` / `high` / `critical`.
 - **Residual risk:** an attacker who can forge a webhook can still cause an order
   to be *tagged* (not gift-carded) with an incorrect state. MF-004 remains the
   root fix.
+  **Superseded by MF-012 (2026-10-22):** that residual risk was larger than
+  stated — an unverified amount was recorded and later summed with verified
+  ones, so it COULD mint value. Fixed there.
 - **Discovered-in:** overpayment/gift-card work, 2026-09-03.
 
 ---
@@ -242,3 +247,81 @@ Severity: `low` / `medium` / `high` / `critical`.
   negative `filled_amount_in_usd` could previously subtract from an order's
   received total and flip a paid order back to underpaid.
 - **Discovered-in:** code review of the payment page work, 2026-09-03.
+
+---
+
+## MF-012 — Forged webhook amounts counted toward an order (two-step)
+
+- **Severity:** critical
+- **Status:** mitigated (2026-10-22)
+- **Attack:** When a webhook's `reference_id` was unknown, the connector found
+  the order from `customer_id` — `shopify:{shop}:order:{id}`, printed in the
+  buyer's own payment link. Payram, asked about the made-up reference, had no
+  such payment, so the payment was "unverified" — and was then recorded anyway
+  "from the webhook body only": its `filled_amount_in_usd` went into
+  `PayramPayment`, the order was tagged `payram_paid` and noted "paid in full".
+  `sumReceivedUsd` added every non-cancelled row, confirmed or not. So a buyer
+  posts one forged webhook claiming $150 on a $100 order, then really pays $1:
+  Payram's genuine webhook for the $1 is verified, the total reads $151, and the
+  connector calls `orderMarkAsPaid` and issues a $51 gift card. The payment page
+  told the buyer "nothing left to pay" after the forged message alone. During a
+  Payram outage a forged webhook could also overwrite the amount of an existing
+  real reference, or wipe it with a forged `CANCELLED`/`OPEN`.
+- **Affected surfaces:** `api.payram.webhook`, `settlement.server.ts`
+  (`settleOrder`, `sumReceivedUsd`), `payment-session.server.ts` (`quoteOrder`),
+  Re-check payment in `app._index.tsx` (credited a reference without checking
+  it belonged to the order), every `PayramPayment` row written before the fix.
+- **Mitigation:** one rule — only figures Payram itself confirms (the reference
+  exists AND its customerId is this order's) become money received, tag or note
+  an order, mark it paid, or mint a gift card.
+  - The webhook confirms every reference with Payram before writing anything,
+    and records Payram's figures, never the body's. Payram says no → 200 and a
+    merchant-facing `syncError`; Payram cannot be asked → 503 so payram-core
+    resends (it retries any status ≥ 400: `pkg/utils/utils.go`
+    `SendWebhookToMerchant`; schedule in `webhook_delivery_service_impl.go`).
+  - `PayramPayment.verifiedAt` marks confirmed rows; `sumReceivedUsd` — shared
+    by settlement and the payment page — counts confirmed rows only.
+    `settleOrder` refuses `verified: false` outright.
+  - Rows from before the fix are unconfirmed and do not count. They are
+    confirmed lazily (≤ 5 per settlement or payment-page visit; every reference
+    on Re-check payment); rows Payram rejects get `rejectedAt`, never count, are
+    never retried automatically, and keep the claimed figures as the audit
+    trail (plus a log line and the order's `syncError`).
+  - The repeat-delivery shortcut only applies to a row already confirmed for
+    the same order, and only when the confirmed total equals what settlement
+    last acted on.
+  - A confirmed reference moves to the order Payram says owns it.
+- **Residual risk:** orders already exploited before the fix keep whatever
+  Shopify state and gift card they got; the next settlement re-tags and notes
+  them from confirmed figures, but a gift card cannot be clawed back
+  automatically. A legacy row whose real amount a forged `CANCELLED` had wiped
+  is not looked up automatically (it counts nothing either way); Re-check
+  payment restores it.
+- **Discovered-in:** security audit, 2026-10-22 (reproduced end to end).
+
+---
+
+## MF-013 — Webhook signature (supersedes MF-004's mitigation)
+
+- **Severity:** medium
+- **Status:** partially mitigated (2026-10-22)
+- **Attack:** as MF-004 — anyone can post to `/api/payram/webhook`.
+- **Finding:** payram-core 3.9.0+ signs every webhook it sends (payment, payout
+  and ping) with `X-Payram-Signature: sha256=<hex HMAC-SHA256 of the raw body,
+  keyed with the project API key>` (`pkg/utils/utils.go` → `signWebhook`). It
+  signs with the project's newest active admin key
+  (`api_key_repo_impl.go` → `GetByExternalPlatformId`), not necessarily the key
+  the merchant pasted into this app.
+- **Mitigation:** per-shop enforcement. The first webhook that verifies with
+  the saved key records `MerchantConfig.signedWebhooksSince`; from then on an
+  unsigned or wrongly signed webhook is refused with 401 before anything is
+  read from Payram or written. Saving a different Payram URL or API key clears
+  it. Until a shop has proven its Payram signs, webhooks are accepted
+  unauthenticated — safe because of MF-012, which never believes the body.
+- **Residual risk:** on Payram before 3.9.0, or where the saved key is not the
+  signing key, forged webhooks still reach the confirmation step: they cost one
+  Payram lookup each and can replace the order's `syncError` with a "could not
+  be confirmed" note (nuisance, no money). Once a shop is enforcing, a new admin
+  API key created in Payram makes its webhooks fail 401 until that key is saved
+  in the app; Payram keeps resending meanwhile and Re-check payment still works.
+- **Discovered-in:** security audit, 2026-10-22.

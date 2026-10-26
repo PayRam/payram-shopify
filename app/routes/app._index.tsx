@@ -18,9 +18,9 @@ import {
 import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 import { decrypt, encrypt } from "~/utils/encryption.server";
-import { fetchPayramPayment, validatePayramBaseUrl } from "~/utils/payram.server";
+import { validatePayramBaseUrl } from "~/utils/payram.server";
 import { findOfflineAccessToken } from "~/utils/shopify-admin.server";
-import { normalizePayramState, settleOrder } from "~/utils/settlement.server";
+import { recheckOrder } from "~/utils/settlement.server";
 import { getUpdateStatus } from "~/utils/updates.server";
 
 function summarizeResponseText(value: string): string | null {
@@ -241,9 +241,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // --- Test Payram server reachability ---
   // --- Re-check a single order against Payram ---
   // Webhooks are the normal path, but they can be missing (no webhook configured
-  // in Payram), late, or exhausted after retries. Settlement never depended on
-  // the webhook for its figures — it re-reads them from Payram — so the same
-  // work can be triggered on demand. This is the merchant's self-service repair.
+  // in Payram), late, or exhausted after retries. Settlement never depends on
+  // the webhook for its figures — it reads them from Payram — so the same work
+  // can be triggered on demand. This is the merchant's self-service repair.
   if (intent === "recheck") {
     const shopifyOrderId = String(formData.get("shopifyOrderId") ?? "").trim();
     if (!/^\d+$/.test(shopifyOrderId)) {
@@ -270,50 +270,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     }
 
-    // Re-check EVERY reference we know for this order, not just the latest.
-    // A top-up arrives under a brand-new Payram reference, so an order that was
-    // underpaid and then topped up has more than one, and refreshing only the
-    // most recent would leave it reading "still short".
-    const known = await prisma.payramPayment.findMany({
-      where: { shop: session.shop, shopifyOrderId },
-      select: { payramReferenceId: true },
+    // Every reference this order has is read from Payram; only what Payram
+    // confirms for this order counts (settlement.server.ts → recheckOrder).
+    const { outcome, unreachable, notConfirmed } = await recheckOrder({
+      shop: session.shop,
+      shopifyOrderId,
+      accessToken,
+      latestReferenceId: mapping.payramReferenceId,
     });
-    const references = Array.from(
-      new Set([mapping.payramReferenceId, ...known.map((k) => k.payramReferenceId)]),
-    );
-
-    let outcome: Awaited<ReturnType<typeof settleOrder>> | null = null;
-    const unreachable: string[] = [];
-
-    for (const referenceId of references) {
-      const snapshot = await fetchPayramPayment(session.shop, referenceId);
-      if (!snapshot) {
-        unreachable.push(referenceId);
-        continue;
-      }
-      outcome = await settleOrder({
-        shop: session.shop,
-        shopifyOrderId,
-        referenceId,
-        state: normalizePayramState(snapshot.paymentState),
-        filledAmountInUsd: snapshot.filledAmountInUsd,
-        txHash: null,
-        accessToken,
-        // Read straight from Payram over an authenticated call — the trust level
-        // marking an order paid and issuing a gift card both require.
-        verified: true,
-        // The merchant explicitly asked, so redo the Shopify side even if nothing
-        // about the payment changed. This is what repairs an order that settled
-        // but failed to be marked paid.
-        force: true,
-      });
-    }
 
     if (!outcome) {
       return json({
-        error:
-          "Payram did not return this payment. Check that the Payram Base URL and API Key " +
-          "above are correct and that your Payram server is reachable.",
+        error: unreachable.length
+          ? "Payram did not return this payment. Check that the Payram Base URL and API Key " +
+            "above are correct and that your Payram server is reachable."
+          : `Payram does not confirm any payment for order ${shopifyOrderId} ` +
+            `(${notConfirmed.length} reference(s) checked), so nothing is counted toward it. ` +
+            "Check the order in Payram.",
       });
     }
 
@@ -324,9 +297,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       outcome.settled
         ? `Order ${shopifyOrderId} is settled — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Shopify has been updated.`
         : `Order ${shopifyOrderId} is still short — $${outcome.receivedUsd} received of $${outcome.invoicedUsd}. Do not fulfil until the balance is paid.`,
-      unreachable.length
-        ? `${unreachable.length} earlier payment reference(s) could not be read from Payram.`
-        : "",
+      // Payram's unanswered and rejected references are already described in
+      // the warnings, in the same words the order's syncError carries.
       ...outcome.warnings,
     ]
       .filter(Boolean)
@@ -497,29 +469,53 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     settlementToleranceMinUsd,
   });
 
-  await prisma.merchantConfig.upsert({
-    where: { shop: session.shop },
-    create: {
-      shop: session.shop,
-      payramBaseUrl,
-      payramProjectApiKeyEncrypted: encryptedKey,
-      paymentMethodName,
-      autoGiftCardOnOverpayment,
-      giftCardMinimumUsd,
-      settlementTolerancePercent,
-      settlementToleranceMinUsd,
-      updateChecksEnabled,
-    },
-    update: {
-      payramBaseUrl,
-      payramProjectApiKeyEncrypted: encryptedKey,
-      paymentMethodName,
-      autoGiftCardOnOverpayment,
-      giftCardMinimumUsd,
-      settlementTolerancePercent,
-      settlementToleranceMinUsd,
-      updateChecksEnabled,
-    },
+  // R-DB-TX: whether the Payram server or key changed is read and acted on in
+  // one transaction.
+  await prisma.$transaction(async (tx) => {
+    const current = await tx.merchantConfig.findUnique({
+      where: { shop: session.shop },
+      select: { payramBaseUrl: true, payramProjectApiKeyEncrypted: true },
+    });
+    // Compare the key itself: the ciphertext changes on every save (fresh IV).
+    let keyChanged = false;
+    if (current && payramProjectApiKey) {
+      try {
+        keyChanged = decrypt(current.payramProjectApiKeyEncrypted) !== payramProjectApiKey;
+      } catch {
+        keyChanged = true;
+      }
+    }
+    // A different Payram server or key may not sign its webhooks yet, or signs
+    // with another key, so stop refusing unsigned ones until it proves it does
+    // (authenticateWebhook in payram.server.ts).
+    const credentialsChanged =
+      current != null && (current.payramBaseUrl !== payramBaseUrl || keyChanged);
+
+    await tx.merchantConfig.upsert({
+      where: { shop: session.shop },
+      create: {
+        shop: session.shop,
+        payramBaseUrl,
+        payramProjectApiKeyEncrypted: encryptedKey,
+        paymentMethodName,
+        autoGiftCardOnOverpayment,
+        giftCardMinimumUsd,
+        settlementTolerancePercent,
+        settlementToleranceMinUsd,
+        updateChecksEnabled,
+      },
+      update: {
+        payramBaseUrl,
+        payramProjectApiKeyEncrypted: encryptedKey,
+        ...(credentialsChanged ? { signedWebhooksSince: null } : {}),
+        paymentMethodName,
+        autoGiftCardOnOverpayment,
+        giftCardMinimumUsd,
+        settlementTolerancePercent,
+        settlementToleranceMinUsd,
+        updateChecksEnabled,
+      },
+    });
   });
 
   const savedRow = await prisma.merchantConfig.findUnique({
