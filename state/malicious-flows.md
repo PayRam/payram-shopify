@@ -164,9 +164,11 @@ Severity: `low` / `medium` / `high` / `critical`.
 - **Mitigation:** the webhook body is never trusted for money. Before settling,
   the connector re-reads the payment from Payram directly
   (`fetchPayramPayment` → `GET /api/v1/payment/reference/{id}`) and uses those
-  figures. A gift card is issued only when `verified` is true; if Payram cannot
-  be reached the payment is still recorded and tagged, but no value is minted and
-  the merchant is told to refund manually. This mirrors the WooCommerce
+  figures. A gift card is issued only when `verified` is true. If Payram cannot
+  be asked, the webhook answers 503 and records nothing (no payment row, tag or
+  gift card), so payram-core resends it; the payment mapping carries a
+  `syncError` until a delivery is confirmed (MF-012, 2026-10-22; before that the
+  payment was recorded and tagged unconfirmed). This mirrors the WooCommerce
   connector's `fetch_payment_status()` defence-in-depth.
   Defence in depth: the feature is **off by default**, requires the merchant to
   opt in, enforces a configurable minimum, and refuses to issue a second card for
@@ -274,8 +276,11 @@ Severity: `low` / `medium` / `high` / `critical`.
 - **Mitigation:** one rule — only figures Payram itself confirms (the reference
   exists AND its customerId is this order's) become money received, tag or note
   an order, mark it paid, or mint a gift card.
-  - The webhook confirms every reference with Payram before writing anything,
-    and records Payram's figures, never the body's. Payram says no → 200 and a
+  - The webhook confirms every reference with Payram before it records a
+    payment or touches the Shopify order, and records Payram's figures, never
+    the body's. The only write before that is a diagnostic `syncError` on the
+    payment mapping, for a message that is unrecognised, rejected or not yet
+    confirmable; it is never a tag, note or amount. Payram says no → 200 and a
     merchant-facing `syncError`; Payram cannot be asked → 503 so payram-core
     resends (it retries any status ≥ 400: `pkg/utils/utils.go`
     `SendWebhookToMerchant`; schedule in `webhook_delivery_service_impl.go`).
@@ -315,7 +320,10 @@ Severity: `low` / `medium` / `high` / `critical`.
 - **Mitigation:** per-shop enforcement. The first webhook that verifies with
   the saved key records `MerchantConfig.signedWebhooksSince`; from then on an
   unsigned or wrongly signed webhook is refused with 401 before anything is
-  read from Payram or written. Saving a different Payram URL or API key clears
+  read from Payram or written. If the saved key itself cannot be read (for
+  example it fails to decrypt), no signature can be checked: the webhook gets
+  503 instead, because the Payram lookup needs the same key, and nothing is
+  recorded. Saving a different Payram URL or API key clears
   it. Until a shop has proven its Payram signs, webhooks are accepted
   unauthenticated — safe because of MF-012, which never believes the body.
 - **Residual risk:** on Payram before 3.9.0, or where the saved key is not the
