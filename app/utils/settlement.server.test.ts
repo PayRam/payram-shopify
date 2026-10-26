@@ -25,7 +25,10 @@ const { db, admin, fx, store } = vi.hoisted(() => {
     addOrderTags: vi.fn(),
     appendOrderNote: vi.fn(),
     createGiftCard: vi.fn(),
+    findGiftCardsByNote: vi.fn(),
     markOrderPaid: vi.fn(),
+    // Settlement tells an unclear failure from a refusal by this class.
+    GiftCardOutcomeUnknownError: class GiftCardOutcomeUnknownError extends Error {},
   };
   const fx = {
     convertFromUsd: vi.fn(),
@@ -1013,8 +1016,173 @@ describe("giftCardSlot", () => {
     ["", "open"],
     ["pending", "pending"],
     ["manual_refund", "manual_refund"],
+    ["unconfirmed:2026-10-26T12:00:00.000Z", "unconfirmed"],
     ["gid://shopify/GiftCard/9", "issued"],
   ])("reads %s as %s", (id, slot) => {
     expect(giftCardSlot(id as string | null | undefined)).toBe(slot);
+  });
+});
+
+describe("settleOrder — a gift card Shopify may have made is never made twice", () => {
+  // giftCardCreate timing out after Shopify made the card used to free the
+  // slot, so the next delivery or Re-check minted a second card (audit F4).
+  const unclear = () =>
+    new admin.GiftCardOutcomeUnknownError(
+      "Gift card could not be created and it is unclear whether Shopify created one (timeout).",
+    );
+  const recheck = () =>
+    settleOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      referenceId: "ref-1",
+      state: "OVER_FILLED" as never,
+      filledAmountInUsd: "60.00",
+      txHash: null,
+      accessToken: "token",
+      verified: true,
+      force: true,
+    });
+  /** As if the unclear attempt ended `minutes` ago. */
+  const unclearFor = (minutes: number) => {
+    db.mapping = {
+      ...db.mapping,
+      giftCardId: `unconfirmed:${new Date(Date.now() - minutes * 60_000).toISOString()}`,
+    };
+  };
+  const created = new Date("2026-10-20T09:00:00Z");
+
+  it("keeps the slot reserved and tells the merchant not to refund by hand", async () => {
+    seedMapping({ createdAt: created });
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+
+    const out = await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    expect(out.giftCardIssued).toBe(false);
+    expect(giftCardSlot(db.mapping?.giftCardId as string)).toBe("unconfirmed");
+    const text = out.warnings.join(" ");
+    expect(text).toMatch(/Shopify may have made it/);
+    expect(text).toMatch(/\[Payram order 1001\]/);
+    expect(text).toMatch(/Do not refund it by hand as well/);
+    expect(text).not.toMatch(/Refund manually/);
+  });
+
+  it("does not try again, or even look, before Shopify has had time to list the card", async () => {
+    seedMapping({ createdAt: created });
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    const again = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(1);
+    expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
+    expect(again.warnings.join(" ")).toMatch(/from \d{4}-\d\d-\d\d \d\d:\d\d UTC, Re-check payment looks/);
+    expect(giftCardSlot(db.mapping?.giftCardId as string)).toBe("unconfirmed");
+  });
+
+  it("finds the card Shopify did make and records it instead of minting another", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    admin.findGiftCardsByNote.mockResolvedValue([
+      { id: "gid://shopify/GiftCard/77", lastCharacters: "9z9z", amount: "5.33", currencyCode: "EUR" },
+    ]);
+
+    const out = await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect(admin.findGiftCardsByNote).toHaveBeenCalledWith(SHOP, "token", {
+      noteIncludes: "[Payram order 1001]",
+      createdSince: new Date(created.getTime() - 60 * 60 * 1000),
+    });
+    expect(out.giftCardIssued).toBe(true);
+    expect(db.mapping).toMatchObject({
+      giftCardId: "gid://shopify/GiftCard/77",
+      giftCardLastChars: "9z9z",
+      giftCardAmount: "5.33",
+      giftCardCurrency: "EUR",
+    });
+    expect(admin.appendOrderNote.mock.lastCall?.[4]).toMatch(/gift card 5\.33 EUR ending 9z9z/);
+  });
+
+  it("creates the card only once Shopify confirms it has none", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    admin.findGiftCardsByNote.mockResolvedValue([]);
+
+    const out = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(1);
+    expect(out.giftCardIssued).toBe(true);
+    expect(db.mapping?.giftCardId).toBe("gid://shopify/GiftCard/9");
+  });
+
+  it("stays reserved, creating nothing, when Shopify cannot be asked", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    const before = db.mapping?.giftCardId;
+    admin.findGiftCardsByNote.mockRejectedValue(new Error("Could not reach Shopify (find gift cards)."));
+
+    const out = await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect(db.mapping?.giftCardId).toBe(before);
+    expect(out.warnings.join(" ")).toMatch(/Shopify could not be asked just now/);
+  });
+
+  it("an unclear answer on the retry keeps the slot reserved again", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    admin.findGiftCardsByNote.mockResolvedValue([]);
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+
+    await recheck();
+    const again = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(1);
+    expect(giftCardSlot(db.mapping?.giftCardId as string)).toBe("unconfirmed");
+    expect(again.giftCardIssued).toBe(false);
+  });
+
+  it("says so when Shopify holds more than one card for the order", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    admin.findGiftCardsByNote.mockResolvedValue([
+      { id: "gid://shopify/GiftCard/77", lastCharacters: "aaaa", amount: "5.33", currencyCode: "EUR" },
+      { id: "gid://shopify/GiftCard/78", lastCharacters: "bbbb", amount: "5.33", currencyCode: "EUR" },
+    ]);
+
+    const out = await recheck();
+
+    expect(db.mapping?.giftCardId).toBe("gid://shopify/GiftCard/77");
+    expect(out.warnings.join(" ")).toMatch(/2 gift cards .* keep the card ending aaaa/);
+  });
+
+  it("gift cards switched off since, and none in Shopify: left for a manual refund", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(11);
+    db.config = { ...db.config, autoGiftCardOnOverpayment: false };
+    admin.findGiftCardsByNote.mockResolvedValue([]);
+
+    const out = await recheck();
+
+    expect(admin.createGiftCard).not.toHaveBeenCalled();
+    expect(db.mapping?.giftCardId).toBe("manual_refund");
+    expect(out.warnings.join(" ")).toMatch(/must be refunded manually/);
+  });
+
+  it("every card's note carries the order marker the search looks for", async () => {
+    seedMapping({ createdAt: created });
+    await settle("ref-1", "OVER_FILLED" as never, "60.00");
+
+    const args = admin.createGiftCard.mock.calls[0][2] as { note: string };
+    expect(args.note).toBe(
+      "Payram overpayment refund for order #1001 (5.78 USD overpaid). [Payram order 1001]",
+    );
+  });
+
+  it("an order whose card may exist is not reported as having one", async () => {
+    seedMapping({ createdAt: created });
+    unclearFor(1);
+    const out = await settle("ref-1", "OVER_FILLED" as never, "60.00");
+    expect(out.giftCardIssued).toBe(false);
   });
 });

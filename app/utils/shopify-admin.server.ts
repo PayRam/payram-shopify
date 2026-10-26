@@ -582,6 +582,23 @@ export interface GiftCardResult {
   notified: boolean;
 }
 
+/**
+ * giftCardCreate did not say whether it worked: the request timed out, the
+ * connection dropped, or Shopify answered with something other than a result.
+ * Shopify may have created the card anyway, so this must never be retried
+ * blindly — look for the card first (`findGiftCardsByNote`).
+ *
+ * Every other failure from `createGiftCard` is definitive: nothing was created.
+ */
+export class GiftCardOutcomeUnknownError extends Error {
+  constructor(detail: string) {
+    super(
+      `Gift card could not be created and it is unclear whether Shopify created one (${detail}).`,
+    );
+    this.name = "GiftCardOutcomeUnknownError";
+  }
+}
+
 interface GiftCardData {
   giftCardCreate?: {
     giftCard?: {
@@ -673,14 +690,13 @@ export async function createGiftCard(
       );
     } catch (err) {
       // A thrown error is AMBIGUOUS: the request may have timed out or the
-      // socket dropped *after* Shopify created the card. Retrying would mint a
-      // second one for the same overpayment. Bail and let the merchant refund
-      // manually — under-issuing is recoverable, double-issuing is not.
+      // socket dropped *after* Shopify created the card. Retrying here would
+      // mint a second one for the same overpayment, so stop and say so; the
+      // caller looks for the card before it ever tries again. Under-issuing is
+      // recoverable, double-issuing is not.
       lastError = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `Gift card could not be created and it is unclear whether Shopify created ` +
-          `one (${lastError}). Check Shopify Admin → Gift cards before refunding manually.`,
-      );
+      console.error("[payram-admin] giftCardCreate outcome unknown:", lastError);
+      throw new GiftCardOutcomeUnknownError(lastError);
     }
 
     const errs = data.giftCardCreate?.userErrors ?? [];
@@ -711,6 +727,101 @@ export async function createGiftCard(
   }
 
   throw new Error(`Gift card could not be created: ${lastError}`);
+}
+
+const GIFT_CARDS_QUERY = /* graphql */ `
+  query payramGiftCards($query: String!, $after: String) {
+    giftCards(first: 100, after: $after, query: $query, sortKey: CREATED_AT) {
+      nodes {
+        id
+        lastCharacters
+        note
+        initialValue { amount currencyCode }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+/** Pages read before giving up rather than concluding "none". */
+const GIFT_CARD_SEARCH_MAX_PAGES = 5;
+
+interface GiftCardsData {
+  giftCards?: {
+    nodes?: {
+      id?: string;
+      lastCharacters?: string | null;
+      note?: string | null;
+      initialValue?: { amount?: string; currencyCode?: string } | null;
+    }[];
+    pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+  };
+}
+
+/** A gift card already in Shopify. Never the code — only its handle. */
+export interface FoundGiftCard {
+  id: string;
+  lastCharacters: string | null;
+  amount: string | null;
+  currencyCode: string | null;
+}
+
+/**
+ * Gift cards created since `createdSince` whose note contains `noteIncludes`,
+ * oldest first.
+ *
+ * Used after `giftCardCreate` gave no answer, to find out whether Shopify made
+ * the card anyway. The note is matched here, not in Shopify's search: the
+ * search syntax does not document the note as searchable, and a search that
+ * silently ignored it would answer "none" for a card that exists. Throws —
+ * never answers "none" — when the cards cannot all be read, so a caller can
+ * only conclude there is no card from a complete answer.
+ *
+ * Needs read access to gift cards, which `write_gift_cards` includes.
+ */
+export async function findGiftCardsByNote(
+  shop: string,
+  accessToken: string,
+  params: { noteIncludes: string; createdSince: Date },
+): Promise<FoundGiftCard[]> {
+  const query = `created_at:>='${params.createdSince.toISOString()}'`;
+  const found: FoundGiftCard[] = [];
+  let after: string | null = null;
+
+  for (let page = 0; page < GIFT_CARD_SEARCH_MAX_PAGES; page += 1) {
+    const data: GiftCardsData = await adminGraphql<GiftCardsData>(
+      shop,
+      accessToken,
+      GIFT_CARDS_QUERY,
+      { query, after },
+      "find gift cards",
+    );
+    const connection = data.giftCards;
+    if (!connection?.nodes) {
+      throw new Error("Shopify returned no gift card list (find gift cards).");
+    }
+    for (const card of connection.nodes) {
+      if (card.id && card.note?.includes(params.noteIncludes)) {
+        found.push({
+          id: card.id,
+          lastCharacters: card.lastCharacters ?? null,
+          amount: card.initialValue?.amount ?? null,
+          currencyCode: card.initialValue?.currencyCode ?? null,
+        });
+      }
+    }
+    if (!connection.pageInfo?.hasNextPage) return found;
+    after = connection.pageInfo.endCursor ?? null;
+    if (!after) break;
+  }
+
+  console.error(
+    `[payram-admin] find gift cards: more than ${GIFT_CARD_SEARCH_MAX_PAGES} pages since ` +
+      `${params.createdSince.toISOString()}; not concluding there is no card`,
+  );
+  throw new Error(
+    "Too many gift cards were created in that time to check them all (find gift cards).",
+  );
 }
 
 /* ------------------------------------------------------------------ */

@@ -48,8 +48,11 @@ const admin = vi.hoisted(() => ({
   addOrderTags: vi.fn(),
   appendOrderNote: vi.fn(),
   createGiftCard: vi.fn(),
+  findGiftCardsByNote: vi.fn(),
   markOrderPaid: vi.fn(),
   tagShopifyOrderPaid: vi.fn(),
+  // Settlement tells an unclear failure from a refusal by this class.
+  GiftCardOutcomeUnknownError: class GiftCardOutcomeUnknownError extends Error {},
 }));
 vi.mock("~/utils/shopify-admin.server", () => admin);
 
@@ -707,6 +710,111 @@ describe("overpayments the merchant was told to refund by hand (audit F3)", () =
 
     expect(admin.createGiftCard).toHaveBeenCalledOnce();
     expect(again.outcome?.giftCardIssued).toBe(false);
+    expect((await mapping()).giftCardId).toBe("manual_refund");
+  });
+});
+
+describe("a gift card Shopify may have made (audit F4)", () => {
+  const unclear = () =>
+    new admin.GiftCardOutcomeUnknownError(
+      "Gift card could not be created and it is unclear whether Shopify created one " +
+        "(Could not reach Shopify (create gift card). Please try again shortly.).",
+    );
+  const recheck = () =>
+    settlement.recheckOrder({
+      shop: SHOP,
+      shopifyOrderId: ORDER,
+      accessToken: "shpat_test",
+      latestReferenceId: "real-ref",
+    });
+  /** Ten minutes and more pass after the unclear attempt. */
+  async function waitOutShopify() {
+    const m = await mapping();
+    const since = new Date(String(m.giftCardId).slice("unconfirmed:".length));
+    await prisma.paymentMapping.update({
+      where: { id: m.id },
+      data: { giftCardId: `unconfirmed:${new Date(since.getTime() - 11 * 60_000).toISOString()}` },
+    });
+  }
+
+  it("a timeout after Shopify made the card: Re-check finds and records it, and mints no second card", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+
+    const first = await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(first.body).toMatchObject({ settled: true, giftCardIssued: false });
+    let m = await mapping();
+    expect(m.giftCardId).toMatch(/^unconfirmed:/);
+    // Needs review: listed with what to check and not to refund by hand.
+    expect(m.syncError).toMatch(/Shopify may have made it.*Do not refund it by hand as well/);
+
+    // Pressed straight away (the audit's probe P5): nothing is created.
+    const early = await recheck();
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
+    expect(early.outcome?.giftCardIssued).toBe(false);
+
+    // Later: Shopify lists the card the timed-out request made.
+    await waitOutShopify();
+    admin.findGiftCardsByNote.mockResolvedValue([
+      { id: "gid://shopify/GiftCard/55", lastCharacters: "w8w8", amount: "50.00", currencyCode: "USD" },
+    ]);
+    const later = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(later.outcome?.giftCardIssued).toBe(true);
+    m = await mapping();
+    expect(m).toMatchObject({
+      giftCardId: "gid://shopify/GiftCard/55",
+      giftCardLastChars: "w8w8",
+      giftCardAmount: "50.00",
+    });
+    expect(admin.findGiftCardsByNote.mock.calls[0][2]).toMatchObject({
+      noteIncludes: `[Payram order ${ORDER}]`,
+    });
+
+    // And from then on the order has its card: no more lookups, no more cards.
+    await recheck();
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).toHaveBeenCalledOnce();
+  });
+
+  it("a timeout before Shopify made anything: issued once Shopify confirms there is no card", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    await waitOutShopify();
+    admin.findGiftCardsByNote.mockResolvedValue([]);
+    const result = await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledTimes(2);
+    expect(result.outcome?.giftCardIssued).toBe(true);
+    expect((await mapping()).giftCardId).toBe("gid://shopify/GiftCard/1");
+  });
+
+  it("repeat deliveries while it is unclear create nothing", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(unclear());
+    for (let i = 0; i < 4; i += 1) {
+      await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+    }
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect((await mapping()).giftCardId).toMatch(/^unconfirmed:/);
+  });
+
+  it("a refusal Shopify states plainly still closes the slot for a manual refund", async () => {
+    payramHas("real-ref", "OVER_FILLED", "150.00");
+    admin.createGiftCard.mockRejectedValueOnce(
+      new Error("Gift card could not be created: Gift cards are not enabled for this shop"),
+    );
+    await post(genuine("real-ref", "OVER_FILLED", "150.00"));
+
+    await recheck();
+
+    expect(admin.createGiftCard).toHaveBeenCalledOnce();
+    expect(admin.findGiftCardsByNote).not.toHaveBeenCalled();
     expect((await mapping()).giftCardId).toBe("manual_refund");
   });
 });

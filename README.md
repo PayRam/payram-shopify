@@ -817,6 +817,10 @@ settings page (maximum 10%).
    *Refund manually*: do so. From then on the connector never issues a gift card for that order,
    not even after gift cards are switched on or Re-check payment is pressed, so a buyer you refunded
    by hand is never refunded twice. The order keeps saying it was left for a manual refund.
+   If Shopify did not answer whether it created the card (a timeout), the order says so instead:
+   do **not** refund by hand. From ten minutes later, **Re-check payment** looks in Shopify for a
+   card whose note ends `[Payram order <id>]`, records it if it is there, and issues one only if
+   there is none.
 5. Fulfil as normal. The order is paid.
 
 **Where to see problems.** Open the Payram app in Shopify Admin. Any order that is underpaid, or
@@ -1012,7 +1016,7 @@ documented rather than quietly carried:
 | `shopifyFinancialStatus` | Synced from Shopify after mark-paid |
 | `shopifyPaidSyncedAt` | Timestamp of successful sync |
 | `syncError` | Error from last Shopify sync attempt |
-| `giftCardId` | The overpayment gift card issued for the order (`gid://shopify/GiftCard/…`); `pending` while one is being created; `manual_refund` once the merchant was told to refund by hand, after which none is issued automatically |
+| `giftCardId` | The overpayment gift card issued for the order (`gid://shopify/GiftCard/…`); `pending` while one is being created; `unconfirmed:<time>` when Shopify did not say whether it created one, so Shopify is checked before any retry; `manual_refund` once the merchant was told to refund by hand, after which none is issued automatically |
 | `orderCurrency` | Presentment currency of the Shopify order, e.g. `EUR` |
 | `orderAmount` | Original order total in `orderCurrency`, as a decimal string |
 | `fxRate` | USD per 1 unit of `orderCurrency` at the time of payment |

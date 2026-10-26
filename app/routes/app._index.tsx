@@ -965,6 +965,7 @@ docker run -d --name payram-shopify-connector \\
                       p.settled &&
                       (p.giftCard != null ||
                         p.giftCardSlot === "manual_refund" ||
+                        p.giftCardSlot === "unconfirmed" ||
                         (p.syncError != null && /overpaid/i.test(p.syncError)));
                     return (
                       <Card key={p.shopifyOrderId} background="bg-surface-secondary">
@@ -1000,7 +1001,9 @@ docker run -d --name payram-shopify-connector \\
                                   ? ` Refunded as a ${p.giftCard} gift card.`
                                   : p.giftCardSlot === "manual_refund"
                                     ? " Left for you to refund by hand — no gift card is issued for this order automatically."
-                                    : " Not yet refunded — see the message below."}
+                                    : p.giftCardSlot === "unconfirmed"
+                                      ? " A gift card may already have been created — do not refund by hand; see the message below."
+                                      : " Not yet refunded — see the message below."}
                               </p>
                             </Banner>
                           )}

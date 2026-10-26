@@ -27,6 +27,8 @@ import {
   addOrderTags,
   createGiftCard,
   fetchOrderTotal,
+  findGiftCardsByNote,
+  GiftCardOutcomeUnknownError,
   markOrderPaid,
   tagShopifyOrderPaid,
 } from "./shopify-admin.server";
@@ -200,5 +202,102 @@ describe("createGiftCard", () => {
       }),
     ).rejects.toThrow(/unclear whether Shopify created one/);
     expect(sent).toHaveLength(1);
+  });
+
+  it("marks an unclear failure as such, so settlement looks before it ever retries", async () => {
+    replies.push({ errors: [{ message: "Internal error" }] });
+    const err = await createGiftCard(SHOP, "token", {
+      amount: "5.33",
+      currencyCode: "EUR",
+      customerId: null,
+      note: "n",
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GiftCardOutcomeUnknownError);
+  });
+
+  it("a refusal Shopify states is not marked unclear", async () => {
+    reply({
+      giftCardCreate: { giftCard: null, userErrors: [{ message: "Gift cards are not enabled" }] },
+    });
+    const err = await createGiftCard(SHOP, "token", {
+      amount: "5.33",
+      currencyCode: "EUR",
+      customerId: null,
+      note: "n",
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(GiftCardOutcomeUnknownError);
+    expect(String(err)).toMatch(/Gift card could not be created: Gift cards are not enabled/);
+  });
+});
+
+describe("findGiftCardsByNote", () => {
+  const since = new Date("2026-10-20T08:00:00Z");
+  const page = (
+    nodes: { id: string; note: string | null; last?: string }[],
+    next: string | null = null,
+  ) => ({
+    giftCards: {
+      nodes: nodes.map((n) => ({
+        id: n.id,
+        lastCharacters: n.last ?? "abcd",
+        note: n.note,
+        initialValue: { amount: "5.33", currencyCode: "EUR" },
+      })),
+      pageInfo: { hasNextPage: next !== null, endCursor: next },
+    },
+  });
+
+  it("returns only cards whose note carries the marker, created since the given time", async () => {
+    reply(
+      page([
+        { id: "gid://shopify/GiftCard/1", note: "Birthday card" },
+        { id: "gid://shopify/GiftCard/2", note: "Payram overpayment refund for order #12. [Payram order 12]" },
+        { id: "gid://shopify/GiftCard/3", note: "Payram overpayment refund for order #123. [Payram order 123]", last: "zzzz" },
+        { id: "gid://shopify/GiftCard/4", note: null },
+      ]),
+    );
+
+    const found = await findGiftCardsByNote(SHOP, "token", {
+      noteIncludes: "[Payram order 123]",
+      createdSince: since,
+    });
+
+    expect(found).toEqual([
+      { id: "gid://shopify/GiftCard/3", lastCharacters: "zzzz", amount: "5.33", currencyCode: "EUR" },
+    ]);
+    expect(sent[0].variables.query).toBe("created_at:>='2026-10-20T08:00:00.000Z'");
+    expect(sent[0].query).toMatch(/sortKey: CREATED_AT/);
+  });
+
+  it("reads every page before saying there is none", async () => {
+    reply(page([{ id: "gid://shopify/GiftCard/1", note: "other" }], "cursor-1"));
+    reply(page([{ id: "gid://shopify/GiftCard/2", note: "x [Payram order 9]" }]));
+
+    const found = await findGiftCardsByNote(SHOP, "token", {
+      noteIncludes: "[Payram order 9]",
+      createdSince: since,
+    });
+
+    expect(found.map((c) => c.id)).toEqual(["gid://shopify/GiftCard/2"]);
+    expect(sent[1].variables.after).toBe("cursor-1");
+  });
+
+  it("never answers 'none' from an incomplete read", async () => {
+    for (let i = 0; i < 5; i += 1) reply(page([], `cursor-${i}`));
+    await expect(
+      findGiftCardsByNote(SHOP, "token", { noteIncludes: "[Payram order 9]", createdSince: since }),
+    ).rejects.toThrow(/Too many gift cards/);
+
+    replies.length = 0;
+    reply({});
+    await expect(
+      findGiftCardsByNote(SHOP, "token", { noteIncludes: "[Payram order 9]", createdSince: since }),
+    ).rejects.toThrow(/no gift card list/);
+
+    replies.push({ errors: [{ message: "Access denied for giftCards field." }] });
+    await expect(
+      findGiftCardsByNote(SHOP, "token", { noteIncludes: "[Payram order 9]", createdSince: since }),
+    ).rejects.toThrow();
   });
 });

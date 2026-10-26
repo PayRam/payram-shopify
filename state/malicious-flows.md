@@ -199,6 +199,18 @@ Severity: `low` / `medium` / `high` / `critical`.
   record they kept). Residual: an order whose "Refund manually" text was later
   replaced by another `syncError` before the upgrade is not recognised and
   stays open.
+- **Follow-up (2026-10-26, audit F4):** `giftCardCreate` timing out after
+  Shopify made the card freed the slot, so the next delivery or Re-check
+  minted a second card. An unclear failure (`GiftCardOutcomeUnknownError`) now
+  keeps the slot reserved (`giftCardId = 'unconfirmed:<time>'`) and tells the
+  merchant not to refund by hand. No card is created again until, at least ten
+  minutes later, Shopify's gift card list has been read in full and holds no
+  card whose note carries the order marker `[Payram order <id>]` (every card's
+  note does); a card that is there is recorded instead. A failed or incomplete
+  read keeps the slot reserved. Residual: a merchant who refunds by hand
+  anyway, despite the message, and then presses Re-check on an order where
+  Shopify made nothing is refunded twice; a card made more than ten minutes
+  after the timeout is not expected but would not be seen.
 - **Discovered-in:** overpayment/gift-card work, 2026-09-03.
 
 ---
